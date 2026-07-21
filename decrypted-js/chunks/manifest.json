@@ -1,0 +1,12 @@
+{
+  "source_bundle": "/private/tmp/dungeon4-jsbundle.unityfs",
+  "project_root": "/Users/max/Downloads/dungeon4_M521957",
+  "assets": [
+    {
+      "name": "battle",
+      "path": "battle.mjs",
+      "bytes": 148956,
+      "sha256": "55918d8ca5dc4809e88f64bdd9b302dfdd3e99f5aa908599939ae17d4bf324cc"
+    }
+  ]
+}

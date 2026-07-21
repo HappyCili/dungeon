@@ -1,0 +1,267 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light">
+    <title>每日任务操作台</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}?v={{ asset_version }}">
+  </head>
+  <body>
+    <a class="skip-link" href="#workspace">跳到主内容</a>
+    <header class="app-header">
+      <div class="app-header__inner">
+        <div class="brand-lockup">
+          <span class="brand-mark" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 6h16"></path><path d="M4 12h16"></path><path d="M4 18h11"></path></svg>
+          </span>
+          <div>
+            <h1>每日任务操作台</h1>
+            <p>本机操作台</p>
+          </div>
+        </div>
+        <output id="connection-status" class="status-indicator status-indicator--{{ initial_state.config.connection.status }}" aria-live="polite">
+          <span class="status-indicator__dot"></span>{{ initial_state.config.connection.label }}
+        </output>
+      </div>
+    </header>
+
+    <main id="workspace" class="workspace">
+      <section class="configuration-band" aria-labelledby="account-heading">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">连接设置</p>
+            <h2 id="account-heading">账号与区服</h2>
+          </div>
+          <p id="login-message" class="inline-message" role="status"></p>
+        </div>
+        <form id="login-form" class="connection-form" novalidate>
+          <label class="field-control">
+            <span>账号</span>
+            <input id="username" name="username" type="text" value="{{ initial_state.config.account.username }}" maxlength="64" autocomplete="username" required>
+          </label>
+          <label class="field-control">
+            <span>密码</span>
+            <span class="password-control">
+              <input id="password" name="password" type="password" maxlength="256" autocomplete="current-password" required>
+              <button id="toggle-password" class="icon-button" type="button" aria-label="显示密码" aria-pressed="false" title="显示密码">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6S2 12 2 12Z"></path><circle cx="12" cy="12" r="2.6"></circle></svg>
+              </button>
+            </span>
+          </label>
+          <label class="check-control remember-control">
+            <input id="remember-password" type="checkbox" {% if initial_state.config.account.remember_password %}checked{% endif %}>
+            <span>记住密码</span>
+          </label>
+          <button id="login-button" class="button button--primary" type="submit">登录并获取区服</button>
+          <label class="field-control zone-control">
+            <span>区服</span>
+            <select id="zone-select" {% if not initial_state.config.zones %}disabled{% endif %}>
+              <option value="">请选择区服</option>
+            </select>
+          </label>
+        </form>
+      </section>
+
+      <nav class="tabs" role="tablist" aria-label="功能页">
+        <button id="daily-tab" class="tab-button is-active" type="button" role="tab" aria-selected="true" aria-controls="daily-panel" data-tab="daily">日常任务</button>
+        <button id="arena-tab" class="tab-button" type="button" role="tab" aria-selected="false" aria-controls="arena-panel" data-tab="arena">龙痕竞技场</button>
+        <button id="treasure-tab" class="tab-button" type="button" role="tab" aria-selected="false" aria-controls="treasure-panel" data-tab="treasure">聚宝之地</button>
+        <button id="dungeon-tab" class="tab-button" type="button" role="tab" aria-selected="false" aria-controls="dungeon-panel" data-tab="dungeon">地下城扫荡</button>
+      </nav>
+
+      <section id="daily-panel" class="feature-panel" role="tabpanel" aria-labelledby="daily-tab">
+        <div class="section-heading section-heading--compact">
+          <div>
+            <p class="eyebrow">日常编排</p>
+            <h2>今日任务</h2>
+          </div>
+          <div class="summary-strip" aria-label="日常汇总">
+            <div class="summary-item"><span>活跃度</span><strong id="activity-score">--</strong></div>
+            <div class="summary-item"><span>下个奖励</span><strong id="next-reward">--</strong></div>
+            <div class="summary-item"><span>已完成</span><strong id="completed-count">--</strong></div>
+            <div class="summary-item"><span>刷新倒计时</span><strong id="refresh-countdown">--:--:--</strong></div>
+          </div>
+        </div>
+
+        <div class="command-bar" aria-label="日常任务命令">
+          <div class="command-bar__group">
+            <button id="select-available" class="button button--secondary" type="button">选择可执行项</button>
+            <button id="clear-selection" class="button button--secondary" type="button">清空选择</button>
+            <button id="refresh-daily" class="button button--secondary" type="button">刷新状态</button>
+          </div>
+          <div class="command-bar__group">
+            <button id="run-daily" class="button button--primary" type="button">执行已选</button>
+            <button id="stop-daily" class="button button--danger" type="button" disabled>停止</button>
+          </div>
+        </div>
+
+        <div class="table-scroll" tabindex="0">
+          <table class="task-table">
+            <caption class="sr-only">20 条正式日常任务</caption>
+            <thead>
+              <tr>
+                <th scope="col">选择</th>
+                <th scope="col">日常任务</th>
+                <th scope="col">目标</th>
+                <th scope="col">当前进度</th>
+                <th scope="col">活跃度</th>
+                <th scope="col">实现状态</th>
+                <th scope="col">执行结果</th>
+              </tr>
+            </thead>
+            <tbody id="task-table-body">
+              <tr><td colspan="7">登录并选择区服后刷新日常状态</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section id="arena-panel" class="feature-panel" role="tabpanel" aria-labelledby="arena-tab" hidden>
+        <div class="section-heading section-heading--compact">
+          <div>
+            <p class="eyebrow">竞技场编排</p>
+            <h2>龙痕竞技场</h2>
+          </div>
+        </div>
+        <div class="arena-layout">
+          <div class="arena-controls">
+            <label class="field-control stepper-field">
+              <span>轮数</span>
+              <span class="number-stepper">
+                <button class="icon-button" id="rounds-decrease" type="button" aria-label="减少轮数" title="减少轮数">-</button>
+                <input id="arena-rounds" type="number" inputmode="numeric" min="1" max="100" value="{{ initial_state.config.arena.rounds }}" aria-label="竞技场轮数">
+                <button class="icon-button" id="rounds-increase" type="button" aria-label="增加轮数" title="增加轮数">+</button>
+              </span>
+            </label>
+            <fieldset class="segment-field">
+              <legend>胜利抉择</legend>
+              <div class="segmented-control" role="group" aria-label="胜利抉择">
+                <button class="segment-button {% if initial_state.config.arena.outcome == 'mercy' %}is-selected{% endif %}" type="button" data-outcome="mercy" aria-pressed="{% if initial_state.config.arena.outcome == 'mercy' %}true{% else %}false{% endif %}">仁慈</button>
+                <button class="segment-button {% if initial_state.config.arena.outcome == 'execute' %}is-selected{% endif %}" type="button" data-outcome="execute" aria-pressed="{% if initial_state.config.arena.outcome == 'execute' %}true{% else %}false{% endif %}">处决</button>
+              </div>
+            </fieldset>
+            <label class="switch-control">
+              <input id="refresh-on-exhaustion" type="checkbox" {% if initial_state.config.arena.refresh_on_exhaustion %}checked{% endif %}>
+              <span class="switch-control__track" aria-hidden="true"></span>
+              <span>寻找对手耗尽后自动刷新</span>
+            </label>
+            <div class="command-bar command-bar--arena">
+              <button id="refresh-arena" class="button button--secondary" type="button">刷新状态</button>
+              <button id="run-arena" class="button button--primary" type="button">开始刷取</button>
+              <button id="stop-arena" class="button button--danger" type="button" disabled>停止</button>
+            </div>
+          </div>
+          <dl class="arena-stats" aria-live="polite">
+            <div><dt>当前积分</dt><dd id="arena-score">--</dd></div>
+            <div><dt>可挑战对手</dt><dd id="arena-opponents">--</dd></div>
+            <div><dt>龙痕币日计数</dt><dd id="arena-daily-reward">--</dd></div>
+            <div><dt>目标轮数</dt><dd id="arena-requested">{{ initial_state.config.arena.rounds }}</dd></div>
+            <div><dt>已处理</dt><dd id="arena-completed">0</dd></div>
+            <div><dt>胜 / 负</dt><dd id="arena-win-loss">0 / 0</dd></div>
+            <div><dt>当前阶段</dt><dd id="arena-stage">空闲</dd></div>
+            <div><dt>积分变化</dt><dd id="arena-score-delta">+0</dd></div>
+            <div><dt>龙痕币变化</dt><dd id="arena-coin-delta">+0</dd></div>
+            <div class="arena-stats__last"><dt>最后结果</dt><dd id="arena-last-result">等待开始</dd></div>
+          </dl>
+        </div>
+      </section>
+
+      <section id="treasure-panel" class="feature-panel" role="tabpanel" aria-labelledby="treasure-tab" hidden>
+        <div class="section-heading section-heading--compact">
+          <div>
+            <p class="eyebrow">地图扫荡</p>
+            <h2>聚宝之地</h2>
+          </div>
+        </div>
+        <div class="treasure-layout">
+          <div class="treasure-controls">
+            <label class="field-control">
+              <span>可扫荡地图</span>
+              <select id="treasure-area" disabled>
+                <option value="">请先刷新聚宝之地状态</option>
+              </select>
+            </label>
+            <label class="field-control stepper-field">
+              <span>本次扫荡次数</span>
+              <span class="number-stepper">
+                <button class="icon-button" id="treasure-times-decrease" type="button" aria-label="减少扫荡次数" title="减少扫荡次数">-</button>
+                <input id="treasure-times" type="number" inputmode="numeric" min="1" max="30" value="{{ initial_state.config.treasure.times }}" aria-label="聚宝之地本次扫荡次数">
+                <button class="icon-button" id="treasure-times-increase" type="button" aria-label="增加扫荡次数" title="增加扫荡次数">+</button>
+              </span>
+            </label>
+            <div class="command-bar command-bar--treasure">
+              <button id="refresh-treasure" class="button button--secondary" type="button">刷新状态</button>
+              <button id="run-treasure" class="button button--primary" type="button">开始扫荡</button>
+              <button id="stop-treasure" class="button button--danger" type="button" disabled>停止</button>
+            </div>
+          </div>
+          <dl class="treasure-stats" aria-live="polite">
+            <div><dt>今日已扫荡</dt><dd id="treasure-used">--</dd></div>
+            <div><dt>每日上限</dt><dd id="treasure-limit">--</dd></div>
+            <div><dt>今日可扫荡</dt><dd id="treasure-available">--</dd></div>
+            <div><dt>单次上限</dt><dd id="treasure-request-limit">30</dd></div>
+          </dl>
+        </div>
+      </section>
+
+      <section id="dungeon-panel" class="feature-panel" role="tabpanel" aria-labelledby="dungeon-tab" hidden>
+        <div class="section-heading section-heading--compact">
+          <div>
+            <p class="eyebrow">扫荡与抽取</p>
+            <h2>地下城</h2>
+          </div>
+        </div>
+        <div class="dungeon-layout">
+          <div class="dungeon-controls">
+            <label class="field-control">
+              <span>可扫荡地下城</span>
+              <select id="dungeon-select" disabled>
+                <option value="">请先刷新地下城状态</option>
+              </select>
+            </label>
+            <div class="command-bar command-bar--dungeon">
+              <button id="refresh-dungeon" class="button button--secondary" type="button">刷新状态</button>
+              <button id="run-dungeon" class="button button--primary" type="button">扫荡并全部抽取</button>
+              <button id="stop-dungeon" class="button button--danger" type="button" disabled>停止</button>
+            </div>
+          </div>
+          <div class="dungeon-result-stack">
+            <dl class="dungeon-stats" aria-live="polite">
+              <div><dt>选中地下城</dt><dd id="dungeon-name">--</dd></div>
+              <div><dt>历史最高分</dt><dd id="dungeon-highest-score">--</dd></div>
+              <div><dt>宝库抽取进度</dt><dd id="dungeon-draw-progress">-- / --</dd></div>
+            </dl>
+            <section class="dungeon-rewards" aria-labelledby="dungeon-rewards-heading">
+              <div class="dungeon-rewards__heading">
+                <h3 id="dungeon-rewards-heading">本次奖励</h3>
+                <output id="dungeon-reward-summary" aria-live="polite">尚未获取奖励</output>
+              </div>
+              <ul id="dungeon-reward-list" class="dungeon-reward-list" aria-live="polite">
+                <li class="dungeon-reward-empty">扫荡并全部抽取后在此显示服务端返回的奖励数据</li>
+              </ul>
+            </section>
+          </div>
+        </div>
+      </section>
+
+      <section class="run-panel" aria-labelledby="run-heading">
+        <div class="section-heading section-heading--compact">
+          <div>
+            <p class="eyebrow">当前任务</p>
+            <h2 id="run-heading">运行进度</h2>
+          </div>
+          <output id="job-status" class="job-status" aria-live="polite">空闲</output>
+        </div>
+        <p id="job-progress" class="job-progress">等待操作</p>
+        <ol id="log-list" class="log-list" aria-label="脱敏运行日志">
+          <li class="log-item log-item--info"><time>--:--:--</time><span>系统</span><p>等待操作</p></li>
+        </ol>
+      </section>
+    </main>
+
+    <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+    <script id="initial-state" type="application/json">{{ initial_state|tojson }}</script>
+    <script src="{{ url_for('static', filename='app.js') }}?v={{ asset_version }}" defer></script>
+  </body>
+</html>

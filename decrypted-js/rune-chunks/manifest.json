@@ -1,0 +1,18 @@
+{
+  "source_bundle": "/private/tmp/dungeon4-jsbundle.unityfs",
+  "project_root": "/Users/max/Downloads/dungeon4_M521957",
+  "assets": [
+    {
+      "name": "runePullPanel",
+      "path": "runePullPanel.js",
+      "bytes": 13325,
+      "sha256": "1a98e3b70b5f7a5c2cbe3ec29eee86f7cd64b5a9ed48900adbbca1193ef2f51d"
+    },
+    {
+      "name": "runePullInfo",
+      "path": "runePullInfo.js",
+      "bytes": 3408,
+      "sha256": "58d4874305416ddfbfcc8705e8b85d167da38e414033da68e97fce850092b58c"
+    }
+  ]
+}

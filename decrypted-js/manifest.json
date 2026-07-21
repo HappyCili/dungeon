@@ -1,0 +1,60 @@
+{
+  "source_bundle": "/private/tmp/dungeon4-jsbundle.unityfs",
+  "project_root": "/Users/max/Downloads/dungeon4_M521957",
+  "assets": [
+    {
+      "name": "itemSigninBox",
+      "path": "itemSigninBox.js",
+      "bytes": 7777,
+      "sha256": "65acc8ed90777d945cdf0ae7d80160601b59b5d7673e67b385ebaeb60f175b8f"
+    },
+    {
+      "name": "main",
+      "path": "main.js",
+      "bytes": 3730490,
+      "sha256": "3bb92451f323be845b97ead13b129e928ed1085c13a31632839c4ff6c58c1e33"
+    },
+    {
+      "name": "signinPanel",
+      "path": "signinPanel.js",
+      "bytes": 5581,
+      "sha256": "fea91e5eec1416b365a27d5fb8ca272468d8a9ef63b8d3e39724d2694032a1af"
+    },
+    {
+      "name": "signinPanel1New",
+      "path": "signinPanel1New.js",
+      "bytes": 4222,
+      "sha256": "e26ebc70dd320c062ec0e153a22877fcc763ae9d2ee81804f09cef700fcec290"
+    },
+    {
+      "name": "webapi",
+      "path": "webapi.js",
+      "bytes": 58082,
+      "sha256": "0ad5aaa395a89253896f487a6b76bbdb7ad8efa0a5fb3e853ccdfba68da9fdba"
+    },
+    {
+      "name": "signinReturnPanel",
+      "path": "signinReturnPanel.js",
+      "bytes": 27405,
+      "sha256": "b0ccb04d3252963e3eea5de98da2363a2b11a70e47a282bf155ed27001baa92c"
+    },
+    {
+      "name": "signinPanel2",
+      "path": "signinPanel2.js",
+      "bytes": 5083,
+      "sha256": "b0c0d64e6943e87ff3bd30f0224d7caac53fe110755ff4ca710c16da6724e447"
+    },
+    {
+      "name": "signinPanel1",
+      "path": "signinPanel1.js",
+      "bytes": 4318,
+      "sha256": "8e97fc2bf8f1d1502d1835006ca833a633e1600f5d670bd3eae9db8e10a76c16"
+    },
+    {
+      "name": "signinPanel3",
+      "path": "signinPanel3.js",
+      "bytes": 6004,
+      "sha256": "7366ed45039710bf95ca31476b43d0be71d95bb9109b34af77b635fdf7d43f7d"
+    }
+  ]
+}

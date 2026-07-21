@@ -1,0 +1,28 @@
+{
+  "version": 4,
+  "account": {
+    "username": "17767051461",
+    "remember_password": true
+  },
+  "zone": {
+    "id": "4101",
+    "name": "S1"
+  },
+  "daily": {
+    "enabled_task_ids": [
+      101
+    ]
+  },
+  "arena": {
+    "rounds": 10,
+    "outcome": "mercy",
+    "refresh_on_exhaustion": true
+  },
+  "treasure": {
+    "area_id": 230101,
+    "times": 8
+  },
+  "dungeon": {
+    "dungeon_id": 3
+  }
+}

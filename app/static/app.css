@@ -1,0 +1,1069 @@
+:root {
+  --canvas: #f3f6f5;
+  --surface: #ffffff;
+  --ink: #172428;
+  --muted: #65757a;
+  --line: #d4dddb;
+  --line-strong: #aebfbb;
+  --teal: #087a74;
+  --teal-dark: #045f5a;
+  --teal-soft: #e4f2ef;
+  --green: #1a7658;
+  --green-soft: #e7f4ec;
+  --amber: #9a6100;
+  --amber-soft: #fff1d6;
+  --red: #a83f3f;
+  --red-soft: #fae7e5;
+  --focus: #267eaa;
+  --shadow: 0 8px 24px rgba(23, 36, 40, 0.08);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  background: var(--canvas);
+}
+
+body {
+  min-width: 320px;
+  margin: 0;
+  color: var(--ink);
+  background: var(--canvas);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-size: 14px;
+  line-height: 1.45;
+  letter-spacing: 0;
+}
+
+button,
+input,
+select {
+  font: inherit;
+  letter-spacing: 0;
+}
+
+button,
+select,
+input[type="checkbox"] {
+  cursor: pointer;
+}
+
+button:disabled,
+select:disabled,
+input:disabled {
+  cursor: not-allowed;
+}
+
+button:focus-visible,
+input:focus-visible,
+select:focus-visible,
+.table-scroll:focus-visible {
+  outline: 3px solid color-mix(in srgb, var(--focus) 45%, transparent);
+  outline-offset: 2px;
+}
+
+.skip-link {
+  position: fixed;
+  z-index: 10;
+  top: 8px;
+  left: 8px;
+  padding: 8px 12px;
+  color: #fff;
+  background: var(--teal-dark);
+  transform: translateY(-160%);
+}
+
+.skip-link:focus {
+  transform: translateY(0);
+}
+
+.app-header {
+  color: #f4fbf9;
+  background: #172d2d;
+  border-bottom: 3px solid var(--teal);
+}
+
+.app-header__inner,
+.workspace {
+  width: min(1440px, calc(100% - 40px));
+  margin: 0 auto;
+}
+
+.app-header__inner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 76px;
+  gap: 24px;
+}
+
+.brand-lockup {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  gap: 12px;
+}
+
+.brand-mark {
+  display: grid;
+  width: 34px;
+  height: 34px;
+  flex: 0 0 34px;
+  place-items: center;
+  color: #17302e;
+  background: #6cc6bb;
+  border-radius: 6px;
+}
+
+.brand-mark svg {
+  width: 21px;
+  height: 21px;
+}
+
+h1,
+h2,
+p {
+  margin: 0;
+}
+
+h1 {
+  font-size: 20px;
+  font-weight: 700;
+  line-height: 1.2;
+}
+
+h2 {
+  font-size: 17px;
+  font-weight: 700;
+  line-height: 1.3;
+}
+
+.brand-lockup p,
+.eyebrow {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.brand-lockup p {
+  color: #b8ccca;
+  margin-top: 2px;
+}
+
+.eyebrow {
+  margin-bottom: 2px;
+  color: var(--teal-dark);
+  font-weight: 700;
+}
+
+.workspace {
+  margin-bottom: 40px;
+  background: var(--surface);
+  border-right: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+  border-left: 1px solid var(--line);
+}
+
+.configuration-band,
+.feature-panel,
+.run-panel {
+  padding: 22px 24px;
+  border-bottom: 1px solid var(--line);
+}
+
+.configuration-band {
+  background: #fbfdfc;
+}
+
+.section-heading {
+  display: flex;
+  align-items: end;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 16px;
+}
+
+.section-heading--compact {
+  align-items: center;
+}
+
+.inline-message {
+  min-height: 20px;
+  color: var(--muted);
+  text-align: right;
+}
+
+.connection-form {
+  display: grid;
+  grid-template-columns: minmax(150px, 1fr) minmax(180px, 1fr) max-content minmax(150px, max-content) minmax(170px, 1fr);
+  align-items: end;
+  gap: 12px;
+}
+
+.field-control,
+.segment-field {
+  display: grid;
+  min-width: 0;
+  gap: 6px;
+  color: var(--ink);
+  font-weight: 600;
+}
+
+.field-control > span:first-child,
+.segment-field legend {
+  padding: 0;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+input[type="text"],
+input[type="password"],
+input[type="number"],
+select {
+  width: 100%;
+  min-width: 0;
+  height: 38px;
+  padding: 0 10px;
+  color: var(--ink);
+  background: #fff;
+  border: 1px solid var(--line-strong);
+  border-radius: 5px;
+}
+
+input[type="text"]:hover,
+input[type="password"]:hover,
+input[type="number"]:hover,
+select:hover {
+  border-color: var(--teal);
+}
+
+.password-control {
+  position: relative;
+  display: block;
+}
+
+.password-control input {
+  padding-right: 42px;
+}
+
+.password-control .icon-button {
+  position: absolute;
+  top: 3px;
+  right: 3px;
+}
+
+.check-control,
+.switch-control {
+  display: inline-flex;
+  align-items: center;
+  min-height: 38px;
+  gap: 8px;
+  color: var(--ink);
+  font-weight: 600;
+}
+
+.check-control input,
+.task-checkbox {
+  width: 16px;
+  height: 16px;
+  accent-color: var(--teal);
+}
+
+.remember-control {
+  padding-bottom: 1px;
+  white-space: nowrap;
+}
+
+.button,
+.icon-button,
+.segment-button {
+  min-height: 38px;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  font-weight: 700;
+  transition: background-color 120ms ease, border-color 120ms ease, color 120ms ease;
+}
+
+.button {
+  padding: 7px 12px;
+  overflow-wrap: anywhere;
+}
+
+.button--primary {
+  color: #fff;
+  background: var(--teal);
+  border-color: var(--teal);
+}
+
+.button--primary:hover:not(:disabled) {
+  background: var(--teal-dark);
+  border-color: var(--teal-dark);
+}
+
+.button--secondary {
+  color: var(--teal-dark);
+  background: #fff;
+  border-color: var(--line-strong);
+}
+
+.button--secondary:hover:not(:disabled) {
+  background: var(--teal-soft);
+  border-color: var(--teal);
+}
+
+.button--danger {
+  color: var(--red);
+  background: #fff;
+  border-color: #dfb3b0;
+}
+
+.button--danger:hover:not(:disabled) {
+  background: var(--red-soft);
+  border-color: var(--red);
+}
+
+.button:disabled,
+.icon-button:disabled,
+.segment-button:disabled {
+  opacity: 0.5;
+}
+
+.icon-button {
+  display: inline-grid;
+  width: 32px;
+  min-width: 32px;
+  height: 32px;
+  min-height: 32px;
+  padding: 0;
+  place-items: center;
+  color: var(--teal-dark);
+  background: #fff;
+  border-color: transparent;
+}
+
+.icon-button:hover:not(:disabled) {
+  background: var(--teal-soft);
+  border-color: var(--line);
+}
+
+.icon-button svg {
+  width: 18px;
+  height: 18px;
+}
+
+.status-indicator,
+.job-status {
+  display: inline-flex;
+  align-items: center;
+  min-height: 28px;
+  gap: 7px;
+  padding: 4px 9px;
+  border: 1px solid #496662;
+  border-radius: 999px;
+  color: #d8ebe7;
+  font-size: 12px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.status-indicator__dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #afc5c1;
+}
+
+.status-indicator--available .status-indicator__dot {
+  background: #6fd1a7;
+}
+
+.status-indicator--failed .status-indicator__dot {
+  background: #f19486;
+}
+
+.tabs {
+  display: flex;
+  gap: 4px;
+  padding: 0 24px;
+  background: #eef3f1;
+  border-bottom: 1px solid var(--line);
+}
+
+.tab-button {
+  min-height: 46px;
+  padding: 0 15px;
+  color: var(--muted);
+  background: transparent;
+  border: 0;
+  border-bottom: 3px solid transparent;
+  font-weight: 700;
+}
+
+.tab-button:hover {
+  color: var(--teal-dark);
+}
+
+.tab-button.is-active {
+  color: var(--teal-dark);
+  border-bottom-color: var(--teal);
+}
+
+.summary-strip {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(86px, auto));
+  border-left: 1px solid var(--line);
+}
+
+.summary-item {
+  display: grid;
+  gap: 1px;
+  padding: 0 13px;
+  border-right: 1px solid var(--line);
+}
+
+.summary-item span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.summary-item strong {
+  color: var(--ink);
+  font-size: 15px;
+}
+
+.command-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+.command-bar__group {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.table-scroll {
+  overflow-x: auto;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+
+.task-table {
+  width: 100%;
+  min-width: 960px;
+  border-collapse: collapse;
+  table-layout: fixed;
+}
+
+.task-table th,
+.task-table td {
+  padding: 10px 12px;
+  overflow-wrap: anywhere;
+  border-bottom: 1px solid var(--line);
+  text-align: left;
+  vertical-align: middle;
+}
+
+.task-table th {
+  color: #38504d;
+  background: #edf3f1;
+  font-size: 12px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.task-table th:nth-child(1),
+.task-table td:nth-child(1) {
+  width: 60px;
+  text-align: center;
+}
+
+.task-table th:nth-child(2),
+.task-table td:nth-child(2) {
+  width: 74px;
+}
+
+.task-table th:nth-child(3),
+.task-table td:nth-child(3) {
+  width: 190px;
+}
+
+.task-table th:nth-child(4),
+.task-table td:nth-child(4) {
+  width: 90px;
+}
+
+.task-table th:nth-child(5),
+.task-table td:nth-child(5) {
+  width: 92px;
+}
+
+.task-table th:nth-child(6),
+.task-table td:nth-child(6) {
+  width: 76px;
+}
+
+.task-table th:nth-child(7),
+.task-table td:nth-child(7) {
+  width: 110px;
+}
+
+.task-table tr:last-child td {
+  border-bottom: 0;
+}
+
+.task-table tbody tr:hover {
+  background: #f7fbfa;
+}
+
+.numeric-cell {
+  font-variant-numeric: tabular-nums;
+}
+
+.task-name {
+  font-weight: 700;
+}
+
+.state-badge {
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  padding: 2px 7px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.state-badge--available {
+  color: var(--green);
+  background: var(--green-soft);
+}
+
+.state-badge--muted {
+  color: #68777a;
+  background: #edf0f0;
+}
+
+.result-text {
+  color: var(--muted);
+}
+
+.arena-layout,
+.treasure-layout,
+.dungeon-layout {
+  display: grid;
+  grid-template-columns: minmax(320px, 0.8fr) minmax(450px, 1.2fr);
+  gap: 28px;
+  align-items: start;
+}
+
+.arena-controls,
+.treasure-controls,
+.dungeon-controls {
+  display: grid;
+  gap: 18px;
+  max-width: 450px;
+}
+
+.number-stepper {
+  display: grid;
+  grid-template-columns: 32px minmax(70px, 1fr) 32px;
+  align-items: center;
+  gap: 4px;
+}
+
+.number-stepper input {
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+
+.segment-field {
+  border: 0;
+}
+
+.segmented-control {
+  display: inline-grid;
+  grid-template-columns: repeat(2, minmax(90px, 1fr));
+  overflow: hidden;
+  border: 1px solid var(--line-strong);
+  border-radius: 5px;
+}
+
+.segment-button {
+  padding: 7px 14px;
+  color: var(--teal-dark);
+  background: #fff;
+  border-radius: 0;
+}
+
+.segment-button + .segment-button {
+  border-left-color: var(--line-strong);
+}
+
+.segment-button.is-selected {
+  color: #fff;
+  background: var(--teal);
+  border-color: var(--teal);
+}
+
+.switch-control input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  clip-path: inset(50%);
+}
+
+.switch-control__track {
+  position: relative;
+  width: 36px;
+  height: 20px;
+  flex: 0 0 36px;
+  background: #aebbb9;
+  border-radius: 999px;
+  transition: background-color 120ms ease;
+}
+
+.switch-control__track::after {
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 14px;
+  height: 14px;
+  content: "";
+  background: #fff;
+  border-radius: 50%;
+  transition: transform 120ms ease;
+}
+
+.switch-control input:checked + .switch-control__track {
+  background: var(--teal);
+}
+
+.switch-control input:checked + .switch-control__track::after {
+  transform: translateX(16px);
+}
+
+.switch-control input:focus-visible + .switch-control__track {
+  outline: 3px solid color-mix(in srgb, var(--focus) 45%, transparent);
+  outline-offset: 2px;
+}
+
+.command-bar--arena,
+.command-bar--treasure,
+.command-bar--dungeon {
+  justify-content: flex-start;
+  margin: 2px 0 0;
+}
+
+.arena-stats,
+.treasure-stats,
+.dungeon-stats {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  margin: 0;
+  border-top: 1px solid var(--line);
+  border-left: 1px solid var(--line);
+}
+
+.arena-stats > div,
+.treasure-stats > div,
+.dungeon-stats > div {
+  min-height: 74px;
+  padding: 11px 13px;
+  border-right: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+}
+
+.arena-stats dt,
+.treasure-stats dt,
+.dungeon-stats dt {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.arena-stats dd,
+.treasure-stats dd,
+.dungeon-stats dd {
+  margin: 4px 0 0;
+  overflow-wrap: anywhere;
+  color: var(--ink);
+  font-size: 16px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.arena-stats__last {
+  grid-column: 1 / -1;
+}
+
+.dungeon-result-stack {
+  display: grid;
+  gap: 18px;
+}
+
+.dungeon-rewards {
+  padding-top: 2px;
+}
+
+.dungeon-rewards__heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+
+.dungeon-rewards h3 {
+  margin: 0;
+  font-size: 14px;
+  line-height: 1.35;
+}
+
+.dungeon-rewards output {
+  max-width: min(100%, 540px);
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+  text-align: right;
+  overflow-wrap: anywhere;
+}
+
+.dungeon-reward-list {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  border-top: 1px solid var(--line);
+  border-left: 1px solid var(--line);
+}
+
+.dungeon-reward-item,
+.dungeon-reward-empty {
+  min-width: 0;
+  min-height: 64px;
+  padding: 9px 11px;
+  border-right: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+}
+
+.dungeon-reward-item {
+  display: grid;
+  gap: 2px;
+}
+
+.dungeon-reward-item strong,
+.dungeon-reward-item span,
+.dungeon-reward-empty {
+  overflow-wrap: anywhere;
+}
+
+.dungeon-reward-item strong {
+  font-size: 13px;
+}
+
+.dungeon-reward-item span,
+.dungeon-reward-empty {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.dungeon-reward-empty {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+}
+
+.run-panel {
+  background: #fbfdfc;
+  border-bottom: 0;
+}
+
+.job-status {
+  color: var(--muted);
+  background: #fff;
+  border-color: var(--line);
+}
+
+.job-status[data-state="running"] {
+  color: var(--teal-dark);
+  background: var(--teal-soft);
+  border-color: #a6d4ce;
+}
+
+.job-status[data-state="stopping"] {
+  color: var(--amber);
+  background: var(--amber-soft);
+  border-color: #e6c68e;
+}
+
+.job-status[data-state="succeeded"] {
+  color: var(--green);
+  background: var(--green-soft);
+  border-color: #aad6bd;
+}
+
+.job-status[data-state="failed"] {
+  color: var(--red);
+  background: var(--red-soft);
+  border-color: #e6b5b0;
+}
+
+.job-progress {
+  min-height: 22px;
+  margin-bottom: 10px;
+  color: var(--muted);
+}
+
+.log-list {
+  display: grid;
+  max-height: 236px;
+  margin: 0;
+  padding: 0;
+  overflow: auto;
+  list-style: none;
+  border: 1px solid #29413f;
+  background: #172927;
+}
+
+.log-item {
+  display: grid;
+  grid-template-columns: 76px 76px minmax(0, 1fr);
+  gap: 10px;
+  padding: 8px 10px;
+  color: #dce9e6;
+  border-bottom: 1px solid #31514d;
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 12px;
+}
+
+.log-item:last-child {
+  border-bottom: 0;
+}
+
+.log-item time {
+  color: #a2b9b5;
+  font-variant-numeric: tabular-nums;
+}
+
+.log-item span {
+  color: #7ecfc0;
+  font-weight: 700;
+}
+
+.log-item p {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.log-item--warning span {
+  color: #f0bb63;
+}
+
+.log-item--error span {
+  color: #ed968c;
+}
+
+.log-item--success span {
+  color: #8bd5a5;
+}
+
+.toast {
+  position: fixed;
+  z-index: 8;
+  right: 20px;
+  bottom: 20px;
+  max-width: min(420px, calc(100% - 40px));
+  padding: 10px 13px;
+  color: #fff;
+  background: #263a38;
+  border: 1px solid #52736d;
+  border-radius: 5px;
+  box-shadow: var(--shadow);
+}
+
+.toast.is-error {
+  background: #793632;
+  border-color: #b96861;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+[hidden] {
+  display: none !important;
+}
+
+@media (max-width: 1050px) {
+  .connection-form {
+    grid-template-columns: repeat(3, minmax(150px, 1fr));
+  }
+
+  .remember-control,
+  .connection-form > .button {
+    align-self: end;
+  }
+
+  .zone-control {
+    grid-column: span 2;
+  }
+
+  .arena-layout,
+  .treasure-layout,
+  .dungeon-layout {
+    grid-template-columns: minmax(260px, 0.8fr) minmax(380px, 1.2fr);
+  }
+}
+
+@media (max-width: 760px) {
+  .app-header__inner,
+  .workspace {
+    width: min(100%, calc(100% - 24px));
+  }
+
+  .app-header__inner {
+    align-items: flex-start;
+    min-height: 92px;
+    padding: 14px 0;
+  }
+
+  .configuration-band,
+  .feature-panel,
+  .run-panel {
+    padding: 18px 14px;
+  }
+
+  .section-heading,
+  .section-heading--compact {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .summary-strip {
+    width: 100%;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    border-top: 1px solid var(--line);
+  }
+
+  .summary-item {
+    padding: 8px 10px;
+    border-bottom: 1px solid var(--line);
+  }
+
+  .connection-form {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .connection-form > .button,
+  .zone-control {
+    grid-column: 1 / -1;
+  }
+
+  .remember-control {
+    align-self: center;
+  }
+
+  .tabs {
+    padding: 0 14px;
+  }
+
+  .tab-button {
+    flex: 1 1 0;
+    padding: 0 8px;
+  }
+
+  .command-bar {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .command-bar__group {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .command-bar__group:first-child .button:last-child {
+    grid-column: 1 / -1;
+  }
+
+  .arena-layout,
+  .treasure-layout,
+  .dungeon-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .arena-controls,
+  .treasure-controls,
+  .dungeon-controls {
+    max-width: none;
+  }
+
+  .arena-stats,
+  .treasure-stats,
+  .dungeon-stats {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .log-item {
+    grid-template-columns: 70px 58px minmax(0, 1fr);
+    gap: 6px;
+  }
+}
+
+@media (max-width: 430px) {
+  .app-header__inner {
+    gap: 12px;
+  }
+
+  .brand-mark {
+    width: 30px;
+    height: 30px;
+    flex-basis: 30px;
+  }
+
+  h1 {
+    font-size: 18px;
+  }
+
+  .connection-form {
+    grid-template-columns: 1fr;
+  }
+
+  .connection-form > .button,
+  .zone-control {
+    grid-column: auto;
+  }
+
+  .summary-strip {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .arena-stats,
+  .treasure-stats,
+  .dungeon-stats {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .log-list {
+    max-height: 290px;
+  }
+}

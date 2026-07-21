@@ -1,0 +1,242 @@
+from __future__ import annotations
+
+import socket
+import unittest
+
+from harvest_fief import (
+    LOGIN_MESSAGE_ID,
+    LOGIN_REUNIQUE_MESSAGE_ID,
+    PACK_PASSWORD_MESSAGE_ID,
+    SOCKET_PACK_KEY,
+    GameEndpoint,
+    decode_message_header,
+    encode_bytes_field,
+    encode_int_field,
+    encode_message_header,
+    encode_varint,
+    pack1_decode,
+    pack1_encode,
+)
+from treasure_area import (
+    MAP_TREASURE_CLEAR_RESULT_MESSAGE_ID,
+    MAP_TREASURE_INFO_MESSAGE_ID,
+    MAP_TREASURE_SWEEP_MESSAGE_ID,
+    MAX_SWEEP_TIMES_PER_REQUEST,
+    TreasureAreaClient,
+    TreasureAreaRejected,
+    decode_treasure_area_status,
+    encode_treasure_sweep_request,
+)
+
+
+def _treasure_status_payload(
+    *,
+    swept_today: int,
+    daily_sweep_limit: int,
+    area_ids: tuple[int, ...],
+    has_pending_results: bool = False,
+) -> bytes:
+    packed_areas = b"".join(encode_varint(area_id) for area_id in area_ids)
+    payload = (
+        encode_int_field(1, 3)
+        + encode_int_field(2, 120)
+        + encode_int_field(3, swept_today)
+        + encode_int_field(4, daily_sweep_limit)
+        + encode_bytes_field(5, packed_areas)
+    )
+    if has_pending_results:
+        payload += encode_bytes_field(6, b"")
+    return payload
+
+
+class FakeSocket:
+    def __init__(self, frames: list[tuple[int, bytes]]) -> None:
+        self.frames = list(frames)
+        self.binary_frames: list[bytes] = []
+        self.text_frames: list[str] = []
+        self.closed = False
+
+    def send_binary(self, payload: bytes) -> None:
+        self.binary_frames.append(payload)
+
+    def send_text(self, payload: str) -> None:
+        self.text_frames.append(payload)
+
+    def recv_message(self, _timeout: float) -> tuple[int, bytes]:
+        if not self.frames:
+            raise socket.timeout()
+        return self.frames.pop(0)
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class TreasureAreaProtocolTestCase(unittest.TestCase):
+    def setUp(self) -> None:
+        self.endpoint = GameEndpoint("ws://test.invalid", "game-token", "1", "测试区")
+
+    def test_status_decodes_available_maps_and_daily_remaining_count(self) -> None:
+        status = decode_treasure_area_status(
+            _treasure_status_payload(
+                swept_today=4,
+                daily_sweep_limit=9,
+                area_ids=(1001, 1002),
+            )
+        )
+
+        self.assertEqual(status.area_ids, (1001, 1002))
+        self.assertEqual(status.swept_today, 4)
+        self.assertEqual(status.daily_sweep_limit, 9)
+        self.assertEqual(status.sweep_remaining, 5)
+        self.assertFalse(status.has_pending_results)
+
+    def test_status_clears_pending_sweep_results_before_returning(self) -> None:
+        session_password = "87654321"
+        password_payload = encode_bytes_field(
+            1, pack1_encode(session_password.encode("utf-8"), SOCKET_PACK_KEY).encode("utf-8")
+        )
+
+        def encrypted(message_id: int, data: bytes = b"") -> tuple[int, bytes]:
+            return (
+                0x2,
+                pack1_encode(
+                    encode_message_header(message_id, data), session_password
+                ).encode("utf-8"),
+            )
+
+        pending = _treasure_status_payload(
+            swept_today=2,
+            daily_sweep_limit=10,
+            area_ids=(1001,),
+            has_pending_results=True,
+        )
+        cleared = _treasure_status_payload(
+            swept_today=2,
+            daily_sweep_limit=10,
+            area_ids=(1001,),
+        )
+        fake_socket = FakeSocket(
+            [
+                (0x2, encode_message_header(PACK_PASSWORD_MESSAGE_ID, password_payload)),
+                encrypted(LOGIN_REUNIQUE_MESSAGE_ID),
+                encrypted(MAP_TREASURE_INFO_MESSAGE_ID, pending),
+                encrypted(MAP_TREASURE_CLEAR_RESULT_MESSAGE_ID, cleared),
+            ]
+        )
+        client = TreasureAreaClient(
+            self.endpoint,
+            1.0,
+            socket_factory=lambda _url, _timeout: fake_socket,
+        )
+
+        status = client.get_status()
+
+        self.assertFalse(status.has_pending_results)
+        self.assertEqual(status.sweep_remaining, 8)
+        sent_ids = [
+            decode_message_header(pack1_decode(frame, session_password)).message_id
+            for frame in fake_socket.text_frames
+        ]
+        self.assertEqual(
+            sent_ids,
+            [MAP_TREASURE_INFO_MESSAGE_ID, MAP_TREASURE_CLEAR_RESULT_MESSAGE_ID],
+        )
+
+    def test_sweep_request_uses_native_area_useitem_and_times_fields(self) -> None:
+        request = encode_treasure_sweep_request(1001, MAX_SWEEP_TIMES_PER_REQUEST)
+
+        self.assertEqual(request, b"\x08\xe9\x07\x10\x01\x18\x1e")
+        with self.assertRaises(ValueError):
+            encode_treasure_sweep_request(1001, MAX_SWEEP_TIMES_PER_REQUEST + 1)
+
+    def test_client_queries_status_then_sweeps_with_server_updated_quota(self) -> None:
+        session_password = "87654321"
+        password_payload = encode_bytes_field(
+            1, pack1_encode(session_password.encode("utf-8"), SOCKET_PACK_KEY).encode("utf-8")
+        )
+
+        def encrypted(message_id: int, data: bytes = b"") -> tuple[int, bytes]:
+            packet = encode_message_header(message_id, data)
+            return 0x2, pack1_encode(packet, session_password).encode("utf-8")
+
+        initial = _treasure_status_payload(
+            swept_today=2,
+            daily_sweep_limit=10,
+            area_ids=(1001, 1002),
+        )
+        updated = _treasure_status_payload(
+            swept_today=5,
+            daily_sweep_limit=10,
+            area_ids=(1001, 1002),
+        )
+        sweep_response = encode_bytes_field(2, updated)
+        fake_socket = FakeSocket(
+            [
+                (0x2, encode_message_header(PACK_PASSWORD_MESSAGE_ID, password_payload)),
+                encrypted(LOGIN_REUNIQUE_MESSAGE_ID),
+                encrypted(MAP_TREASURE_INFO_MESSAGE_ID, initial),
+                encrypted(MAP_TREASURE_SWEEP_MESSAGE_ID, sweep_response),
+            ]
+        )
+        client = TreasureAreaClient(
+            self.endpoint,
+            1.0,
+            socket_factory=lambda _url, _timeout: fake_socket,
+        )
+
+        status = client.get_status()
+        response = client.sweep(1001, 3)
+
+        self.assertEqual(status.sweep_remaining, 8)
+        self.assertEqual(response.status.swept_today, 5)
+        self.assertEqual(response.status.sweep_remaining, 5)
+        self.assertEqual(
+            decode_message_header(fake_socket.binary_frames[0]).message_id,
+            LOGIN_MESSAGE_ID,
+        )
+        info_packet = decode_message_header(
+            pack1_decode(fake_socket.text_frames[0], session_password)
+        )
+        self.assertEqual(info_packet.message_id, MAP_TREASURE_INFO_MESSAGE_ID)
+        self.assertEqual(info_packet.data, b"")
+        sweep_packet = decode_message_header(
+            pack1_decode(fake_socket.text_frames[1], session_password)
+        )
+        self.assertEqual(sweep_packet.message_id, MAP_TREASURE_SWEEP_MESSAGE_ID)
+        self.assertEqual(sweep_packet.data, encode_treasure_sweep_request(1001, 3))
+
+    def test_client_raises_for_server_rejection(self) -> None:
+        session_password = "87654321"
+        password_payload = encode_bytes_field(
+            1, pack1_encode(session_password.encode("utf-8"), SOCKET_PACK_KEY).encode("utf-8")
+        )
+
+        def encrypted(message_id: int, data: bytes = b"") -> tuple[int, bytes]:
+            return (
+                0x2,
+                pack1_encode(
+                    encode_message_header(message_id, data), session_password
+                ).encode("utf-8"),
+            )
+
+        fake_socket = FakeSocket(
+            [
+                (0x2, encode_message_header(PACK_PASSWORD_MESSAGE_ID, password_payload)),
+                encrypted(LOGIN_REUNIQUE_MESSAGE_ID),
+                encrypted(MAP_TREASURE_SWEEP_MESSAGE_ID, encode_int_field(1, 4)),
+            ]
+        )
+        client = TreasureAreaClient(
+            self.endpoint,
+            1.0,
+            socket_factory=lambda _url, _timeout: fake_socket,
+        )
+
+        with self.assertRaises(TreasureAreaRejected) as context:
+            client.sweep(1001, 1)
+
+        self.assertEqual(context.exception.ret, 4)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -2,7 +2,13 @@ from __future__ import annotations
 
 import unittest
 
-from app.services.arena_service import ArenaService
+from app.job_manager import JobExecutionError
+from app.services.arena_service import (
+    ArenaService,
+    describe_login_kickout,
+    format_run_summary,
+    format_status_line,
+)
 from dragon_arena import (
     DragonArenaChallengeResponse,
     DragonArenaChallengeResult,
@@ -11,12 +17,13 @@ from dragon_arena import (
     DragonArenaMatchResponse,
     DragonArenaOpponent,
     DragonArenaRoundResult,
+    GameLoginKickout,
 )
 from harvest_fief import GameEndpoint, ItemChange
 
 
 class InMemoryArenaClient:
-    def __init__(self) -> None:
+    def __init__(self, *, fail_enter: Exception | None = None) -> None:
         self.entered = False
         self.closed = False
         self.matched = False
@@ -24,15 +31,20 @@ class InMemoryArenaClient:
         self.choice_ids: list[int] = []
         self.challenged: list[bool] = []
         self.rounds = 0
+        self._fail_enter = fail_enter
 
     def __enter__(self) -> "InMemoryArenaClient":
+        if self._fail_enter is not None:
+            raise self._fail_enter
         self.entered = True
         return self
 
     def close(self) -> None:
         self.closed = True
 
-    def resume_pending_battle(self, *, mercy_choice_id: int) -> None:
+    def resume_pending_battle(
+        self, *, win_choice_id: int | None = None, mercy_choice_id: int | None = None
+    ) -> None:
         return None
 
     def get_info(self) -> DragonArenaInfo:
@@ -71,19 +83,26 @@ class InMemoryArenaClient:
         )
 
     def run_round(
-        self, index: int, *, mercy_choice_id: int
+        self,
+        index: int,
+        *,
+        win_choice_id: int | None = None,
+        mercy_choice_id: int | None = None,
     ) -> DragonArenaRoundResult:
         self.rounds += 1
         self.challenged[index - 1] = True
+        choice_id = (
+            win_choice_id if win_choice_id is not None else (mercy_choice_id or 0)
+        )
         if self.rounds == 1:
-            self.choice_ids.append(mercy_choice_id)
+            self.choice_ids.append(choice_id)
             return DragonArenaRoundResult(
                 index=index,
                 challenge=DragonArenaChallengeResponse(0, index, 0, True, 0),
                 battle=DragonArenaChallengeResult(True, index, False, 100, 10, 1, 0, 3),
                 mercy=DragonArenaChoiceResult(
                     0,
-                    mercy_choice_id,
+                    choice_id,
                     97,
                     -3,
                     False,
@@ -91,6 +110,7 @@ class InMemoryArenaClient:
                     0,
                     4,
                     (ItemChange(440, 4, 8848),),
+                    ((440, 4),),
                 ),
             )
         return DragonArenaRoundResult(
@@ -105,10 +125,17 @@ class ArenaServiceTestCase(unittest.TestCase):
     def setUp(self) -> None:
         self.clients: list[InMemoryArenaClient] = []
         self.endpoint = GameEndpoint("ws://test.invalid", "token", "4101", "真实一区")
-        self.service = ArenaService(live_client_builder=self._build_client)
+        self.enter_errors: list[Exception | None] = []
+        self.service = ArenaService(
+            live_client_builder=self._build_client,
+            kickout_retry_delay=0,
+            result_log_destination=None,
+        )
 
-    def _build_client(self, _endpoint: GameEndpoint, _log):
-        client = InMemoryArenaClient()
+    def _build_client(self, endpoint: GameEndpoint, _log):
+        fail_enter = self.enter_errors.pop(0) if self.enter_errors else None
+        client = InMemoryArenaClient(fail_enter=fail_enter)
+        client.endpoint = endpoint  # type: ignore[attr-defined]
         self.clients.append(client)
         return client
 
@@ -118,6 +145,7 @@ class ArenaServiceTestCase(unittest.TestCase):
         self.assertEqual(snapshot["level"], 32)
         self.assertEqual(snapshot["score"], 90)
         self.assertEqual(snapshot["stage"], {"id": 33, "name": "未知竞技场阶段（ID 33）"})
+        self.assertEqual(snapshot["choice"]["name"], "无")
         self.assertEqual(
             snapshot["opponents"], {"total": 0, "available": 0, "challenged": 0}
         )
@@ -151,7 +179,19 @@ class ArenaServiceTestCase(unittest.TestCase):
             stats["rewards"],
             [{"id": 440, "name": "龙痕币", "delta": 4, "total": 8848}],
         )
-        self.assertTrue(any(message == "当前对手已耗尽，正在寻找新对手" for _, message, _ in events))
+        self.assertEqual(stats["dragon_coin_total"], 8848)
+        messages = [message for _, message, _ in events]
+        self.assertTrue(any("开始战斗" in message for message in messages))
+        self.assertTrue(any("战斗进行中" in message for message in messages))
+        self.assertTrue(any("战斗完成：胜利" in message for message in messages))
+        self.assertTrue(any(message == "胜利抉择：仁慈" for message in messages))
+        self.assertTrue(any("剩余对手" in message and "进度" in message for message in messages))
+        self.assertTrue(any("第 1 轮已完成" in message for message in messages))
+        self.assertTrue(any("对手已耗尽，正在寻找新对手" in message for message in messages))
+        self.assertTrue(any(message.startswith("全部完成") for message in messages))
+        self.assertIn("1 胜", stats["last_result"])
+        self.assertIn("1 负", stats["last_result"])
+        self.assertIn("共 2 场", stats["last_result"])
 
     def test_execute_uses_the_execute_choice_slot(self) -> None:
         self.service.run(
@@ -164,6 +204,94 @@ class ArenaServiceTestCase(unittest.TestCase):
         )
 
         self.assertEqual(self.clients[0].choice_ids, [1])
+
+    def test_kickout_ret2_refreshes_endpoint_and_retries_login(self) -> None:
+        refreshed = GameEndpoint("ws://retry.invalid", "token-2", "4101", "真实一区")
+        self.enter_errors = [GameLoginKickout(2, "会话已切换"), None]
+        events: list[str] = []
+
+        result = self.service.run(
+            self.endpoint,
+            1,
+            "mercy",
+            False,
+            lambda _level, message, _data: events.append(message),
+            lambda: False,
+            refresh_endpoint=lambda: refreshed,
+        )
+
+        self.assertFalse(result["cancelled"])
+        self.assertEqual(len(self.clients), 2)
+        self.assertTrue(self.clients[0].closed)
+        self.assertEqual(self.clients[1].endpoint.url, "ws://retry.invalid")
+        self.assertTrue(
+            any("重新进入区服" in message and "重试" in message for message in events)
+        )
+
+    def test_opponent_picker_is_used_instead_of_list_order(self) -> None:
+        picked: list[int] = []
+
+        def always_last(candidates):
+            index = candidates[-1]
+            picked.append(index)
+            return index
+
+        service = ArenaService(
+            live_client_builder=self._build_client,
+            kickout_retry_delay=0,
+            result_log_destination=None,
+            opponent_picker=always_last,
+        )
+        service.run(
+            self.endpoint,
+            1,
+            "mercy",
+            True,
+            lambda _level, _message, _data: None,
+            lambda: False,
+        )
+        # 刷新后有两名未挑战对手；应挑战列表末位而不是首位。
+        self.assertEqual(picked, [2])
+
+    def test_status_and_summary_lines_are_human_readable(self) -> None:
+        stats = {
+            "score": 97,
+            "score_delta": 7,
+            "dragon_coin_delta": 4,
+            "dragon_coin_total": 8848,
+            "completed_rounds": 1,
+            "requested_rounds": 10,
+            "opponents": {"total": 15, "available": 10, "challenged": 5},
+            "wins": 1,
+            "losses": 0,
+        }
+        status = format_status_line(stats)
+        self.assertIn("积分 97", status)
+        self.assertIn("龙痕币 8848", status)
+        self.assertIn("剩余对手 10/15", status)
+        self.assertIn("进度 1/10", status)
+        summary = format_run_summary(stats)
+        self.assertTrue(summary.startswith("全部完成"))
+        self.assertIn("1 胜", summary)
+        self.assertIn("共 1 场", summary)
+
+    def test_kickout_without_recovery_surfaces_specific_message(self) -> None:
+        self.enter_errors = [GameLoginKickout(2, "会话已切换")]
+
+        with self.assertRaises(JobExecutionError) as raised:
+            self.service.run(
+                self.endpoint,
+                1,
+                "mercy",
+                False,
+                lambda _level, _message, _data: None,
+                lambda: False,
+            )
+
+        self.assertIn("ret 2", str(raised.exception))
+        self.assertIn("需重新进入区服", str(raised.exception))
+        self.assertNotIn("过期", describe_login_kickout(GameLoginKickout(2)))
+        self.assertIn("令牌过期", describe_login_kickout(GameLoginKickout(51)))
 
 
 if __name__ == "__main__":

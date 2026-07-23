@@ -30,6 +30,9 @@ class InMemoryCredentialStore:
     def delete_password(self, username: str) -> None:
         self.values.pop(username, None)
 
+    def get_password(self, username: str) -> str | None:
+        return self.values.get(username)
+
     def is_configured(self, username: str) -> bool:
         return username in self.values
 
@@ -41,14 +44,34 @@ class InMemoryTokenStore:
     def save(self, result: LoginResult) -> None:
         self.saved.append(result)
 
+    def load_game_tokens(self) -> dict[str, str] | None:
+        if not self.saved:
+            return None
+        result = self.saved[-1]
+        return {
+            "userid": result.game.userid,
+            "verify_token": result.game.verify_token,
+        }
+
+    def load_refresh_token(self) -> str | None:
+        if not self.saved:
+            return None
+        return self.saved[-1].identity.refresh_token
+
 
 class FakeLoginClient:
     def __init__(self) -> None:
         self.calls: list[dict[str, str]] = []
+        self.refresh_calls: list[dict[str, str]] = []
         self.error: Exception | None = None
+        self.refresh_error: Exception | None = None
         self.result = LoginResult(
             IdentityTokens("header.payload.signature", "refresh-token", "openid-1"),
             GameTokens("user-1", "verify-token", "pay-token", None),
+        )
+        self.refresh_result = LoginResult(
+            IdentityTokens("refreshed.id", "refresh-token-2", "openid-1"),
+            GameTokens("user-1", "verify-token-refreshed", "pay-token-2", None),
         )
 
     def login_with_password(self, **kwargs: str) -> LoginResult:
@@ -56,6 +79,12 @@ class FakeLoginClient:
         if self.error is not None:
             raise self.error
         return self.result
+
+    def login_with_refresh(self, **kwargs: str) -> LoginResult:
+        self.refresh_calls.append(dict(kwargs))
+        if self.refresh_error is not None:
+            raise self.refresh_error
+        return self.refresh_result
 
 
 class InMemoryTreasureClient:
@@ -132,7 +161,9 @@ class InMemoryArenaService:
         self.snapshot_endpoints: list[GameEndpoint] = []
         self.run_endpoints: list[GameEndpoint] = []
 
-    def snapshot(self, endpoint: GameEndpoint) -> dict[str, object]:
+    def snapshot(
+        self, endpoint: GameEndpoint, *, refresh_endpoint=None
+    ) -> dict[str, object]:
         self.snapshot_endpoints.append(endpoint)
         return {
             "level": 32,
@@ -151,6 +182,8 @@ class InMemoryArenaService:
         refresh_on_exhaustion: bool,
         emit,
         stop_requested,
+        *,
+        refresh_endpoint=None,
     ) -> dict[str, object]:
         self.run_endpoints.append(endpoint)
         stats: dict[str, object] = {
@@ -246,6 +279,7 @@ class UiAppTestCase(unittest.TestCase):
                 token_store=self.token_store,
                 zone_loader=zone_loader,
                 endpoint_resolver=endpoint_resolver,
+                restore_on_init=True,
             )
 
         daily_service = DailyService(live_runner_builder=live_runner_builder)
@@ -255,7 +289,8 @@ class UiAppTestCase(unittest.TestCase):
             return InMemoryTreasureClient(self.treasure_state)
 
         treasure_service = TreasureService(
-            live_client_builder=treasure_client_builder
+            live_client_builder=treasure_client_builder,
+            result_log_destination=None,
         )
 
         def dungeon_client_builder(endpoint: GameEndpoint):
@@ -387,6 +422,88 @@ class UiAppTestCase(unittest.TestCase):
         self.assertNotIn("verify-token", response.get_data(as_text=True))
         self.assertNotIn("demo-secret", self.config_path.read_text(encoding="utf-8"))
 
+    def test_session_restores_from_saved_tokens_after_recreate(self) -> None:
+        self.assertEqual(self.login(remember_password=True).status_code, 200)
+        self.assertEqual(
+            self.put_json(
+                "/api/config/zone", {"id": "4101", "name": "真实一区"}
+            ).status_code,
+            200,
+        )
+        self.zone_requests.clear()
+        self.app.extensions["daily_console"]["jobs"].shutdown()
+
+        restored_app = create_app(
+            {"TESTING": True, "SIMULATION_DELAY": 0.01},
+            config_path=self.config_path,
+            credential_store=self.credentials,
+            account_service_factory=lambda config_store, credentials: AccountService(
+                config_store,
+                credentials,
+                login_client_factory=lambda: self.login_client,
+                token_store=self.token_store,
+                zone_loader=lambda tokens: (
+                    self.zone_requests.append(dict(tokens)) or (
+                        AccountZone(4101, "真实一区"),
+                        AccountZone("4102", "真实二区"),
+                    )
+                ),
+                endpoint_resolver=lambda tokens, args: GameEndpoint(
+                    "ws://test.invalid", "game-token", getattr(args, "zone_id"), "真实一区"
+                ),
+            ),
+            arena_service=self.arena_service,
+        )
+        self.addCleanup(
+            restored_app.extensions["daily_console"]["jobs"].shutdown
+        )
+        restored_client = restored_app.test_client()
+
+        config = restored_client.get("/api/config").get_json()
+        self.assertEqual(config["connection"]["status"], "available")
+        self.assertEqual(
+            config["zones"],
+            [{"id": "4101", "name": "真实一区"}, {"id": "4102", "name": "真实二区"}],
+        )
+        self.assertEqual(config["zone"]["id"], "4101")
+        self.assertEqual(
+            self.zone_requests, [{"userid": "user-1", "verify_token": "verify-token"}]
+        )
+        self.assertEqual(len(self.login_client.calls), 1)
+
+        index = restored_client.get("/")
+        self.assertEqual(index.status_code, 200)
+        self.assertIn(b'"status": "available"', index.data)
+        self.assertIn(b'"id": "4101"', index.data)
+        # Jinja tojson 会把中文区服名转义为 \\uXXXX。
+        self.assertIn(b"\\u771f\\u5b9e\\u4e00\\u533a", index.data)
+
+    def test_login_with_empty_password_uses_remembered_credential(self) -> None:
+        self.assertEqual(self.login(remember_password=True).status_code, 200)
+        self.login_client.calls.clear()
+
+        response = self.post_json(
+            "/api/account/login",
+            {
+                "username": "demo-user",
+                "password": "",
+                "remember_password": True,
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(self.login_client.calls), 1)
+        self.assertEqual(self.login_client.calls[0]["password"], "demo-secret")
+
+    def test_tab_auto_refresh_hooks_exist_in_frontend(self) -> None:
+        script = (
+            Path(__file__).resolve().parents[1] / "app" / "static" / "app.js"
+        ).read_text(encoding="utf-8")
+        self.assertIn("function refreshTab(name", script)
+        self.assertIn("activateTab(button.dataset.tab)", script)
+        self.assertIn("refreshTab(state.activeTab)", script)
+        self.assertIn("已恢复登录", script)
+
     def test_zone_selection_requires_current_login_result(self) -> None:
         response = self.put_json(
             "/api/config/zone", {"id": "4101", "name": "真实一区"}
@@ -487,8 +604,8 @@ class UiAppTestCase(unittest.TestCase):
         self.assertEqual(
             payload["areas"],
             [
-                {"id": 1001, "name": "未知地图（ID 1001）", "selected": False},
-                {"id": 1002, "name": "未知地图（ID 1002）", "selected": False},
+                {"id": 1001, "name": "审判庭城门前", "selected": False},
+                {"id": 1002, "name": "幽暗林地", "selected": False},
             ],
         )
         self.assertEqual(
@@ -520,15 +637,19 @@ class UiAppTestCase(unittest.TestCase):
         self.assertEqual(self.treasure_state["sweep_calls"], [(1001, 4)])
         self.assertEqual(
             terminal["result"]["request"],
-            {"area_id": 1001, "area_name": "未知地图（ID 1001）", "times": 4},
+            {"area_id": 1001, "area_name": "审判庭城门前", "times": 4},
         )
         self.assertEqual(terminal["result"]["treasure"]["sweep"]["available"], 1)
+        self.assertIn("审判庭城门前", terminal["result"]["summary"])
         self.assertEqual(
             self.client.get("/api/config").get_json()["treasure"],
             {
                 "area_id": 1001,
-                "area_name": "未知地图（ID 1001）",
+                "area_name": "审判庭城门前",
                 "times": 4,
+                "farm_area_id": 530101,
+                "farm_area_name": "沉默之城",
+                "farm_target_hearth": 100,
             },
         )
 

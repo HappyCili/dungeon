@@ -29,14 +29,21 @@ class DailyActionSpec:
 
 DAILY_ACTION_SPECS: tuple[DailyActionSpec, ...] = (
     DailyActionSpec(101, 5, "冒险者公会“换一批”"),
+    DailyActionSpec(103, 5, "铁匠铺锻造"),
     DailyActionSpec(104, 1, "秘法塔探索"),
     DailyActionSpec(105, 2, "庄园普通收取"),
+    DailyActionSpec(106, 1, "庄园快速收取"),
+    DailyActionSpec(109, 3, "骑士比武挑战"),
     DailyActionSpec(112, 1, "龙痕竞技场胜利"),
     DailyActionSpec(119, 1, "古律院铭刻"),
 )
 DAILY_ACTION_BY_ID = {spec.task_id: spec for spec in DAILY_ACTION_SPECS}
 FIEF_NORMAL_HARVESTS_PER_RUN = 1
+FIEF_QUICK_HARVESTS_PER_RUN = 1
 FIXTURE_DAILY_REMAINING_SECONDS = 5 * 3600 + 42 * 60 + 18
+# 独立刷 SS 脚本默认仅在金币单价 < 200 时刷新；日常任务需补足 5 次，
+# 允许配置表最高 200 金币单价（比较为 cost >= limit 时停止，故取 201）。
+DAILY_GUILD_GOLD_COST_LIMIT = 201
 
 
 @dataclass(frozen=True)
@@ -257,6 +264,20 @@ class DailyActionRunner:
             return fallback
 
 
+def _guild_stop_label(stop_reason: str) -> str:
+    from adventurer_guild_daily_auto_refresh import RESULT_LABELS, STOP_LABELS
+
+    if stop_reason in STOP_LABELS:
+        return STOP_LABELS[stop_reason]
+    if stop_reason.startswith("server_ret_"):
+        try:
+            ret = int(stop_reason.removeprefix("server_ret_"))
+        except ValueError:
+            return stop_reason
+        return RESULT_LABELS.get(ret, f"服务端返回 ret={ret}")
+    return stop_reason
+
+
 def run_adventurer_guild_action(
     endpoint: GameEndpoint,
     timeout: float,
@@ -265,7 +286,11 @@ def run_adventurer_guild_action(
     client_factory: Callable[..., object] | None = None,
     catalog: object | None = None,
 ) -> ActionExecution:
-    """按日常剩余次数刷新，发现 SS 时由现有策略立即停止。"""
+    """按日常剩余次数刷新，发现 SS 时由现有策略立即停止。
+
+    日常模式允许配置表内全部金币价位（最高 200），以便在已用过低价刷新后
+    仍能补足任务进度；独立脚本默认的 ``< 200`` 节流策略不在此处使用。
+    """
 
     if remaining <= 0:
         return ActionExecution(0, 0, "无需执行冒险者公会刷新")
@@ -288,14 +313,21 @@ def run_adventurer_guild_action(
         catalog,
         max_refreshes=remaining,
         target_refreshes=remaining,
+        gold_cost_limit=DAILY_GUILD_GOLD_COST_LIMIT,
     )
     attempts = len(result.attempts)
+    stop_reason = getattr(result, "stop_reason", "") or ""
+    stop_label = _guild_stop_label(stop_reason) if stop_reason else ""
     if result.paused:
-        message = "检测到 SS，已停止刷新，等待服务端状态确认"
+        message = "检测到 SS，已停止刷新"
     elif attempts == 0:
-        message = "没有符合策略的刷新次数，等待服务端状态确认"
+        message = "没有符合策略的刷新次数"
+    elif attempts < remaining:
+        message = f"已请求 {attempts}/{remaining} 次冒险者公会刷新"
     else:
         message = f"已请求 {attempts}/{remaining} 次冒险者公会刷新"
+    if stop_label and stop_reason != "daily_target_reached":
+        message = f"{message}（{stop_label}）"
     return ActionExecution(remaining, attempts, message)
 
 
@@ -321,6 +353,42 @@ def run_arcane_tower_action(
     return ActionExecution(remaining, attempts, message)
 
 
+def run_smithy_forge_action(
+    endpoint: GameEndpoint,
+    timeout: float,
+    remaining: int,
+    *,
+    client_factory: Callable[..., object] | None = None,
+) -> ActionExecution:
+    """日常 103：铁匠铺普通锻造，按服务端剩余次数补足。"""
+
+    if remaining <= 0:
+        return ActionExecution(0, 0, "无需执行铁匠铺锻造")
+    if not 0 < remaining <= DAILY_ACTION_BY_ID[103].target:
+        raise ValueError("铁匠铺锻造剩余次数必须在 1 到 5 之间")
+
+    from smithy_forge import (
+        SmithyForgeClient,
+        forged_count,
+        stop_reason_label,
+    )
+
+    factory = client_factory or SmithyForgeClient
+    result = factory(endpoint, timeout).forge_for_daily(max_times=remaining)
+    forged = forged_count(result)
+    stop_reason = getattr(result, "stop_reason", "") or ""
+    stop_label = stop_reason_label(stop_reason) if stop_reason else ""
+    if forged <= 0:
+        message = f"未执行铁匠铺锻造（{stop_label or '无可用次数'}）"
+    elif forged < remaining:
+        message = f"铁匠铺锻造成功 {forged}/{remaining} 次"
+        if stop_label and stop_reason != "completed":
+            message = f"{message}（{stop_label}）"
+    else:
+        message = f"铁匠铺锻造成功 {forged}/{remaining} 次"
+    return ActionExecution(remaining, forged, message)
+
+
 def run_fief_harvest_action(
     endpoint: GameEndpoint,
     timeout: float,
@@ -337,6 +405,7 @@ def run_fief_harvest_action(
     from harvest_fief import (
         FiefClient,
         FiefHarvestRejected,
+        HARVEST_NORMAL,
         describe_fief_harvest_rejection,
     )
 
@@ -345,7 +414,7 @@ def run_fief_harvest_action(
     requested_count = min(remaining, FIEF_NORMAL_HARVESTS_PER_RUN)
     for attempt_number in range(1, requested_count + 1):
         try:
-            results.append(factory(endpoint, timeout).harvest())
+            results.append(factory(endpoint, timeout).harvest(HARVEST_NORMAL))
         except FiefHarvestRejected as exc:
             return ActionExecution(
                 requested_count,
@@ -365,21 +434,156 @@ def run_fief_harvest_action(
     )
 
 
+def run_fief_quick_harvest_action(
+    endpoint: GameEndpoint,
+    timeout: float,
+    remaining: int,
+    *,
+    client_factory: Callable[..., object] | None = None,
+    allow_pay: bool = False,
+) -> ActionExecution:
+    """日常 106：庄园快速收取。
+
+    默认只发送 ``HARVEST_FREE``（免费快速收取），不消耗宝石。``allow_pay``
+    为真时才在免费次数不足后尝试 ``HARVEST_PAY``；编排入口默认关闭。
+    """
+
+    if not 0 <= remaining <= DAILY_ACTION_BY_ID[106].target:
+        raise ValueError("庄园快速收取剩余次数必须在 0 到 1 之间")
+    if remaining == 0:
+        return ActionExecution(0, 0, "无需执行庄园快速收取")
+    from harvest_fief import (
+        FiefClient,
+        FiefHarvestRejected,
+        HARVEST_FREE,
+        HARVEST_PAY,
+        describe_fief_harvest_rejection,
+    )
+
+    factory = client_factory or FiefClient
+    requested_count = min(remaining, FIEF_QUICK_HARVESTS_PER_RUN)
+    attempted = 0
+    for attempt_number in range(1, requested_count + 1):
+        try:
+            factory(endpoint, timeout).harvest(HARVEST_FREE)
+            attempted += 1
+        except FiefHarvestRejected as free_exc:
+            if free_exc.ret != 1 or not allow_pay:
+                return ActionExecution(
+                    requested_count,
+                    attempted,
+                    f"第 {attempt_number} 次庄园快速收取未执行："
+                    f"{describe_fief_harvest_rejection(free_exc.ret)}",
+                )
+            try:
+                factory(endpoint, timeout).harvest(HARVEST_PAY)
+                attempted += 1
+            except FiefHarvestRejected as pay_exc:
+                return ActionExecution(
+                    requested_count,
+                    attempted,
+                    f"第 {attempt_number} 次庄园付费快速收取未执行："
+                    f"{describe_fief_harvest_rejection(pay_exc.ret)}",
+                )
+            except HarvestError as exc:
+                return ActionExecution(
+                    requested_count,
+                    attempted,
+                    f"第 {attempt_number} 次庄园付费快速收取异常（{_action_error_detail(exc)}）",
+                )
+        except HarvestError as exc:
+            return ActionExecution(
+                requested_count,
+                attempted,
+                f"第 {attempt_number} 次庄园快速收取异常（{_action_error_detail(exc)}）",
+            )
+    return ActionExecution(
+        requested_count,
+        attempted,
+        f"已请求 {attempted}/{requested_count} 次庄园快速收取，等待服务端状态确认",
+    )
+
+
+def run_knight_arena_action(
+    endpoint: GameEndpoint,
+    timeout: float,
+    remaining: int,
+    *,
+    client_factory: Callable[..., object] | None = None,
+    refresh_on_exhaustion: bool = True,
+) -> ActionExecution:
+    """执行日常任务 109：在骑士比武完成 ``remaining`` 次挑战。
+
+    只计挑战次数，不要求胜利；角色与对手均可任意选取。
+    """
+
+    if remaining <= 0:
+        return ActionExecution(0, 0, "无需执行骑士比武挑战")
+    from knight_arena import KnightArenaClient
+
+    factory = client_factory or KnightArenaClient
+    client = factory(
+        endpoint,
+        timeout,
+        log=lambda _message: None,
+        log_server_messages=False,
+        websocket_log=None,
+        business_log=None,
+    )
+    try:
+        enter = getattr(client, "__enter__", None)
+        if callable(enter):
+            enter()
+        results = client.run_loop(
+            rounds=remaining,
+            refresh_on_exhaustion=refresh_on_exhaustion,
+        )
+    finally:
+        close = getattr(client, "close", None)
+        if callable(close):
+            close()
+    completed = sum(1 for result in results if result.battle is not None)
+    wins = sum(
+        1 for result in results if result.battle is not None and result.battle.win
+    )
+    losses = completed - wins
+    return ActionExecution(
+        remaining,
+        completed,
+        (
+            f"骑士比武完成 {completed}/{remaining} 场挑战"
+            f"（{wins} 胜 / {losses} 负），等待服务端状态确认"
+        ),
+    )
+
+
 def run_dragon_arena_action(
     endpoint: GameEndpoint,
     timeout: float,
     remaining: int,
     *,
     client_factory: Callable[..., object] | None = None,
+    win_choice_id: int | None = None,
     mercy_choice_id: int | None = None,
+    outcome: str = "mercy",
     refresh_on_exhaustion: bool = True,
 ) -> ActionExecution:
+    """执行日常任务 112：在龙痕竞技场取得 ``remaining`` 场胜利。
+
+    ``remaining`` 是服务端尚未完成的胜利次数，不是挑战次数；失败后会继续
+    挑战直至胜利数达标或候选对手耗尽。
+    """
+
     if remaining <= 0:
         return ActionExecution(0, 0, "无需执行龙痕竞技场挑战")
-    from dragon_arena import DragonArenaClient, MERCY_CHOICE_ID
+    from dragon_arena import DragonArenaClient, resolve_win_choice_id
 
     factory = client_factory or DragonArenaClient
-    choice_id = mercy_choice_id or MERCY_CHOICE_ID
+    choice_id = resolve_win_choice_id(
+        win_choice_id=win_choice_id,
+        mercy_choice_id=mercy_choice_id,
+        outcome=None if (win_choice_id is not None or mercy_choice_id is not None) else outcome,
+    )
     # 统一入口不创建完整 WebSocket 原始载荷日志，也不向页面回显服务端报文。
     client = factory(
         endpoint,
@@ -395,11 +599,12 @@ def run_dragon_arena_action(
             enter()
         resume = getattr(client, "resume_pending_battle", None)
         if callable(resume):
-            resume(mercy_choice_id=choice_id)
+            resume(win_choice_id=choice_id)
         results = client.run_loop(
             rounds=remaining,
-            mercy_choice_id=choice_id,
+            win_choice_id=choice_id,
             refresh_on_exhaustion=refresh_on_exhaustion,
+            require_wins=True,
         )
     finally:
         close = getattr(client, "close", None)
@@ -411,7 +616,7 @@ def run_dragon_arena_action(
     return ActionExecution(
         remaining,
         len(results),
-        f"龙痕竞技场胜利 {wins}/{len(results)} 场，等待服务端状态确认",
+        f"龙痕竞技场胜利 {wins}/{remaining} 场（挑战 {len(results)} 次），等待服务端状态确认",
     )
 
 
@@ -427,6 +632,11 @@ def run_ancient_law_court_action(
     from engrave_ancient_law_court_daily_free import (
         AncientLawCourtClient,
         RESULT_SUCCESS,
+        collect_highlight_runes,
+        format_highlight_rune_summary,
+        load_name_catalogs,
+        DEFAULT_ITEM_MAP,
+        DEFAULT_RUNE_TABLE,
     )
 
     factory = client_factory or AncientLawCourtClient
@@ -440,6 +650,15 @@ def run_ancient_law_court_action(
         message = "没有免费古律院铭刻次数，等待服务端状态确认"
     else:
         message = f"古律院免费铭刻校验成功 {verified}/{attempts} 次"
+    try:
+        catalogs = load_name_catalogs(DEFAULT_ITEM_MAP, DEFAULT_RUNE_TABLE)
+    except Exception:
+        catalogs = None
+    highlights = collect_highlight_runes(result, catalogs)
+    if highlights:
+        message = (
+            f"{message}；高品质掉落：{format_highlight_rune_summary(highlights)}"
+        )
     return ActionExecution(remaining, attempts, message)
 
 
@@ -460,11 +679,20 @@ def build_live_daily_action_runner(
         101: CallableDailyAction(
             lambda remaining: run_adventurer_guild_action(endpoint, timeout, remaining)
         ),
+        103: CallableDailyAction(
+            lambda remaining: run_smithy_forge_action(endpoint, timeout, remaining)
+        ),
         104: CallableDailyAction(
             lambda remaining: run_arcane_tower_action(endpoint, timeout, remaining)
         ),
         105: CallableDailyAction(
             lambda remaining: run_fief_harvest_action(endpoint, timeout, remaining)
+        ),
+        106: CallableDailyAction(
+            lambda remaining: run_fief_quick_harvest_action(endpoint, timeout, remaining)
+        ),
+        109: CallableDailyAction(
+            lambda remaining: run_knight_arena_action(endpoint, timeout, remaining)
         ),
         112: CallableDailyAction(
             lambda remaining: run_dragon_arena_action(endpoint, timeout, remaining)

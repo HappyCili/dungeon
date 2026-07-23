@@ -43,7 +43,7 @@
           <label class="field-control">
             <span>密码</span>
             <span class="password-control">
-              <input id="password" name="password" type="password" maxlength="256" autocomplete="current-password" required>
+              <input id="password" name="password" type="password" maxlength="256" autocomplete="current-password" {% if not initial_state.config.account.password_configured %}required{% endif %} placeholder="{% if initial_state.config.account.password_configured %}已记住密码，可直接登录{% endif %}">
               <button id="toggle-password" class="icon-button" type="button" aria-label="显示密码" aria-pressed="false" title="显示密码">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6S2 12 2 12Z"></path><circle cx="12" cy="12" r="2.6"></circle></svg>
               </button>
@@ -68,6 +68,7 @@
         <button id="arena-tab" class="tab-button" type="button" role="tab" aria-selected="false" aria-controls="arena-panel" data-tab="arena">龙痕竞技场</button>
         <button id="treasure-tab" class="tab-button" type="button" role="tab" aria-selected="false" aria-controls="treasure-panel" data-tab="treasure">聚宝之地</button>
         <button id="dungeon-tab" class="tab-button" type="button" role="tab" aria-selected="false" aria-controls="dungeon-panel" data-tab="dungeon">地下城扫荡</button>
+        <button id="abyss-tab" class="tab-button" type="button" role="tab" aria-selected="false" aria-controls="abyss-panel" data-tab="abyss">罪者深渊</button>
       </nav>
 
       <section id="daily-panel" class="feature-panel" role="tabpanel" aria-labelledby="daily-tab">
@@ -170,12 +171,13 @@
       <section id="treasure-panel" class="feature-panel" role="tabpanel" aria-labelledby="treasure-tab" hidden>
         <div class="section-heading section-heading--compact">
           <div>
-            <p class="eyebrow">地图扫荡</p>
+            <p class="eyebrow">扫荡与刷取</p>
             <h2>聚宝之地</h2>
           </div>
         </div>
         <div class="treasure-layout">
           <div class="treasure-controls">
+            <p class="field-hint">扫荡（消耗寻宝卷轴）</p>
             <label class="field-control">
               <span>可扫荡地图</span>
               <select id="treasure-area" disabled>
@@ -201,6 +203,37 @@
             <div><dt>每日上限</dt><dd id="treasure-limit">--</dd></div>
             <div><dt>今日可扫荡</dt><dd id="treasure-available">--</dd></div>
             <div><dt>单次上限</dt><dd id="treasure-request-limit">30</dd></div>
+          </dl>
+        </div>
+        <div class="treasure-layout treasure-layout--farm">
+          <div class="treasure-controls">
+            <p class="field-hint">刷取宝箱（击杀小怪获钥匙 → 开箱获炉温）</p>
+            <label class="field-control">
+              <span>任务地图</span>
+              <select id="treasure-farm-area">
+                <option value="">加载地图列表中…</option>
+              </select>
+            </label>
+            <label class="field-control stepper-field">
+              <span>目标炉温</span>
+              <span class="number-stepper">
+                <button class="icon-button" id="treasure-hearth-decrease" type="button" aria-label="减少目标炉温" title="减少目标炉温">-</button>
+                <input id="treasure-farm-hearth" type="number" inputmode="numeric" min="1" max="10000" value="{{ initial_state.config.treasure.farm_target_hearth }}" aria-label="聚宝之地目标炉温">
+                <button class="icon-button" id="treasure-hearth-increase" type="button" aria-label="增加目标炉温" title="增加目标炉温">+</button>
+              </span>
+            </label>
+            <div class="command-bar command-bar--treasure">
+              <button id="refresh-treasure-farm" class="button button--secondary" type="button">刷新地图</button>
+              <button id="run-treasure-farm" class="button button--primary" type="button">开始刷取</button>
+              <button id="stop-treasure-farm" class="button button--danger" type="button" disabled>停止</button>
+            </div>
+          </div>
+          <dl class="treasure-stats" aria-live="polite">
+            <div><dt>目标炉温</dt><dd id="treasure-farm-target">{{ initial_state.config.treasure.farm_target_hearth }}</dd></div>
+            <div><dt>本次已获</dt><dd id="treasure-farm-gained">--</dd></div>
+            <div><dt>当前炉温</dt><dd id="treasure-farm-total">--</dd></div>
+            <div><dt>地图钥匙</dt><dd id="treasure-farm-keys">--</dd></div>
+            <div><dt>当前阶段</dt><dd id="treasure-farm-phase">--</dd></div>
           </dl>
         </div>
       </section>
@@ -242,6 +275,47 @@
               </ul>
             </section>
           </div>
+        </div>
+      </section>
+
+      <section id="abyss-panel" class="feature-panel" role="tabpanel" aria-labelledby="abyss-tab" hidden>
+        <div class="section-heading section-heading--compact">
+          <div>
+            <p class="eyebrow">活动挑战</p>
+            <h2>罪者深渊</h2>
+          </div>
+        </div>
+        <div class="arena-layout">
+          <div class="arena-controls">
+            <label class="field-control stepper-field">
+              <span>最大轮数（0=直到失败）</span>
+              <span class="number-stepper">
+                <button class="icon-button" id="abyss-rounds-decrease" type="button" aria-label="减少最大轮数" title="减少最大轮数">-</button>
+                <input id="abyss-max-rounds" type="number" inputmode="numeric" min="0" max="900" value="{{ initial_state.config.abyss.max_rounds }}" aria-label="罪者深渊最大轮数">
+                <button class="icon-button" id="abyss-rounds-increase" type="button" aria-label="增加最大轮数" title="增加最大轮数">+</button>
+              </span>
+            </label>
+            <label class="switch-control">
+              <input id="abyss-auto-buff" type="checkbox" {% if initial_state.config.abyss.auto_buff %}checked{% endif %}>
+              <span class="switch-control__track" aria-hidden="true"></span>
+              <span>未选增益时自动选择</span>
+            </label>
+            <div class="command-bar command-bar--arena">
+              <button id="refresh-abyss" class="button button--secondary" type="button">刷新状态</button>
+              <button id="run-abyss" class="button button--primary" type="button">自动挑战直到失败</button>
+              <button id="stop-abyss" class="button button--danger" type="button" disabled>停止</button>
+            </div>
+          </div>
+          <dl class="arena-stats" aria-live="polite">
+            <div><dt>赛季</dt><dd id="abyss-season">--</dd></div>
+            <div><dt>已通关层</dt><dd id="abyss-pass-level">--</dd></div>
+            <div><dt>下一层</dt><dd id="abyss-next-level">--</dd></div>
+            <div><dt>增益</dt><dd id="abyss-buff">--</dd></div>
+            <div><dt>本局胜 / 负</dt><dd id="abyss-win-loss">0 / 0</dd></div>
+            <div><dt>已挑战</dt><dd id="abyss-completed">0</dd></div>
+            <div><dt>当前阶段</dt><dd id="abyss-stage">空闲</dd></div>
+            <div class="arena-stats__last"><dt>最后结果</dt><dd id="abyss-last-result">等待开始</dd></div>
+          </dl>
         </div>
       </section>
 

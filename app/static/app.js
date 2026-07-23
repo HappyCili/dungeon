@@ -7,13 +7,17 @@
     daily: initialState.daily,
     arena: null,
     treasure: null,
+    treasureFarm: null,
     dungeon: null,
     dungeonRewards: [],
     dungeonDraw: null,
+    abyss: null,
     activeJobId: initialState.config.active_job_id,
     lastSequence: 0,
     pollTimer: null,
     toastTimer: null,
+    activeTab: "daily",
+    tabRefreshGeneration: 0,
   };
 
   const elements = {
@@ -64,6 +68,18 @@
     treasureLimit: document.getElementById("treasure-limit"),
     treasureAvailable: document.getElementById("treasure-available"),
     treasureRequestLimit: document.getElementById("treasure-request-limit"),
+    treasureFarmArea: document.getElementById("treasure-farm-area"),
+    treasureFarmHearth: document.getElementById("treasure-farm-hearth"),
+    decreaseTreasureHearth: document.getElementById("treasure-hearth-decrease"),
+    increaseTreasureHearth: document.getElementById("treasure-hearth-increase"),
+    refreshTreasureFarm: document.getElementById("refresh-treasure-farm"),
+    runTreasureFarm: document.getElementById("run-treasure-farm"),
+    stopTreasureFarm: document.getElementById("stop-treasure-farm"),
+    treasureFarmTarget: document.getElementById("treasure-farm-target"),
+    treasureFarmGained: document.getElementById("treasure-farm-gained"),
+    treasureFarmTotal: document.getElementById("treasure-farm-total"),
+    treasureFarmKeys: document.getElementById("treasure-farm-keys"),
+    treasureFarmPhase: document.getElementById("treasure-farm-phase"),
     dungeonSelect: document.getElementById("dungeon-select"),
     refreshDungeon: document.getElementById("refresh-dungeon"),
     runDungeon: document.getElementById("run-dungeon"),
@@ -73,6 +89,21 @@
     dungeonDrawProgress: document.getElementById("dungeon-draw-progress"),
     dungeonRewardSummary: document.getElementById("dungeon-reward-summary"),
     dungeonRewardList: document.getElementById("dungeon-reward-list"),
+    abyssMaxRounds: document.getElementById("abyss-max-rounds"),
+    decreaseAbyssRounds: document.getElementById("abyss-rounds-decrease"),
+    increaseAbyssRounds: document.getElementById("abyss-rounds-increase"),
+    abyssAutoBuff: document.getElementById("abyss-auto-buff"),
+    refreshAbyss: document.getElementById("refresh-abyss"),
+    runAbyss: document.getElementById("run-abyss"),
+    stopAbyss: document.getElementById("stop-abyss"),
+    abyssSeason: document.getElementById("abyss-season"),
+    abyssPassLevel: document.getElementById("abyss-pass-level"),
+    abyssNextLevel: document.getElementById("abyss-next-level"),
+    abyssBuff: document.getElementById("abyss-buff"),
+    abyssWinLoss: document.getElementById("abyss-win-loss"),
+    abyssCompleted: document.getElementById("abyss-completed"),
+    abyssStage: document.getElementById("abyss-stage"),
+    abyssLastResult: document.getElementById("abyss-last-result"),
     jobStatus: document.getElementById("job-status"),
     jobProgress: document.getElementById("job-progress"),
     logList: document.getElementById("log-list"),
@@ -140,13 +171,33 @@
     elements.zoneSelect.disabled = config.zones.length === 0;
   }
 
+  function gameSessionConfigured() {
+    return state.config.connection.status === "available" && Boolean(state.config.zone.id);
+  }
+
   function applyConfig(config) {
     state.config = config;
     elements.username.value = config.account.username;
     elements.rememberPassword.checked = config.account.remember_password;
+    elements.password.required = !config.account.password_configured;
+    elements.password.placeholder = config.account.password_configured
+      ? "已记住密码，可直接登录"
+      : "";
     elements.rounds.value = String(config.arena.rounds);
     elements.refreshOnExhaustion.checked = config.arena.refresh_on_exhaustion;
+    if (elements.abyssMaxRounds && config.abyss) {
+      elements.abyssMaxRounds.value = String(config.abyss.max_rounds ?? 0);
+    }
+    if (elements.abyssAutoBuff && config.abyss) {
+      elements.abyssAutoBuff.checked = Boolean(config.abyss.auto_buff);
+    }
     elements.treasureTimes.value = String(config.treasure.times);
+    if (elements.treasureFarmHearth) {
+      elements.treasureFarmHearth.value = String(config.treasure.farm_target_hearth || 100);
+    }
+    if (elements.treasureFarmTarget) {
+      elements.treasureFarmTarget.textContent = String(config.treasure.farm_target_hearth || 100);
+    }
     document.querySelectorAll("[data-outcome]").forEach((button) => {
       const selected = button.dataset.outcome === config.arena.outcome;
       button.classList.toggle("is-selected", selected);
@@ -366,6 +417,130 @@
     elements.treasureRequestLimit.textContent = String(requestLimit);
   }
 
+  function renderTreasureFarm(farm) {
+    state.treasureFarm = farm;
+    if (!elements.treasureFarmArea) {
+      return;
+    }
+    const selectedAreaId = state.config.treasure.farm_area_id;
+    const fragment = document.createDocumentFragment();
+    const placeholder = document.createElement("option");
+    placeholder.value = "";
+    const areas = farm?.farm_areas || [];
+    if (!farm || areas.length === 0) {
+      placeholder.textContent = "暂无聚宝地图";
+      fragment.append(placeholder);
+      elements.treasureFarmArea.replaceChildren(fragment);
+      elements.treasureFarmArea.disabled = true;
+      return;
+    }
+    placeholder.textContent = "请选择任务地图";
+    fragment.append(placeholder);
+    areas.forEach((area) => {
+      const option = document.createElement("option");
+      option.value = String(area.id);
+      option.textContent = `${area.name} · ${area.key_item_name}`;
+      option.selected = area.id === selectedAreaId;
+      fragment.append(option);
+    });
+    elements.treasureFarmArea.replaceChildren(fragment);
+    elements.treasureFarmArea.value = areas.some((area) => area.id === selectedAreaId)
+      ? String(selectedAreaId)
+      : "";
+    elements.treasureFarmArea.disabled = false;
+    if (elements.treasureFarmTarget) {
+      elements.treasureFarmTarget.textContent = String(
+        state.config.treasure.farm_target_hearth || 100
+      );
+    }
+  }
+
+  function renderTreasureFarmProgress(farm) {
+    if (!farm || !elements.treasureFarmGained) {
+      return;
+    }
+    elements.treasureFarmGained.textContent = String(farm.hearth_gained ?? "--");
+    elements.treasureFarmTotal.textContent = String(farm.hearth_total ?? "--");
+    const keyLabel = farm.key_item_name
+      ? `${farm.key_item_name} ${farm.keys_total ?? 0}`
+      : String(farm.keys_total ?? "--");
+    elements.treasureFarmKeys.textContent = keyLabel;
+    if (elements.treasureFarmPhase) {
+      elements.treasureFarmPhase.textContent = String(
+        farm.phase_label || farm.phase || "等待选择节点"
+      );
+    }
+    if (farm.target_hearth != null && elements.treasureFarmTarget) {
+      elements.treasureFarmTarget.textContent = String(farm.target_hearth);
+    }
+  }
+
+  function renderAbyssStats(stats) {
+    if (!elements.abyssSeason) {
+      return;
+    }
+    if (!stats) {
+      elements.abyssSeason.textContent = "--";
+      elements.abyssPassLevel.textContent = "--";
+      elements.abyssNextLevel.textContent = "--";
+      elements.abyssBuff.textContent = "--";
+      elements.abyssWinLoss.textContent = "0 / 0";
+      elements.abyssCompleted.textContent = "0";
+      elements.abyssStage.textContent = "空闲";
+      elements.abyssLastResult.textContent = "等待开始";
+      return;
+    }
+    const seasonLabel = stats.season_name
+      ? `${stats.season_name}${stats.season_open === false ? "（未开放）" : ""}`
+      : (stats.season_id ? `赛季 ${stats.season_id}` : "--");
+    elements.abyssSeason.textContent = seasonLabel;
+    if (stats.pass_level != null || stats.max_level != null) {
+      elements.abyssPassLevel.textContent = `${stats.pass_level ?? 0} / ${stats.max_level ?? 0}`;
+    }
+    if (stats.next_level) {
+      const nextName = stats.next_name ? ` ${stats.next_name}` : "";
+      elements.abyssNextLevel.textContent = `${stats.next_level}${nextName}`;
+    } else if (stats.next_id === 0) {
+      elements.abyssNextLevel.textContent = "已全部通关";
+    } else {
+      elements.abyssNextLevel.textContent = "--";
+    }
+    if (stats.optbuf) {
+      const desc = stats.optbuf_desc ? ` · ${stats.optbuf_desc}` : "";
+      elements.abyssBuff.textContent = `${stats.optbuf}${desc}`;
+    } else {
+      elements.abyssBuff.textContent = stats.optbuf === 0 ? "未选择" : "--";
+    }
+    if (stats.wins != null || stats.losses != null) {
+      elements.abyssWinLoss.textContent = `${stats.wins || 0} / ${stats.losses || 0}`;
+    }
+    if (stats.completed_rounds != null) {
+      elements.abyssCompleted.textContent = String(stats.completed_rounds);
+    }
+    if (stats.stage) {
+      elements.abyssStage.textContent = stats.stage;
+    }
+    if (stats.last_result) {
+      elements.abyssLastResult.textContent = stats.last_result;
+    }
+  }
+
+  function renderAbyssStatus(abyss) {
+    state.abyss = abyss;
+    if (!abyss) {
+      renderAbyssStats(null);
+      return;
+    }
+    renderAbyssStats({
+      ...abyss,
+      wins: 0,
+      losses: 0,
+      completed_rounds: 0,
+      stage: "空闲",
+      last_result: "等待开始",
+    });
+  }
+
   function renderDungeon(dungeon) {
     state.dungeon = dungeon;
     const fragment = document.createDocumentFragment();
@@ -455,7 +630,14 @@
     const time = document.createElement("time");
     time.textContent = logTime(event.timestamp);
     const feature = document.createElement("span");
-    const featureLabels = { daily: "日常", arena: "竞技场", treasure: "聚宝", dungeon: "地下城" };
+    const featureLabels = {
+      daily: "日常",
+      arena: "竞技场",
+      treasure: "聚宝扫荡",
+      treasure_farm: "聚宝刷取",
+      dungeon: "地下城",
+      abyss: "罪者深渊",
+    };
     feature.textContent = featureLabels[event.feature] || "系统";
     const message = document.createElement("p");
     message.textContent = event.message;
@@ -473,35 +655,81 @@
 
   function setJobControls(status = "idle") {
     const active = isActiveJobStatus(status);
-    const gameSessionConfigured = state.config.connection.status === "available" && Boolean(state.config.zone.id);
+    const sessionReady = gameSessionConfigured();
     const dailyLoaded = Boolean(state.daily);
     const treasureLoaded = Boolean(state.treasure);
     const dungeonLoaded = Boolean(state.dungeon);
     const selectedTreasureArea = Number(elements.treasureArea.value);
+    const selectedFarmArea = Number(elements.treasureFarmArea?.value || 0);
     const selectedDungeonId = Number(elements.dungeonSelect.value);
     const treasureReady = treasureLoaded
       && state.treasure.sweep.available > 0
       && state.treasure.areas.some((area) => area.id === selectedTreasureArea);
+    const farmAreas = state.treasureFarm?.farm_areas || [];
+    const farmReady = farmAreas.some((area) => area.id === selectedFarmArea)
+      && Number(elements.treasureFarmHearth?.value || 0) > 0;
     const dungeonReady = dungeonLoaded
       && state.dungeon.dungeons.some((dungeon) => dungeon.id === selectedDungeonId);
     elements.runDaily.disabled = active || !dailyLoaded;
-    elements.runArena.disabled = active || !gameSessionConfigured;
+    elements.runArena.disabled = active || !sessionReady;
     elements.runTreasure.disabled = active || !treasureReady;
+    if (elements.runTreasureFarm) {
+      elements.runTreasureFarm.disabled = active || !sessionReady || !farmReady;
+    }
     elements.runDungeon.disabled = active || !dungeonReady;
+    if (elements.runAbyss) {
+      elements.runAbyss.disabled = active || !sessionReady;
+    }
     elements.stopDaily.disabled = !active;
     elements.stopArena.disabled = !active;
     elements.stopTreasure.disabled = !active;
+    if (elements.stopTreasureFarm) {
+      elements.stopTreasureFarm.disabled = !active;
+    }
     elements.stopDungeon.disabled = !active;
+    if (elements.stopAbyss) {
+      elements.stopAbyss.disabled = !active;
+    }
     elements.selectAvailable.disabled = active || !dailyLoaded;
     elements.clearSelection.disabled = active || !dailyLoaded;
-    elements.refreshDaily.disabled = active || !gameSessionConfigured;
-    elements.refreshArena.disabled = active || !gameSessionConfigured;
-    elements.refreshTreasure.disabled = active || !gameSessionConfigured;
-    elements.refreshDungeon.disabled = active || !gameSessionConfigured;
+    elements.refreshDaily.disabled = active || !sessionReady;
+    elements.refreshArena.disabled = active || !sessionReady;
+    elements.refreshTreasure.disabled = active || !sessionReady;
+    if (elements.refreshTreasureFarm) {
+      elements.refreshTreasureFarm.disabled = active;
+    }
+    elements.refreshDungeon.disabled = active || !sessionReady;
+    if (elements.refreshAbyss) {
+      elements.refreshAbyss.disabled = active || !sessionReady;
+    }
+    if (elements.abyssMaxRounds) {
+      elements.abyssMaxRounds.disabled = active;
+    }
+    if (elements.abyssAutoBuff) {
+      elements.abyssAutoBuff.disabled = active;
+    }
+    if (elements.decreaseAbyssRounds) {
+      elements.decreaseAbyssRounds.disabled = active;
+    }
+    if (elements.increaseAbyssRounds) {
+      elements.increaseAbyssRounds.disabled = active;
+    }
     elements.treasureArea.disabled = active || !treasureLoaded || state.treasure.areas.length === 0;
     elements.treasureTimes.disabled = active || !treasureLoaded || state.treasure.sweep.request_limit === 0;
     elements.decreaseTreasureTimes.disabled = elements.treasureTimes.disabled;
     elements.increaseTreasureTimes.disabled = elements.treasureTimes.disabled;
+    if (elements.treasureFarmArea) {
+      elements.treasureFarmArea.disabled = active || farmAreas.length === 0;
+    }
+    if (elements.treasureFarmHearth) {
+      elements.treasureFarmHearth.disabled = active;
+    }
+    if (elements.decreaseTreasureHearth) {
+      elements.decreaseTreasureHearth.disabled = active;
+    }
+    if (elements.increaseTreasureHearth) {
+      elements.increaseTreasureHearth.disabled = active;
+    }
     elements.dungeonSelect.disabled = active || !dungeonLoaded || state.dungeon.dungeons.length === 0;
   }
 
@@ -521,8 +749,14 @@
       if (event.data.treasure) {
         renderTreasure(event.data.treasure);
       }
+      if (event.data.farm) {
+        renderTreasureFarmProgress(event.data.farm);
+      }
       if (event.data.dungeon) {
         renderDungeon(event.data.dungeon);
+      }
+      if (event.data.abyss) {
+        renderAbyssStats(event.data.abyss);
       }
       if (event.feature === "dungeon" && Object.prototype.hasOwnProperty.call(event.data, "rewards")) {
         renderDungeonRewards(event.data.rewards, event.data.draw || null);
@@ -537,8 +771,14 @@
     if (job.result?.treasure) {
       renderTreasure(job.result.treasure);
     }
+    if (job.result?.farm) {
+      renderTreasureFarmProgress(job.result.farm);
+    }
     if (job.result?.dungeon) {
       renderDungeon(job.result.dungeon);
+    }
+    if (job.result?.abyss) {
+      renderAbyssStats(job.result.abyss);
     }
     if (job.feature === "dungeon" && job.result && Object.prototype.hasOwnProperty.call(job.result, "rewards")) {
       renderDungeonRewards(job.result.rewards, job.result.draw || null);
@@ -558,6 +798,13 @@
       elements.jobProgress.textContent = `竞技场 ${progress.arena.completed_rounds}/${progress.arena.requested_rounds} · ${progress.arena.stage}`;
     } else if (progress.treasure) {
       elements.jobProgress.textContent = `聚宝之地 · 今日可扫荡 ${progress.treasure.sweep.available} 次`;
+    } else if (progress.farm) {
+      const farm = progress.farm;
+      elements.jobProgress.textContent = (
+        `${farm.area_name || "聚宝刷取"} · ${farm.phase_label || farm.phase || "等待选择节点"} · `
+        `炉温 +${farm.hearth_gained || 0}/`
+        + `${farm.target_hearth || 0}`
+      );
     } else if (progress.dungeon) {
       if (progress.phase === "drawing") {
         elements.jobProgress.textContent = "地下城 · 扫荡完成，正在全部抽取";
@@ -572,6 +819,13 @@
           ? `地下城 · ${selected.name}，最高分 ${selected.highest_score}`
           : "地下城 · 已读取扫荡状态";
       }
+    } else if (progress.abyss) {
+      const abyss = progress.abyss;
+      elements.jobProgress.textContent = (
+        `罪者深渊 · 通关 ${abyss.pass_level || 0}/${abyss.max_level || 0}`
+        + ` · ${abyss.wins || 0} 胜 / ${abyss.losses || 0} 负`
+        + ` · ${abyss.stage || ""}`
+      );
     } else {
       elements.jobProgress.textContent = jobStatusLabels[status] || status;
     }
@@ -667,6 +921,40 @@
     setJobControls();
   }
 
+  function normalizedFarmHearth() {
+    const raw = Number(elements.treasureFarmHearth?.value || 0);
+    if (!Number.isInteger(raw) || raw < 1) {
+      return 1;
+    }
+    return Math.min(10000, raw);
+  }
+
+  async function saveTreasureFarmConfig() {
+    const areaId = Number(elements.treasureFarmArea?.value || 0);
+    if (!Number.isInteger(areaId) || areaId <= 0) {
+      return;
+    }
+    const target = normalizedFarmHearth();
+    if (elements.treasureFarmHearth) {
+      elements.treasureFarmHearth.value = String(target);
+    }
+    const data = await api("/api/config/treasure-farm", {
+      method: "PUT",
+      body: JSON.stringify({
+        farm_area_id: areaId,
+        farm_target_hearth: target,
+      }),
+    });
+    applyConfig(data.config);
+  }
+
+  async function refreshTreasureFarm() {
+    const data = await api("/api/treasure/farm-catalog", { method: "GET" });
+    applyConfig(data.config);
+    renderTreasureFarm(data.farm);
+    setJobControls();
+  }
+
   async function saveDungeonConfig() {
     const dungeonId = Number(elements.dungeonSelect.value);
     if (!Number.isInteger(dungeonId) || dungeonId <= 0) {
@@ -686,6 +974,82 @@
     setJobControls();
   }
 
+  function normalizedAbyssMaxRounds() {
+    const raw = Number(elements.abyssMaxRounds?.value || 0);
+    if (!Number.isInteger(raw) || raw < 0) {
+      return 0;
+    }
+    return Math.min(900, raw);
+  }
+
+  async function saveAbyssConfig() {
+    if (!elements.abyssMaxRounds) {
+      return;
+    }
+    const maxRounds = normalizedAbyssMaxRounds();
+    elements.abyssMaxRounds.value = String(maxRounds);
+    const data = await api("/api/config/abyss", {
+      method: "PUT",
+      body: JSON.stringify({
+        max_rounds: maxRounds,
+        auto_buff: Boolean(elements.abyssAutoBuff?.checked),
+      }),
+    });
+    applyConfig(data.config);
+  }
+
+  async function refreshAbyss() {
+    const data = await api("/api/abyss", { method: "GET" });
+    applyConfig(data.config);
+    renderAbyssStatus(data.abyss);
+    setJobControls();
+  }
+
+  async function refreshDaily() {
+    const daily = await api("/api/daily-tasks", { method: "GET" });
+    renderDaily(daily);
+    setJobControls();
+  }
+
+  async function refreshTab(name, { notify = false } = {}) {
+    if (!gameSessionConfigured() || state.activeJobId) {
+      return;
+    }
+    const generation = ++state.tabRefreshGeneration;
+    try {
+      if (name === "daily") {
+        await refreshDaily();
+        if (notify && generation === state.tabRefreshGeneration) {
+          showToast("日常状态已刷新");
+        }
+      } else if (name === "arena") {
+        await refreshArena();
+        if (notify && generation === state.tabRefreshGeneration) {
+          showToast("龙痕竞技场状态已刷新");
+        }
+      } else if (name === "treasure") {
+        await Promise.all([refreshTreasure(), refreshTreasureFarm()]);
+        if (notify && generation === state.tabRefreshGeneration) {
+          showToast("聚宝之地状态已刷新");
+        }
+      } else if (name === "dungeon") {
+        await refreshDungeon();
+        if (notify && generation === state.tabRefreshGeneration) {
+          showToast("地下城状态已刷新");
+        }
+      } else if (name === "abyss") {
+        await refreshAbyss();
+        if (notify && generation === state.tabRefreshGeneration) {
+          showToast("罪者深渊状态已刷新");
+        }
+      }
+    } catch (error) {
+      if (generation === state.tabRefreshGeneration) {
+        showToast(error.message, true);
+      }
+    }
+  }
+
   async function cancelActiveJob() {
     if (!state.activeJobId) {
       return;
@@ -701,13 +1065,17 @@
     }
   }
 
-  function activateTab(name) {
+  function activateTab(name, { autoRefresh = true } = {}) {
+    state.activeTab = name;
     document.querySelectorAll("[data-tab]").forEach((button) => {
       const selected = button.dataset.tab === name;
       button.classList.toggle("is-active", selected);
       button.setAttribute("aria-selected", String(selected));
       document.getElementById(`${button.dataset.tab}-panel`).hidden = !selected;
     });
+    if (autoRefresh) {
+      refreshTab(name).catch(() => {});
+    }
   }
 
   elements.loginForm.addEventListener("submit", async (event) => {
@@ -718,8 +1086,10 @@
     renderArenaStatus(null);
     renderArenaStats(null);
     renderTreasure(null);
+    renderTreasureFarm(null);
     renderDungeon(null);
     renderDungeonRewards();
+    renderAbyssStatus(null);
     setJobControls();
     try {
       const data = await api("/api/account/login", {
@@ -765,21 +1135,29 @@
       renderArenaStatus(null);
       renderArenaStats(null);
       renderTreasure(null);
+      renderTreasureFarm(null);
       renderDungeon(null);
       renderDungeonRewards();
+      renderAbyssStatus(null);
       setJobControls();
-      const [daily, arena, treasure, dungeon] = await Promise.all([
+      const [daily, arena, treasure, dungeon, farm, abyss] = await Promise.all([
         api("/api/daily-tasks", { method: "GET" }),
         api("/api/arena", { method: "GET" }),
         api("/api/treasure", { method: "GET" }),
         api("/api/dungeon", { method: "GET" }),
+        api("/api/treasure/farm-catalog", { method: "GET" }),
+        api("/api/abyss", { method: "GET" }),
       ]);
       renderDaily(daily);
       applyConfig(arena.config);
       renderArenaStatus(arena);
       applyConfig(treasure.config);
       renderTreasure(treasure);
+      applyConfig(farm.config);
+      renderTreasureFarm(farm.farm);
       renderDungeon(dungeon);
+      applyConfig(abyss.config);
+      renderAbyssStatus(abyss.abyss);
       setJobControls();
     } catch (error) {
       showToast(error.message, true);
@@ -798,15 +1176,8 @@
     persistSelection([]).catch((error) => showToast(error.message, true));
   });
 
-  elements.refreshDaily.addEventListener("click", async () => {
-    try {
-      const daily = await api("/api/daily-tasks", { method: "GET" });
-      renderDaily(daily);
-      setJobControls();
-      showToast("日常状态已刷新");
-    } catch (error) {
-      showToast(error.message, true);
-    }
+  elements.refreshDaily.addEventListener("click", () => {
+    refreshTab("daily", { notify: true }).catch(() => {});
   });
 
   elements.runDaily.addEventListener("click", async () => {
@@ -870,21 +1241,23 @@
   });
 
   elements.refreshArena.addEventListener("click", () => {
-    refreshArena()
-      .then(() => showToast("龙痕竞技场状态已刷新"))
-      .catch((error) => showToast(error.message, true));
+    refreshTab("arena", { notify: true }).catch(() => {});
   });
 
   elements.refreshTreasure.addEventListener("click", () => {
-    refreshTreasure()
-      .then(() => showToast("聚宝之地状态已刷新"))
-      .catch((error) => showToast(error.message, true));
+    refreshTab("treasure", { notify: true }).catch(() => {});
   });
 
+  if (elements.refreshTreasureFarm) {
+    elements.refreshTreasureFarm.addEventListener("click", () => {
+      refreshTreasureFarm()
+        .then(() => showToast("刷取地图列表已刷新"))
+        .catch((error) => showToast(error.message, true));
+    });
+  }
+
   elements.refreshDungeon.addEventListener("click", () => {
-    refreshDungeon()
-      .then(() => showToast("地下城状态已刷新"))
-      .catch((error) => showToast(error.message, true));
+    refreshTab("dungeon", { notify: true }).catch(() => {});
   });
 
   elements.treasureArea.addEventListener("change", () => {
@@ -971,6 +1344,78 @@
     }
   });
 
+  if (elements.treasureFarmArea) {
+    elements.treasureFarmArea.addEventListener("change", () => {
+      saveTreasureFarmConfig()
+        .then(() => setJobControls())
+        .catch((error) => {
+          renderTreasureFarm(state.treasureFarm);
+          showToast(error.message, true);
+        });
+    });
+  }
+
+  if (elements.decreaseTreasureHearth) {
+    elements.decreaseTreasureHearth.addEventListener("click", () => {
+      const next = Math.max(1, normalizedFarmHearth() - 10);
+      elements.treasureFarmHearth.value = String(next);
+      saveTreasureFarmConfig()
+        .then(() => setJobControls())
+        .catch((error) => showToast(error.message, true));
+    });
+  }
+
+  if (elements.increaseTreasureHearth) {
+    elements.increaseTreasureHearth.addEventListener("click", () => {
+      const next = Math.min(10000, normalizedFarmHearth() + 10);
+      elements.treasureFarmHearth.value = String(next);
+      saveTreasureFarmConfig()
+        .then(() => setJobControls())
+        .catch((error) => showToast(error.message, true));
+    });
+  }
+
+  if (elements.treasureFarmHearth) {
+    elements.treasureFarmHearth.addEventListener("change", () => {
+      const next = normalizedFarmHearth();
+      elements.treasureFarmHearth.value = String(next);
+      saveTreasureFarmConfig()
+        .then(() => setJobControls())
+        .catch((error) => showToast(error.message, true));
+    });
+  }
+
+  if (elements.runTreasureFarm) {
+    elements.runTreasureFarm.addEventListener("click", async () => {
+      const areaId = Number(elements.treasureFarmArea.value);
+      const target = normalizedFarmHearth();
+      if (!Number.isInteger(areaId) || areaId <= 0) {
+        showToast("请选择任务地图", true);
+        return;
+      }
+      try {
+        const data = await api("/api/jobs/treasure-farm", {
+          method: "POST",
+          body: JSON.stringify({
+            farm_area_id: areaId,
+            farm_target_hearth: target,
+          }),
+        });
+        applyConfig(data.config);
+        beginPolling(data.job);
+      } catch (error) {
+        showToast(error.message, true);
+        setJobControls();
+      }
+    });
+  }
+
+  if (elements.stopTreasureFarm) {
+    elements.stopTreasureFarm.addEventListener("click", () => {
+      cancelActiveJob().catch(() => {});
+    });
+  }
+
   elements.runDungeon.addEventListener("click", async () => {
     const dungeonId = Number(elements.dungeonSelect.value);
     if (!Number.isInteger(dungeonId) || dungeonId <= 0) {
@@ -992,6 +1437,77 @@
     }
   });
 
+  if (elements.refreshAbyss) {
+    elements.refreshAbyss.addEventListener("click", () => {
+      refreshAbyss()
+        .then(() => showToast("罪者深渊状态已刷新"))
+        .catch((error) => showToast(error.message, true));
+    });
+  }
+
+  if (elements.decreaseAbyssRounds) {
+    elements.decreaseAbyssRounds.addEventListener("click", () => {
+      const next = Math.max(0, normalizedAbyssMaxRounds() - 1);
+      elements.abyssMaxRounds.value = String(next);
+      saveAbyssConfig().catch((error) => showToast(error.message, true));
+    });
+  }
+
+  if (elements.increaseAbyssRounds) {
+    elements.increaseAbyssRounds.addEventListener("click", () => {
+      const next = Math.min(900, normalizedAbyssMaxRounds() + 1);
+      elements.abyssMaxRounds.value = String(next);
+      saveAbyssConfig().catch((error) => showToast(error.message, true));
+    });
+  }
+
+  if (elements.abyssMaxRounds) {
+    elements.abyssMaxRounds.addEventListener("change", () => {
+      elements.abyssMaxRounds.value = String(normalizedAbyssMaxRounds());
+      saveAbyssConfig().catch((error) => showToast(error.message, true));
+    });
+  }
+
+  if (elements.abyssAutoBuff) {
+    elements.abyssAutoBuff.addEventListener("change", () => {
+      saveAbyssConfig().catch((error) => showToast(error.message, true));
+    });
+  }
+
+  if (elements.runAbyss) {
+    elements.runAbyss.addEventListener("click", async () => {
+      const maxRounds = normalizedAbyssMaxRounds();
+      try {
+        const data = await api("/api/jobs/abyss", {
+          method: "POST",
+          body: JSON.stringify({
+            max_rounds: maxRounds,
+            auto_buff: Boolean(elements.abyssAutoBuff?.checked),
+          }),
+        });
+        applyConfig(data.config);
+        renderAbyssStats({
+          ...(state.abyss || {}),
+          wins: 0,
+          losses: 0,
+          completed_rounds: 0,
+          stage: "连接中",
+          last_result: "正在连接罪者深渊",
+        });
+        beginPolling(data.job);
+      } catch (error) {
+        showToast(error.message, true);
+        setJobControls();
+      }
+    });
+  }
+
+  if (elements.stopAbyss) {
+    elements.stopAbyss.addEventListener("click", () => {
+      cancelActiveJob().catch(() => {});
+    });
+  }
+
   document.querySelectorAll("[data-tab]").forEach((button) => {
     button.addEventListener("click", () => activateTab(button.dataset.tab));
   });
@@ -1001,9 +1517,15 @@
   renderArenaStatus(null);
   renderArenaStats(null);
   renderTreasure(null);
+  renderTreasureFarm(null);
   renderDungeon(null);
   renderDungeonRewards();
+  renderAbyssStatus(null);
   setJobControls();
+  refreshTreasureFarm().catch(() => {});
+  if (state.config.connection.status === "available" && state.config.zones.length > 0) {
+    elements.loginMessage.textContent = `已恢复登录 · ${state.config.zones.length} 个区服`;
+  }
   if (state.activeJobId) {
     pollJob().then(() => {
       if (state.activeJobId) {
@@ -1012,5 +1534,8 @@
         }, 450);
       }
     }).catch((error) => showToast(error.message, true));
+  } else if (gameSessionConfigured()) {
+    // 已登录且已选区服时，进入默认标签自动拉取最新状态。
+    refreshTab(state.activeTab).catch(() => {});
   }
 })();

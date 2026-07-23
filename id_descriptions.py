@@ -99,13 +99,22 @@ def dungeon_name(dungeon_id: object) -> str:
 
 
 def treasure_area_name(area_id: object) -> str:
-    """Resolve a treasure map only when a dedicated map table exists."""
+    """Resolve a treasure-area map id to a Chinese name when a table exists.
 
-    for relative_path in ("decrypted-data/map.json", "decrypted-data/maps.json"):
+    Prefer ``mapareas`` / ``map`` catalogs under native decrypted data. Without
+    an authoritative row, fall back to the standard unknown label — never invent
+    a display name from unrelated item text.
+    """
+
+    for relative_path in (
+        "decrypted-data/mapareas.json",
+        "decrypted-data/map.json",
+        "decrypted-data/maps.json",
+    ):
         known = _known_name(_name_table(relative_path), area_id)
         if known is not None:
             return known
-    return unknown_name("地图", area_id)
+    return unknown_name("聚宝地图", area_id)
 
 
 def reward_box_name(reward_id: object) -> str:
@@ -118,6 +127,108 @@ def rune_name(rune_id: object) -> str:
     return _known_name(
         _name_table("decrypted-data/rune-tables/orderrune.json"), rune_id
     ) or unknown_name("律文", rune_id)
+
+
+def artifact_name(artifact_id: object) -> str:
+    return _known_name(
+        _name_table("decrypted-data/tables/artifact.json"), artifact_id
+    ) or unknown_name("秘宝", artifact_id)
+
+
+@lru_cache(maxsize=1)
+def _artifact_rarities() -> dict[int, int]:
+    rarities: dict[int, int] = {}
+    for row in _json_rows("decrypted-data/tables/artifact.json"):
+        identifier = _positive_int(row.get("id"))
+        rarity = row.get("rarity")
+        if (
+            identifier is not None
+            and isinstance(rarity, int)
+            and not isinstance(rarity, bool)
+            and rarity > 0
+        ):
+            rarities[identifier] = rarity
+    return rarities
+
+
+def artifact_rarity(artifact_id: object) -> int:
+    """返回秘宝配置 rarity；未知时为 0。"""
+
+    parsed = _positive_int(artifact_id)
+    if parsed is None:
+        return 0
+    return _artifact_rarities().get(parsed, 0)
+
+
+# 客户端 item type：ArtifactPiece = 15。
+ARTIFACT_PIECE_ITEM_TYPE = 15
+
+
+@lru_cache(maxsize=1)
+def _item_types() -> dict[int, int]:
+    types: dict[int, int] = {}
+    for row in _json_rows("decrypted-data/item.json"):
+        identifier = _positive_int(row.get("id"))
+        item_type = row.get("type")
+        if (
+            identifier is not None
+            and isinstance(item_type, int)
+            and not isinstance(item_type, bool)
+        ):
+            types[identifier] = item_type
+    return types
+
+
+@lru_cache(maxsize=1)
+def _item_qualities() -> dict[int, int]:
+    qualities: dict[int, int] = {}
+    for row in _json_rows("decrypted-data/item.json"):
+        identifier = _positive_int(row.get("id"))
+        quality = row.get("quality")
+        if (
+            identifier is not None
+            and isinstance(quality, int)
+            and not isinstance(quality, bool)
+            and quality > 0
+        ):
+            qualities[identifier] = quality
+    return qualities
+
+
+@lru_cache(maxsize=1)
+def _artifact_ids_by_piece_item() -> dict[int, int]:
+    mapping: dict[int, int] = {}
+    for row in _json_rows("decrypted-data/tables/artifact.json"):
+        artifact_id = _positive_int(row.get("id"))
+        piece_id = _positive_int(row.get("itemid"))
+        if artifact_id is not None and piece_id is not None:
+            mapping[piece_id] = artifact_id
+    return mapping
+
+
+def is_artifact_piece_item(item_id: object) -> bool:
+    """物品是否为秘宝碎片（item.type == ArtifactPiece）。"""
+
+    parsed = _positive_int(item_id)
+    if parsed is None:
+        return False
+    return _item_types().get(parsed) == ARTIFACT_PIECE_ITEM_TYPE
+
+
+def item_quality(item_id: object) -> int:
+    parsed = _positive_int(item_id)
+    if parsed is None:
+        return 0
+    return _item_qualities().get(parsed, 0)
+
+
+def artifact_id_for_piece_item(item_id: object) -> int:
+    """碎片物品 ID 对应的秘宝 ID；未知时为 0。"""
+
+    parsed = _positive_int(item_id)
+    if parsed is None:
+        return 0
+    return _artifact_ids_by_piece_item().get(parsed, 0)
 
 
 def hero_name(hero_id: object) -> str:
@@ -174,6 +285,8 @@ def reward_name(kind: object, reward_id: object) -> str:
         return item_name(reward_id)
     if parsed_kind == 2:
         return reward_box_name(reward_id)
+    if parsed_kind == 4:
+        return artifact_name(reward_id)
     if parsed_kind == 5:
         return hero_name(reward_id)
     if parsed_kind == 6:
@@ -209,6 +322,33 @@ def business_name(message_id: object) -> str:
 
 def zone_name(zone_id: object, configured_name: object) -> str:
     return _text(configured_name) or unknown_name("区服", zone_id)
+
+
+# 龙痕竞技场胜利抉择：与 dragon_arena.EXECUTE_CHOICE_ID / MERCY_CHOICE_ID 对齐。
+_WIN_CHOICE_NAMES = {
+    1: "处决",
+    2: "仁慈",
+}
+
+
+def win_choice_name(choice_id: object) -> str:
+    """解析 Scararena_winchoice 抉择 ID 为人读名称。"""
+
+    parsed = _positive_int(choice_id)
+    if parsed is not None and parsed in _WIN_CHOICE_NAMES:
+        return _WIN_CHOICE_NAMES[parsed]
+    if parsed == 0 or choice_id in (0, "0", None, ""):
+        return "无"
+    return unknown_name("胜利抉择", choice_id)
+
+
+def arena_stage_name(stage_id: object) -> str:
+    """解析龙痕竞技场阶段 ID。本地暂无权威阶段表时使用标准未知兜底。"""
+
+    parsed = _positive_int(stage_id)
+    if parsed is None or parsed == 0:
+        return "无"
+    return unknown_name("竞技场阶段", parsed)
 
 
 def item_change_text(item_id: object, delta: int, total: int | None = None) -> str:

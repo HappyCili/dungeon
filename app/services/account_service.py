@@ -45,10 +45,27 @@ class LoginClient(Protocol):
     ) -> LoginResult:
         """完成渠道登录并交换游戏侧凭据。"""
 
+    def login_with_refresh(
+        self,
+        *,
+        refresh_token: str,
+        game_code: str,
+        ip: str,
+        device_info: str,
+        terminal_info: str,
+    ) -> LoginResult:
+        """使用 refresh_token 刷新身份并交换游戏侧凭据。"""
+
 
 class TokenResultStore(Protocol):
     def save(self, result: LoginResult) -> None:
         """安全保存游戏侧凭据。"""
+
+    def load_game_tokens(self) -> dict[str, str] | None:
+        """读取本地缓存的游戏侧凭据。"""
+
+    def load_refresh_token(self) -> str | None:
+        """读取本地缓存的 refresh_token。"""
 
 
 ZoneLoader = Callable[[Mapping[str, str]], Sequence[AccountZone]]
@@ -83,6 +100,7 @@ class AccountService:
         token_store: TokenResultStore | None = None,
         zone_loader: ZoneLoader = _load_account_zones,
         endpoint_resolver: EndpointResolver = resolve_game_endpoint,
+        restore_on_init: bool = True,
     ) -> None:
         self._config_store = config_store
         self._credentials = credentials
@@ -93,43 +111,43 @@ class AccountService:
         self._connection_status = "unconfigured"
         self._zones: tuple[Zone, ...] = ()
         self._game_tokens: dict[str, str] | None = None
+        if restore_on_init:
+            self.restore_session()
 
     def login(
         self, username: str, password: str, remember_password: bool
     ) -> dict[str, object]:
+        resolved_password = self._resolve_password(username, password)
         self._connection_status = "logging_in"
         self._game_tokens = None
         try:
             result = self._login_client_factory().login_with_password(
                 username=username,
-                password=password,
+                password=resolved_password,
                 game_code=DEFAULT_GAME_CODE,
                 ip=DEFAULT_CLIENT_IP,
                 device_info=DEFAULT_DEVICE_INFO,
                 terminal_info=DEFAULT_TERMINAL_INFO,
             )
-            game_tokens = {
-                "userid": result.game.userid,
-                "verify_token": result.game.verify_token,
-            }
-            account_zones = self._zone_loader(game_tokens)
-            zones = tuple(
-                Zone(str(zone.zone_id), zone.name, zone.zone_id)
-                for zone in account_zones
+            zones = self._zones_from_tokens(
+                {
+                    "userid": result.game.userid,
+                    "verify_token": result.game.verify_token,
+                }
             )
-            if not zones:
-                raise AccountLoginError("账号没有可用区服")
-
             self._token_store.save(result)
             if remember_password:
-                self._credentials.set_password(username, password)
+                self._credentials.set_password(username, resolved_password)
             else:
                 self._credentials.delete_password(username)
             self._config_store.set_account(username, remember_password)
-            self._clear_unavailable_selected_zone(zones)
-            self._zones = zones
-            self._game_tokens = game_tokens
-            self._connection_status = "available"
+            self._activate_session(
+                {
+                    "userid": result.game.userid,
+                    "verify_token": result.game.verify_token,
+                },
+                zones,
+            )
         except Exception as exc:
             self._zones = ()
             self._game_tokens = None
@@ -147,6 +165,112 @@ class AccountService:
             "connection": self.connection_snapshot(),
             "message": f"已加载 {len(self._zones)} 个账号区服",
         }
+
+    def restore_session(self) -> bool:
+        """从本地令牌（必要时刷新令牌或记住的密码）恢复登录态。
+
+        成功返回 True；无可用缓存或恢复失败时保持未配置状态并返回 False。
+        """
+
+        if self._connection_status == "available" and self._game_tokens is not None:
+            return True
+
+        game_tokens = self._token_store.load_game_tokens()
+        if game_tokens is not None and self._try_activate_tokens(game_tokens):
+            return True
+
+        if self._try_refresh_tokens():
+            return True
+
+        if self._try_password_restore():
+            return True
+
+        return False
+
+    def _resolve_password(self, username: str, password: str) -> str:
+        if password:
+            return password
+        stored = self._credentials.get_password(username)
+        if stored:
+            return stored
+        raise AccountLoginError("请输入密码，或先勾选记住密码并成功登录一次")
+
+    def _zones_from_tokens(self, game_tokens: Mapping[str, str]) -> tuple[Zone, ...]:
+        account_zones = self._zone_loader(game_tokens)
+        zones = tuple(
+            Zone(str(zone.zone_id), zone.name, zone.zone_id)
+            for zone in account_zones
+        )
+        if not zones:
+            raise AccountLoginError("账号没有可用区服")
+        return zones
+
+    def _activate_session(
+        self, game_tokens: Mapping[str, str], zones: tuple[Zone, ...]
+    ) -> None:
+        self._clear_unavailable_selected_zone(zones)
+        self._zones = zones
+        self._game_tokens = dict(game_tokens)
+        self._connection_status = "available"
+
+    def _try_activate_tokens(self, game_tokens: dict[str, str]) -> bool:
+        try:
+            zones = self._zones_from_tokens(game_tokens)
+            self._activate_session(game_tokens, zones)
+            return True
+        except (AccountLoginError, HarvestError, OSError, ValueError, LoginError):
+            return False
+
+    def _try_refresh_tokens(self) -> bool:
+        refresh_token = self._token_store.load_refresh_token()
+        if not refresh_token:
+            return False
+        try:
+            result = self._login_client_factory().login_with_refresh(
+                refresh_token=refresh_token,
+                game_code=DEFAULT_GAME_CODE,
+                ip=DEFAULT_CLIENT_IP,
+                device_info=DEFAULT_DEVICE_INFO,
+                terminal_info=DEFAULT_TERMINAL_INFO,
+            )
+            game_tokens = {
+                "userid": result.game.userid,
+                "verify_token": result.game.verify_token,
+            }
+            if not self._try_activate_tokens(game_tokens):
+                return False
+            self._token_store.save(result)
+            return True
+        except Exception:
+            return False
+
+    def _try_password_restore(self) -> bool:
+        settings = self._config_store.snapshot()
+        username = settings.account.username
+        if not settings.account.remember_password or not username:
+            return False
+        password = self._credentials.get_password(username)
+        if not password:
+            return False
+        try:
+            result = self._login_client_factory().login_with_password(
+                username=username,
+                password=password,
+                game_code=DEFAULT_GAME_CODE,
+                ip=DEFAULT_CLIENT_IP,
+                device_info=DEFAULT_DEVICE_INFO,
+                terminal_info=DEFAULT_TERMINAL_INFO,
+            )
+            game_tokens = {
+                "userid": result.game.userid,
+                "verify_token": result.game.verify_token,
+            }
+            if not self._try_activate_tokens(game_tokens):
+                return False
+            self._token_store.save(result)
+            return True
+        except Exception:
+            return False
 
     def _clear_unavailable_selected_zone(self, zones: tuple[Zone, ...]) -> None:
         selected = self._config_store.snapshot().zone

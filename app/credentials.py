@@ -11,6 +11,8 @@ class CredentialStore(Protocol):
 
     def delete_password(self, username: str) -> None: ...
 
+    def get_password(self, username: str) -> str | None: ...
+
     def is_configured(self, username: str) -> bool: ...
 
 
@@ -36,10 +38,13 @@ class KeyringCredentialStore:
         except KeyringError as exc:
             raise CredentialStorageError("系统凭据库不可用") from exc
 
-    def is_configured(self, username: str) -> bool:
+    def get_password(self, username: str) -> str | None:
         if not username:
-            return False
+            return None
         try:
-            return keyring.get_password(self.service_name, username) is not None
+            return keyring.get_password(self.service_name, username)
         except KeyringError:
-            return False
+            return None
+
+    def is_configured(self, username: str) -> bool:
+        return self.get_password(username) is not None

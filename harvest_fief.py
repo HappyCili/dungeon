@@ -2,10 +2,17 @@
 """收取庄园材料的游戏服 WebSocket 客户端。
 
 默认读取同目录 ``tokens.json`` 中的 ``userid`` 和 ``verify_token``，按当前
-Android 客户端的登录链路获取游戏服地址，然后发送一次普通庄园征收。
+Android 客户端的登录链路获取游戏服地址，然后发送一次庄园征收。
+
+支持三种收取模式：
+
+- ``normal`` / ``HARVEST_NORMAL=0``：普通征收（默认）
+- ``free`` / ``HARVEST_FREE=1``：免费快速收取（消耗当日 ``leftfreenum``）
+- ``pay`` / ``HARVEST_PAY=2``：付费快速收取（消耗宝石，按 ``fief_quickcost``）
 
 用法：
     .venv/bin/python harvest_fief.py
+    .venv/bin/python harvest_fief.py --mode free
     .venv/bin/python harvest_fief.py --zone-id 10001
     .venv/bin/python harvest_fief.py --self-test
 """
@@ -41,7 +48,22 @@ ACCOUNT_PACK_KEY = "46154569"
 SOCKET_PACK_KEY = "45985633"
 FIEF_HARVEST_MESSAGE_ID = 19154
 FIEF_HARVEST_SOURCE = 37
+# 与客户端枚举 z0B / C 一致。
+HARVEST_NORMAL = 0
+HARVEST_FREE = 1
+HARVEST_PAY = 2
+HARVEST_MODE_NAMES = {
+    HARVEST_NORMAL: "normal",
+    HARVEST_FREE: "free",
+    HARVEST_PAY: "pay",
+}
+HARVEST_MODE_BY_NAME = {name: mode for mode, name in HARVEST_MODE_NAMES.items()}
+# 付费快速收取消耗的货币 ID（macros.ma_maincity_fiefquickitem = 2，宝石）。
+FIEF_QUICK_PAY_ITEM_ID = 2
 FIEF_HARVEST_REJECTION_MESSAGES = {
+    1: "免费收取次数不足",
+    2: "付费道具不足",
+    3: "今日快速收取使用次数已达上限",
     4: "暂无可收取资源",
 }
 LOGIN_MESSAGE_ID = 10010
@@ -67,6 +89,49 @@ class FiefHarvestRejected(HarvestError):
 
 def describe_fief_harvest_rejection(ret: int) -> str:
     return FIEF_HARVEST_REJECTION_MESSAGES.get(ret, f"服务端拒绝收取（ret={ret}）")
+
+
+def resolve_harvest_mode(mode: int | str) -> int:
+    """将名称或数值解析为客户端 HARVEST_* 模式。"""
+
+    if isinstance(mode, int):
+        if mode not in HARVEST_MODE_NAMES:
+            raise HarvestError(f"不支持的庄园收取模式：{mode}")
+        return mode
+    key = str(mode).strip().lower()
+    if key not in HARVEST_MODE_BY_NAME:
+        raise HarvestError(
+            f"不支持的庄园收取模式：{mode}（可选 {', '.join(HARVEST_MODE_BY_NAME)}）"
+        )
+    return HARVEST_MODE_BY_NAME[key]
+
+
+def encode_fief_harvest_payload(
+    mode: int = HARVEST_NORMAL,
+    *,
+    factory_type: int = 0,
+    times: int = 0,
+) -> bytes:
+    """编码 ``Fief_harvest_res`` C2S 载荷。
+
+    与客户端 Protobuf 编码器一致：零值字段会被省略。因此普通收取
+    （``mode=0``）的内层载荷为空。
+    """
+
+    if mode not in HARVEST_MODE_NAMES:
+        raise HarvestError(f"不支持的庄园收取模式：{mode}")
+    if factory_type < 0:
+        raise HarvestError("factory_type 不能为负数")
+    if times < 0:
+        raise HarvestError("times 不能为负数")
+    packet = b""
+    if mode:
+        packet += encode_int_field(1, mode)
+    if factory_type:
+        packet += encode_int_field(2, factory_type)
+    if times:
+        packet += encode_int_field(3, times)
+    return packet
 
 
 class ProtoError(HarvestError):
@@ -1309,7 +1374,19 @@ class FiefClient:
             raise HarvestError("游戏服 Login 失败")
         return header.message_id == LOGIN_REUNIQUE_MESSAGE_ID
 
-    def harvest(self) -> HarvestResult:
+    def harvest(
+        self,
+        mode: int | str = HARVEST_NORMAL,
+        *,
+        factory_type: int = 0,
+        times: int = 0,
+    ) -> HarvestResult:
+        harvest_mode = resolve_harvest_mode(mode)
+        request_payload = encode_fief_harvest_payload(
+            harvest_mode,
+            factory_type=factory_type,
+            times=times,
+        )
         self.socket = self.socket_factory(self.endpoint.url, self.timeout)
         try:
             self._send_message(
@@ -1335,9 +1412,7 @@ class FiefClient:
             # 100 ms after Login_reunique.  Mirror that ordering before sending
             # the standalone client request.
             time.sleep(0.1)
-            # HARVEST_NORMAL=0; the generated Protobuf encoder omits it, so the
-            # inner message and MsgHdr.data are both empty.
-            self._send_message(FIEF_HARVEST_MESSAGE_ID, b"", encrypted=True)
+            self._send_message(FIEF_HARVEST_MESSAGE_ID, request_payload, encrypted=True)
             response: FiefHarvestResponse | None = None
             item_changes: tuple[ItemChange, ...] = ()
             props: tuple[RewardProp, ...] = ()
@@ -1391,7 +1466,28 @@ def harvest_normal_times(
     if not 0 <= count <= 2:
         raise HarvestError("普通庄园收取次数必须在 0 到 2 之间")
     return tuple(
-        client_factory(endpoint, timeout).harvest()
+        client_factory(endpoint, timeout).harvest(HARVEST_NORMAL)
+        for _ in range(count)
+    )
+
+
+def harvest_quick_times(
+    endpoint: GameEndpoint,
+    timeout: float,
+    count: int,
+    *,
+    mode: int | str = HARVEST_FREE,
+    client_factory: Callable[[GameEndpoint, float], FiefClient] = FiefClient,
+) -> tuple[HarvestResult, ...]:
+    """执行快速收取；默认仅使用免费模式，避免未配置预算时消耗宝石。"""
+
+    harvest_mode = resolve_harvest_mode(mode)
+    if harvest_mode == HARVEST_NORMAL:
+        raise HarvestError("快速收取不能使用 normal 模式")
+    if not 0 <= count <= 1:
+        raise HarvestError("快速收取次数必须在 0 到 1 之间")
+    return tuple(
+        client_factory(endpoint, timeout).harvest(harvest_mode)
         for _ in range(count)
     )
 
@@ -1405,7 +1501,11 @@ def _format_reward_prop(prop: RewardProp) -> str:
 
 
 def print_harvest_result(endpoint: GameEndpoint, result: HarvestResult) -> None:
-    print(f"庄园收获成功，区服：{zone_name(endpoint.zone_id, endpoint.zone_name)}")
+    mode_name = HARVEST_MODE_NAMES.get(result.response.mode, str(result.response.mode))
+    print(
+        f"庄园收获成功，区服：{zone_name(endpoint.zone_id, endpoint.zone_name)}，"
+        f"模式：{mode_name}"
+    )
     if result.changes:
         print("材料变动：")
         for change in result.changes:
@@ -1432,6 +1532,21 @@ def run_self_tests() -> None:
     assert encode_login_payload("token") == b"\x20\x01\x2a\x05token"
     assert encode_message_header(FIEF_HARVEST_MESSAGE_ID) == b"\x08\xd2\x95\x01"
     assert decode_message_header(encode_message_header(123, b"abc")) == MessageHeader(123, 0, b"abc")
+    assert encode_fief_harvest_payload(HARVEST_NORMAL) == b""
+    assert encode_fief_harvest_payload(HARVEST_FREE) == encode_int_field(1, HARVEST_FREE)
+    assert encode_fief_harvest_payload(HARVEST_PAY) == encode_int_field(1, HARVEST_PAY)
+    assert encode_fief_harvest_payload(
+        HARVEST_FREE, factory_type=2, times=1
+    ) == (
+        encode_int_field(1, HARVEST_FREE)
+        + encode_int_field(2, 2)
+        + encode_int_field(3, 1)
+    )
+    assert resolve_harvest_mode("free") == HARVEST_FREE
+    assert resolve_harvest_mode(HARVEST_PAY) == HARVEST_PAY
+    assert describe_fief_harvest_rejection(1) == "免费收取次数不足"
+    assert describe_fief_harvest_rejection(2) == "付费道具不足"
+    assert describe_fief_harvest_rejection(3) == "今日快速收取使用次数已达上限"
 
     item = encode_int_field(1, 7001) + encode_int_field(2, 12) + encode_int_field(3, 99)
     notice = encode_int_field(1, FIEF_HARVEST_SOURCE) + encode_bytes_field(2, item)
@@ -1468,6 +1583,7 @@ def run_self_tests() -> None:
         1, pack1_encode(session_password.encode("utf-8"), SOCKET_PACK_KEY).encode("utf-8")
     )
     notify_payload = encode_int_field(1, FIEF_HARVEST_SOURCE) + encode_bytes_field(2, item)
+    free_response = encode_int_field(2, HARVEST_FREE)
     fake_socket = TestSocket(
         [
             (0x2, encode_message_header(PACK_PASSWORD_MESSAGE_ID, password_payload)),
@@ -1484,7 +1600,38 @@ def run_self_tests() -> None:
     assert decode_message_header(fake_socket.binary_frames[0]).message_id == LOGIN_MESSAGE_ID
     harvest_packet = pack1_decode(fake_socket.text_frames[0], session_password)
     assert decode_message_header(harvest_packet) == MessageHeader(FIEF_HARVEST_MESSAGE_ID, 0, b"")
+
+    free_socket = TestSocket(
+        [
+            (0x2, encode_message_header(PACK_PASSWORD_MESSAGE_ID, password_payload)),
+            (0x2, pack1_encode(encode_message_header(LOGIN_REUNIQUE_MESSAGE_ID), session_password).encode("utf-8")),
+            (
+                0x2,
+                pack1_encode(
+                    encode_message_header(FIEF_HARVEST_MESSAGE_ID, free_response),
+                    session_password,
+                ).encode("utf-8"),
+            ),
+            (
+                0x2,
+                pack1_encode(
+                    encode_message_header(STORAGE_ITEM_CHANGE_MESSAGE_ID, notify_payload),
+                    session_password,
+                ).encode("utf-8"),
+            ),
+        ]
+    )
+    free_result = FiefClient(
+        endpoint, 1.0, lambda _url, _timeout: free_socket
+    ).harvest(HARVEST_FREE)
+    assert free_result.response.ret == 0
+    assert free_result.response.mode == HARVEST_FREE
+    free_packet = pack1_decode(free_socket.text_frames[0], session_password)
+    assert decode_message_header(free_packet) == MessageHeader(
+        FIEF_HARVEST_MESSAGE_ID, 0, encode_fief_harvest_payload(HARVEST_FREE)
+    )
     assert build_parser().parse_args([]).channel_name == "taojin_android_zhuyue"
+    assert build_parser().parse_args(["--mode", "free"]).mode == "free"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1493,6 +1640,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--account-url", default=DEFAULT_ACCOUNT_URL)
     parser.add_argument("--post-format", choices=("json", "form"), default="json")
     parser.add_argument("--zone-id", help="指定区服 ID；默认优先最近登录区服")
+    parser.add_argument(
+        "--mode",
+        choices=tuple(HARVEST_MODE_BY_NAME),
+        default="normal",
+        help="收取模式：normal 普通；free 免费快速；pay 付费快速（消耗宝石）",
+    )
     parser.add_argument("--http-timeout", type=float, default=15.0)
     parser.add_argument("--timeout", type=float, default=15.0, help="WebSocket 登录和响应超时秒数")
     parser.add_argument("--channel-name", default="taojin_android_zhuyue")
@@ -1523,7 +1676,13 @@ def main(argv: list[str] | None = None) -> int:
     try:
         tokens = load_tokens(args.token_file)
         endpoint = resolve_game_endpoint(tokens, args)
-        result = FiefClient(endpoint, args.timeout).harvest()
+        result = FiefClient(endpoint, args.timeout).harvest(args.mode)
+    except FiefHarvestRejected as exc:
+        print(
+            f"庄园收获失败：{describe_fief_harvest_rejection(exc.ret)}",
+            file=sys.stderr,
+        )
+        return 1
     except HarvestError as exc:
         print(f"庄园收获失败：{exc}", file=sys.stderr)
         return 1

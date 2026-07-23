@@ -25,7 +25,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Mapping
+from typing import Callable, Mapping, Sequence
 
 from harvest_fief import (
     HEARTBEAT_MESSAGE_ID,
@@ -58,7 +58,16 @@ from harvest_fief import (
 )
 from harvest_fief import build_parser as build_base_parser
 from logging_store import MANAGED_DESTINATION, LogPersistenceError, write_standard_log
-from id_descriptions import item_name, reward_name, rune_name, zone_name
+from id_descriptions import (
+    artifact_name,
+    artifact_rarity,
+    is_artifact_piece_item,
+    item_name,
+    item_quality,
+    reward_name,
+    rune_name,
+    zone_name,
+)
 from project_paths import NATIVE_APP_ROOT
 
 
@@ -110,6 +119,34 @@ RUNE_RARITY_LABELS = {
     6: "SS",
     7: "SSS",
 }
+# 与客户端品质色板一致：B=#9E80E8 紫，A=#ECB94B 黄。
+RUNE_COLOR_LABELS = {
+    1: "灰色",
+    2: "蓝色",
+    3: "紫色",
+    4: "黄色",
+    5: "绿色",
+    6: "橙色",
+    7: "橙色",
+}
+# 律文：B 紫、A 黄、S 绿（客户端 kb 色板）。
+HIGHLIGHT_RUNE_RARITIES = frozenset({3, 4, 5})
+# 秘宝配置 rarity 映射到 kb[rarity+2]：1→紫、2→黄、3→绿。
+ARTIFACT_COLOR_LABELS = {
+    1: "紫色",
+    2: "黄色",
+    3: "绿色",
+}
+ARTIFACT_RARITY_LABELS = {
+    1: "I",
+    2: "II",
+    3: "III",
+}
+HIGHLIGHT_ARTIFACT_RARITIES = frozenset({1, 2, 3})
+# 秘宝碎片使用物品 quality，色板与装备/律文相同：3 紫、4 黄、5 绿。
+HIGHLIGHT_ARTIFACT_PIECE_QUALITIES = frozenset({3, 4, 5})
+ARTIFACT_FORM_WHOLE = "整体"
+ARTIFACT_FORM_PIECE = "碎片"
 
 
 class GameSessionKickout(HarvestError):
@@ -225,6 +262,7 @@ class RewardSummary:
     stage_level: int
     affix_attributes: tuple[RuneAttribute, ...]
     pattern_attributes: tuple[RuneAttribute, ...]
+    form: str = ""
 
 
 def decode_int64(value: int) -> int:
@@ -591,6 +629,10 @@ def _reward_name(catalogs: NameCatalogs, kind: int, base_id: int) -> str:
         if base_id > 0:
             return catalogs.rune_names.get(base_id, rune_name(base_id))
         return "未知律文"
+    if kind == PROP_KIND_ARTIFACT:
+        if base_id > 0:
+            return artifact_name(base_id)
+        return "未知秘宝"
     if base_id > 0:
         return catalogs.item_names.get(base_id, reward_name(kind, base_id))
     return f"未知{_kind_label(kind)}"
@@ -707,8 +749,72 @@ def resolve_attempt_rewards(
                 )
             )
 
+    pending_artifacts: list[int] = [
+        prop.item_id
+        for prop in props
+        if prop.kind == PROP_KIND_ARTIFACT and prop.item_id > 0
+    ]
+    artifact_instance_ids = list(
+        dict.fromkeys(
+            instance_id
+            for notify in notifications
+            for instance_id in notify.artifact_instance_ids
+            if instance_id > 0
+        )
+    )
+    for instance_id in artifact_instance_ids:
+        base_id = pending_artifacts.pop(0) if pending_artifacts else 0
+        rewards.append(
+            RewardSummary(
+                kind=PROP_KIND_ARTIFACT,
+                base_id=base_id,
+                quantity=1,
+                name=_reward_name(catalogs, PROP_KIND_ARTIFACT, base_id),
+                instance_id=instance_id,
+                rarity=artifact_rarity(base_id) if base_id > 0 else 0,
+                level=0,
+                stage_level=0,
+                affix_attributes=(),
+                pattern_attributes=(),
+                form=ARTIFACT_FORM_WHOLE,
+            )
+        )
+    for base_id in pending_artifacts:
+        rewards.append(
+            RewardSummary(
+                kind=PROP_KIND_ARTIFACT,
+                base_id=base_id,
+                quantity=1,
+                name=_reward_name(catalogs, PROP_KIND_ARTIFACT, base_id),
+                instance_id=0,
+                rarity=artifact_rarity(base_id),
+                level=0,
+                stage_level=0,
+                affix_attributes=(),
+                pattern_attributes=(),
+                form=ARTIFACT_FORM_WHOLE,
+            )
+        )
+
     for prop in props:
-        if prop.kind == PROP_KIND_ORDER_RUNE:
+        if prop.kind in {PROP_KIND_ORDER_RUNE, PROP_KIND_ARTIFACT}:
+            continue
+        if prop.kind == PROP_KIND_ITEM and is_artifact_piece_item(prop.item_id):
+            rewards.append(
+                RewardSummary(
+                    kind=PROP_KIND_ITEM,
+                    base_id=prop.item_id,
+                    quantity=prop.amount,
+                    name=_reward_name(catalogs, PROP_KIND_ITEM, prop.item_id),
+                    instance_id=0,
+                    rarity=item_quality(prop.item_id),
+                    level=0,
+                    stage_level=0,
+                    affix_attributes=(),
+                    pattern_attributes=(),
+                    form=ARTIFACT_FORM_PIECE,
+                )
+            )
             continue
         rewards.append(
             RewardSummary(
@@ -725,41 +831,29 @@ def resolve_attempt_rewards(
             )
         )
 
-    for kind, instance_ids in (
-        (
-            PROP_KIND_EQUIPMENT,
-            [
-                instance_id
-                for notify in notifications
-                for instance_id in notify.equipment_instance_ids
-                if instance_id > 0
-            ],
-        ),
-        (
-            PROP_KIND_ARTIFACT,
-            [
-                instance_id
-                for notify in notifications
-                for instance_id in notify.artifact_instance_ids
-                if instance_id > 0
-            ],
-        ),
-    ):
-        for instance_id in dict.fromkeys(instance_ids):
-            rewards.append(
-                RewardSummary(
-                    kind=kind,
-                    base_id=0,
-                    quantity=1,
-                    name=_reward_name(catalogs, kind, 0),
-                    instance_id=instance_id,
-                    rarity=0,
-                    level=0,
-                    stage_level=0,
-                    affix_attributes=(),
-                    pattern_attributes=(),
-                )
+    equipment_instance_ids = list(
+        dict.fromkeys(
+            instance_id
+            for notify in notifications
+            for instance_id in notify.equipment_instance_ids
+            if instance_id > 0
+        )
+    )
+    for instance_id in equipment_instance_ids:
+        rewards.append(
+            RewardSummary(
+                kind=PROP_KIND_EQUIPMENT,
+                base_id=0,
+                quantity=1,
+                name=_reward_name(catalogs, PROP_KIND_EQUIPMENT, 0),
+                instance_id=instance_id,
+                rarity=0,
+                level=0,
+                stage_level=0,
+                affix_attributes=(),
+                pattern_attributes=(),
             )
+        )
 
     remaining_prop_items: dict[int, int] = {}
     for prop in props:
@@ -776,6 +870,23 @@ def resolve_attempt_rewards(
         )
         missing_quantity = item.delta - covered
         if missing_quantity <= 0:
+            continue
+        if is_artifact_piece_item(item.item_id):
+            rewards.append(
+                RewardSummary(
+                    kind=PROP_KIND_ITEM,
+                    base_id=item.item_id,
+                    quantity=missing_quantity,
+                    name=_reward_name(catalogs, PROP_KIND_ITEM, item.item_id),
+                    instance_id=0,
+                    rarity=item_quality(item.item_id),
+                    level=0,
+                    stage_level=0,
+                    affix_attributes=(),
+                    pattern_attributes=(),
+                    form=ARTIFACT_FORM_PIECE,
+                )
+            )
             continue
         rewards.append(
             RewardSummary(
@@ -1172,6 +1283,26 @@ def _attribute_record(attribute: RuneAttribute) -> dict[str, int]:
 
 
 def _reward_record(reward: RewardSummary) -> dict[str, object]:
+    form = reward.form
+    if reward.kind == PROP_KIND_ARTIFACT or form == ARTIFACT_FORM_WHOLE:
+        rarity_label = ARTIFACT_RARITY_LABELS.get(
+            reward.rarity, "" if reward.rarity == 0 else str(reward.rarity)
+        )
+        color_label = ARTIFACT_COLOR_LABELS.get(reward.rarity, "")
+        form = form or ARTIFACT_FORM_WHOLE
+    elif form == ARTIFACT_FORM_PIECE or (
+        reward.kind == PROP_KIND_ITEM and is_artifact_piece_item(reward.base_id)
+    ):
+        rarity_label = RUNE_RARITY_LABELS.get(
+            reward.rarity, "" if reward.rarity == 0 else str(reward.rarity)
+        )
+        color_label = RUNE_COLOR_LABELS.get(reward.rarity, "")
+        form = ARTIFACT_FORM_PIECE
+    else:
+        rarity_label = RUNE_RARITY_LABELS.get(
+            reward.rarity, "" if reward.rarity == 0 else str(reward.rarity)
+        )
+        color_label = RUNE_COLOR_LABELS.get(reward.rarity, "")
     return {
         "kind": reward.kind,
         "kind_label": _kind_label(reward.kind),
@@ -1180,9 +1311,9 @@ def _reward_record(reward: RewardSummary) -> dict[str, object]:
         "quantity": reward.quantity,
         "instance_id": reward.instance_id,
         "rarity": reward.rarity,
-        "rarity_label": RUNE_RARITY_LABELS.get(
-            reward.rarity, "" if reward.rarity == 0 else str(reward.rarity)
-        ),
+        "rarity_label": rarity_label,
+        "color_label": color_label,
+        "form": form,
         "level": reward.level,
         "stage_level": reward.stage_level,
         "affix_attributes": [
@@ -1293,6 +1424,18 @@ def build_daily_result_log_record(
             }
             for attempt in result.attempts
         ],
+        "highlight_runes": [
+            {
+                **_reward_record(reward),
+                "kind_label": (
+                    "秘宝"
+                    if reward.kind == PROP_KIND_ARTIFACT
+                    or reward.form in {ARTIFACT_FORM_WHOLE, ARTIFACT_FORM_PIECE}
+                    else _kind_label(reward.kind)
+                ),
+            }
+            for reward in collect_highlight_runes(result, catalogs)
+        ],
     }
 
 
@@ -1324,21 +1467,197 @@ def append_daily_result_log(
         raise HarvestError(f"写入古律院铭刻结果日志失败：{exc}") from exc
 
 
+def _artifact_color_and_quality(reward: RewardSummary) -> tuple[str, str]:
+    form = reward.form or (
+        ARTIFACT_FORM_WHOLE if reward.kind == PROP_KIND_ARTIFACT else ARTIFACT_FORM_PIECE
+    )
+    if form == ARTIFACT_FORM_PIECE:
+        color = RUNE_COLOR_LABELS.get(reward.rarity, "")
+        quality = RUNE_RARITY_LABELS.get(
+            reward.rarity, str(reward.rarity) if reward.rarity else "未知"
+        )
+        return color, quality
+    color = ARTIFACT_COLOR_LABELS.get(reward.rarity, "")
+    quality = ARTIFACT_RARITY_LABELS.get(
+        reward.rarity, str(reward.rarity) if reward.rarity else "未知"
+    )
+    return color, quality
+
+
 def _format_reward(reward: RewardSummary) -> str:
     amount = f" x{reward.quantity}" if reward.quantity != 1 else ""
-    if reward.kind != PROP_KIND_ORDER_RUNE:
-        return f"{reward.name}{amount}"
-    details: list[str] = []
-    if reward.rarity > 0:
-        details.append(
-            "品质 " + RUNE_RARITY_LABELS.get(reward.rarity, str(reward.rarity))
+    if reward.kind == PROP_KIND_ORDER_RUNE:
+        details: list[str] = []
+        if reward.rarity > 0:
+            color = RUNE_COLOR_LABELS.get(reward.rarity, "")
+            quality = RUNE_RARITY_LABELS.get(reward.rarity, str(reward.rarity))
+            if color:
+                details.append(f"品质 {color}·{quality}")
+            else:
+                details.append(f"品质 {quality}")
+        if reward.level > 0:
+            details.append(f"Lv.{reward.level}")
+        if reward.stage_level > 0:
+            details.append(f"淬阶 +{reward.stage_level}")
+        suffix = f"（{'；'.join(details)}）" if details else ""
+        return f"{reward.name}{amount}{suffix}"
+    if reward.kind == PROP_KIND_ARTIFACT or reward.form in {
+        ARTIFACT_FORM_WHOLE,
+        ARTIFACT_FORM_PIECE,
+    }:
+        form = reward.form or (
+            ARTIFACT_FORM_WHOLE
+            if reward.kind == PROP_KIND_ARTIFACT
+            else ARTIFACT_FORM_PIECE
         )
-    if reward.level > 0:
-        details.append(f"Lv.{reward.level}")
-    if reward.stage_level > 0:
-        details.append(f"淬阶 +{reward.stage_level}")
-    suffix = f"（{'；'.join(details)}）" if details else ""
-    return f"{reward.name}{amount}{suffix}"
+        details = [f"秘宝·{form}"]
+        if reward.rarity > 0:
+            color, quality = _artifact_color_and_quality(reward)
+            if color:
+                details.append(f"品质 {color}·{quality}")
+            else:
+                details.append(f"品质 {quality}")
+        return f"{reward.name}{amount}（{'；'.join(details)}）"
+    return f"{reward.name}{amount}"
+
+
+def is_highlight_rune_rarity(rarity: int) -> bool:
+    """紫色（B）、黄色（A）或绿色（S）律文需要在日志中单独强调。"""
+
+    return rarity in HIGHLIGHT_RUNE_RARITIES
+
+
+def is_highlight_artifact_rarity(rarity: int) -> bool:
+    """紫色、黄色或绿色秘宝整体需要在日志中单独强调。"""
+
+    return rarity in HIGHLIGHT_ARTIFACT_RARITIES
+
+
+def is_highlight_artifact_piece_quality(quality: int) -> bool:
+    """紫色、黄色或绿色秘宝碎片（物品 quality）需要在日志中单独强调。"""
+
+    return quality in HIGHLIGHT_ARTIFACT_PIECE_QUALITIES
+
+
+def is_highlight_reward(reward: RewardSummary | object) -> bool:
+    kind = int(getattr(reward, "kind", 0) or 0)
+    rarity = int(getattr(reward, "rarity", 0) or 0)
+    form = str(getattr(reward, "form", "") or "")
+    if kind == PROP_KIND_ORDER_RUNE:
+        return is_highlight_rune_rarity(rarity)
+    if kind == PROP_KIND_ARTIFACT or form == ARTIFACT_FORM_WHOLE:
+        return is_highlight_artifact_rarity(rarity)
+    if form == ARTIFACT_FORM_PIECE or (
+        kind == PROP_KIND_ITEM and is_artifact_piece_item(getattr(reward, "base_id", 0))
+    ):
+        return is_highlight_artifact_piece_quality(rarity)
+    return False
+
+
+def collect_highlight_runes(
+    result: AncientLawCourtDailyResult,
+    catalogs: NameCatalogs | None = None,
+) -> tuple[RewardSummary, ...]:
+    """从铭刻结果中提取紫/黄/绿品质律文与秘宝（按实例去重）。"""
+
+    highlights: list[RewardSummary] = []
+    seen: set[tuple[int, int, int, int]] = set()
+
+    def consider(reward: RewardSummary) -> None:
+        if not is_highlight_reward(reward):
+            return
+        key = (reward.kind, reward.instance_id, reward.base_id, reward.rarity)
+        if key in seen:
+            return
+        seen.add(key)
+        highlights.append(reward)
+
+    for attempt in result.attempts:
+        rune_infos = getattr(attempt, "rune_infos", ()) or ()
+        if catalogs is not None and hasattr(attempt, "notifications"):
+            for reward in resolve_attempt_rewards(attempt, catalogs):
+                consider(reward)
+        # 同步下来的律文详情是品质判定的权威来源，即使奖励解析未带上也会纳入。
+        for rune in rune_infos:
+            consider(
+                RewardSummary(
+                    kind=PROP_KIND_ORDER_RUNE,
+                    base_id=rune.order_rune_id,
+                    quantity=1,
+                    name=(
+                        catalogs.rune_names.get(rune.order_rune_id, rune_name(rune.order_rune_id))
+                        if catalogs is not None
+                        else rune_name(rune.order_rune_id)
+                    ),
+                    instance_id=rune.instance_id,
+                    rarity=rune.rarity,
+                    level=rune.level,
+                    stage_level=rune.stage_level,
+                    affix_attributes=getattr(rune, "affix_attributes", ()) or (),
+                    pattern_attributes=getattr(rune, "pattern_attributes", ()) or (),
+                )
+            )
+    return tuple(highlights)
+
+
+def format_highlight_rune_summary(
+    highlights: Sequence[RewardSummary] | Sequence[object],
+) -> str:
+    """格式化为日志片段。
+
+    例如：百胜（律文·紫色·珍稀/B）、永恒之心（秘宝·整体·黄色·II）、
+    邪力水晶残片（秘宝·碎片·紫色·珍稀/B）。
+    """
+
+    parts: list[str] = []
+    for reward in highlights:
+        kind = int(getattr(reward, "kind", PROP_KIND_ORDER_RUNE) or PROP_KIND_ORDER_RUNE)
+        rarity = int(getattr(reward, "rarity", 0) or 0)
+        base_id = int(getattr(reward, "base_id", 0) or 0)
+        form = str(getattr(reward, "form", "") or "")
+        name = str(getattr(reward, "name", "") or "")
+        if kind == PROP_KIND_ARTIFACT or form in {
+            ARTIFACT_FORM_WHOLE,
+            ARTIFACT_FORM_PIECE,
+        }:
+            if not name:
+                name = (
+                    item_name(base_id)
+                    if form == ARTIFACT_FORM_PIECE or kind == PROP_KIND_ITEM
+                    else artifact_name(base_id)
+                )
+            if not form:
+                form = (
+                    ARTIFACT_FORM_WHOLE
+                    if kind == PROP_KIND_ARTIFACT
+                    else ARTIFACT_FORM_PIECE
+                )
+            # 碎片用装备色板（quality），整体用秘宝 rarity 色板。
+            if form == ARTIFACT_FORM_PIECE:
+                color = RUNE_COLOR_LABELS.get(rarity, "")
+                quality = RUNE_RARITY_LABELS.get(
+                    rarity, str(rarity) if rarity else "未知"
+                )
+            else:
+                color = ARTIFACT_COLOR_LABELS.get(rarity, "")
+                quality = ARTIFACT_RARITY_LABELS.get(
+                    rarity, str(rarity) if rarity else "未知"
+                )
+            if color:
+                parts.append(f"{name}（秘宝·{form}·{color}·{quality}）")
+            else:
+                parts.append(f"{name}（秘宝·{form}·{quality}）")
+            continue
+
+        if not name:
+            name = rune_name(base_id)
+        color = RUNE_COLOR_LABELS.get(rarity, "")
+        quality = RUNE_RARITY_LABELS.get(rarity, str(rarity) if rarity else "未知")
+        if color:
+            parts.append(f"{name}（律文·{color}·{quality}）")
+        else:
+            parts.append(f"{name}（律文·{quality}）")
+    return "、".join(parts)
 
 
 def print_daily_result(
@@ -1385,6 +1704,13 @@ def print_daily_result(
             print("  铭刻抽到的物品：服务端未返回可解析的奖励")
         for warning in attempt.warnings:
             print(f"  校验提示：{warning}")
+
+    highlights = collect_highlight_runes(result, catalogs)
+    if highlights:
+        print(
+            "高品质掉落（紫/黄/绿律文或秘宝）："
+            + format_highlight_rune_summary(highlights)
+        )
 
 
 def run_self_tests() -> None:
@@ -1566,6 +1892,10 @@ def run_self_tests() -> None:
     assert rewards[0].name == "守序律文"
     assert rewards[0].instance_id == rune_instance_id
     assert rewards[0].rarity == 4
+    highlights = collect_highlight_runes(result, catalogs)
+    assert len(highlights) == 1
+    assert highlights[0].name == "守序律文"
+    assert "黄色" in format_highlight_rune_summary(highlights)
 
     with tempfile.TemporaryDirectory() as temporary_directory:
         result_log = Path(temporary_directory) / "ancient-law-court.jsonl"
@@ -1584,6 +1914,7 @@ def run_self_tests() -> None:
         assert log_record["details"]["attempts"][0]["free_after"] == 0
         assert len(log_record["details"]["attempts"][0]["rewards"]) == 1
         assert log_record["details"]["attempts"][0]["rewards"][0]["name"] == "守序律文"
+        assert log_record["details"]["highlight_runes"][0]["color_label"] == "黄色"
         assert "token" not in log_text.lower()
 
     no_free_storage = (

@@ -1,0 +1,26 @@
+{
+  "name": "ui_app",
+  "version": "1.0.0",
+  "description": "- `ui_app/`：本操作台的 Python 源码、UI 静态资源、配置、测试及解密 JS。 - `native_app/`：原生 Android 包的清单、DEX、资源、库和非 JS 解密数据。",
+  "main": "dragon_arena_runtime_hook.js",
+  "directories": {
+    "test": "tests"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/HappyCili/dungeon.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/HappyCili/dungeon/issues"
+  },
+  "homepage": "https://github.com/HappyCili/dungeon#readme",
+  "dependencies": {
+    "frida-il2cpp-bridge": "^0.13.1"
+  }
+}

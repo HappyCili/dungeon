@@ -5,11 +5,18 @@ from urllib.parse import urlparse
 
 from flask import Flask, abort, current_app, jsonify, render_template, request
 
-from .config_store import MAX_TREASURE_SWEEP_TIMES, UiSettings, VALID_OUTCOMES
+from .config_store import (
+    MAX_ABYSS_ROUNDS,
+    MAX_TREASURE_FARM_HEARTH,
+    MAX_TREASURE_SWEEP_TIMES,
+    UiSettings,
+    VALID_OUTCOMES,
+)
 from .credentials import CredentialStorageError
 from .job_manager import JobConflictError, JobNotFoundError
 from .models import AVAILABLE_TASK_IDS
 from .services.account_service import AccountLoginError
+from .services.abyss_service import AbyssServiceError
 from .services.arena_service import ArenaServiceError
 from .services.daily_service import DailyServiceError
 from dungeon_sweep import DungeonSweepError
@@ -17,6 +24,7 @@ from daily_quest import DailyQuestError
 from harvest_fief import HarvestError
 from id_descriptions import treasure_area_name
 from treasure_area import TreasureAreaError
+from treasure_farm import TreasureFarmError
 
 
 class ApiError(Exception):
@@ -90,6 +98,30 @@ def _require_treasure_times(payload: Mapping[str, Any]) -> int:
     return value
 
 
+def _require_farm_area_id(payload: Mapping[str, Any]) -> int:
+    value = payload.get("farm_area_id", payload.get("area_id"))
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or not 1 <= value <= 0x7FFFFFFF
+    ):
+        raise ApiError("farm_area_id 必须是正整数")
+    return value
+
+
+def _require_farm_target_hearth(payload: Mapping[str, Any]) -> int:
+    value = payload.get("farm_target_hearth", payload.get("target_hearth"))
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or not 1 <= value <= MAX_TREASURE_FARM_HEARTH
+    ):
+        raise ApiError(
+            f"farm_target_hearth 必须是 1 到 {MAX_TREASURE_FARM_HEARTH} 之间的整数"
+        )
+    return value
+
+
 def _require_dungeon_id(payload: Mapping[str, Any]) -> int:
     value = payload.get("dungeon_id")
     if (
@@ -98,6 +130,19 @@ def _require_dungeon_id(payload: Mapping[str, Any]) -> int:
         or not 1 <= value <= 0x7FFFFFFF
     ):
         raise ApiError("dungeon_id 必须是正整数")
+    return value
+
+
+def _require_abyss_max_rounds(payload: Mapping[str, Any]) -> int:
+    value = payload.get("max_rounds", 0)
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or not 0 <= value <= MAX_ABYSS_ROUNDS
+    ):
+        raise ApiError(
+            f"max_rounds 必须是 0 到 {MAX_ABYSS_ROUNDS} 之间的整数（0=直到失败）"
+        )
     return value
 
 
@@ -148,12 +193,19 @@ def _public_config() -> dict[str, Any]:
             "area_id": settings.treasure.area_id,
             "area_name": treasure_area_name(settings.treasure.area_id),
             "times": settings.treasure.times,
+            "farm_area_id": settings.treasure.farm_area_id,
+            "farm_area_name": treasure_area_name(settings.treasure.farm_area_id),
+            "farm_target_hearth": settings.treasure.farm_target_hearth,
         },
         "dungeon": {
             "dungeon_id": settings.dungeon.dungeon_id,
             "dungeon_name": services["dungeon"].dungeon_name(
                 settings.dungeon.dungeon_id
             ),
+        },
+        "abyss": {
+            "max_rounds": settings.abyss.max_rounds,
+            "auto_buff": settings.abyss.auto_buff,
         },
         "connection": account.connection_snapshot(),
         "zones": account.zones(),
@@ -180,8 +232,13 @@ def _validate_treasure_preflight(
     snapshot: Mapping[str, Any], area_id: int, times: int
 ) -> None:
     areas = snapshot["areas"]
-    if not any(area["id"] == area_id for area in areas):
-        raise ApiError("所选聚宝之地地图当前不可扫荡")
+    area_label = treasure_area_name(area_id)
+    for area in areas:
+        if area["id"] == area_id:
+            area_label = str(area.get("name") or area_label)
+            break
+    else:
+        raise ApiError(f"所选地图 {area_label} 当前不可扫荡")
     remaining = snapshot["sweep"]["available"]
     if remaining <= 0:
         raise ApiError("今日聚宝之地扫荡次数已用完")
@@ -231,7 +288,8 @@ def register_routes(app: Flask) -> None:
     def login():
         payload = _require_json_body()
         username = _require_string(payload, "username", maximum=64)
-        password = _require_string(payload, "password", maximum=256)
+        # 允许空密码：勾选「记住密码」且系统凭据库已有密码时复用。
+        password = _require_string(payload, "password", maximum=256, allow_empty=True)
         remember_password = _require_bool(payload, "remember_password")
         services = _services()
         services["daily"].clear_game_server()
@@ -241,7 +299,9 @@ def register_routes(app: Flask) -> None:
         except CredentialStorageError as exc:
             raise ApiError(str(exc), 503) from exc
         except AccountLoginError as exc:
-            raise ApiError(str(exc), 502) from exc
+            # 缺密码属于客户端可修正的输入问题，其余上游失败仍返回 502。
+            status = 400 if "请输入密码" in str(exc) else 502
+            raise ApiError(str(exc), status) from exc
         return jsonify({"config": _public_config(), **result})
 
     @app.put("/api/config/zone")
@@ -300,14 +360,30 @@ def register_routes(app: Flask) -> None:
             raise ApiError("已有任务正在运行", 409)
         try:
             endpoint = services["account"].resolve_selected_game_endpoint()
-            snapshot = services["arena"].snapshot(endpoint)
+            snapshot = services["arena"].snapshot(
+                endpoint,
+                refresh_endpoint=services["account"].resolve_selected_game_endpoint,
+            )
         except AccountLoginError as exc:
             raise ApiError(str(exc)) from exc
-        except (ArenaServiceError, HarvestError, OSError, ValueError) as exc:
+        except ArenaServiceError as exc:
+            raise ApiError(str(exc), 502) from exc
+        except (HarvestError, OSError, ValueError) as exc:
             raise ApiError(
                 "龙痕竞技场状态查询失败，请检查网络和区服状态", 502
             ) from exc
         return jsonify({"config": _public_config(), **snapshot})
+
+    @app.get("/api/treasure/farm-catalog")
+    def get_treasure_farm_catalog():
+        services = _services()
+        selected = services["config_store"].snapshot().treasure.farm_area_id
+        return jsonify(
+            {
+                "config": _public_config(),
+                "farm": services["treasure"].farm_catalog(selected),
+            }
+        )
 
     @app.get("/api/treasure")
     def get_treasure_status():
@@ -334,6 +410,23 @@ def register_routes(app: Flask) -> None:
         _services()["config_store"].set_treasure(area_id, times)
         return jsonify({"config": _public_config()})
 
+    @app.put("/api/config/treasure-farm")
+    def update_treasure_farm_config():
+        payload = _require_json_body()
+        farm_area_id = _require_farm_area_id(payload)
+        farm_target_hearth = _require_farm_target_hearth(payload)
+        try:
+            # 校验地图在配置表中存在
+            from treasure_farm import get_treasure_map_entry
+
+            get_treasure_map_entry(farm_area_id)
+        except TreasureFarmError as exc:
+            raise ApiError(str(exc)) from exc
+        _services()["config_store"].set_treasure_farm(
+            farm_area_id, farm_target_hearth
+        )
+        return jsonify({"config": _public_config()})
+
     @app.get("/api/dungeon")
     def get_dungeon_status():
         services = _services()
@@ -357,6 +450,35 @@ def register_routes(app: Flask) -> None:
     def update_dungeon_config():
         dungeon_id = _require_dungeon_id(_require_json_body())
         _services()["config_store"].set_dungeon(dungeon_id)
+        return jsonify({"config": _public_config()})
+
+    @app.get("/api/abyss")
+    def get_abyss_status():
+        services = _services()
+        if services["jobs"].active_job_id() is not None:
+            raise ApiError("已有任务正在运行", 409)
+        try:
+            endpoint = services["account"].resolve_selected_game_endpoint()
+            snapshot = services["abyss"].snapshot(
+                endpoint,
+                refresh_endpoint=services["account"].resolve_selected_game_endpoint,
+            )
+        except AccountLoginError as exc:
+            raise ApiError(str(exc)) from exc
+        except AbyssServiceError as exc:
+            raise ApiError(str(exc), 502) from exc
+        except (HarvestError, OSError, ValueError) as exc:
+            raise ApiError(
+                "罪者深渊状态查询失败，请检查网络和区服状态", 502
+            ) from exc
+        return jsonify({"config": _public_config(), **snapshot})
+
+    @app.put("/api/config/abyss")
+    def update_abyss_config():
+        payload = _require_json_body()
+        max_rounds = _require_abyss_max_rounds(payload)
+        auto_buff = _require_bool(payload, "auto_buff")
+        _services()["config_store"].set_abyss(max_rounds, auto_buff)
         return jsonify({"config": _public_config()})
 
     @app.post("/api/jobs/daily")
@@ -417,6 +539,7 @@ def register_routes(app: Flask) -> None:
         services["config_store"].set_arena(
             rounds, outcome, refresh_on_exhaustion
         )
+        refresh_endpoint = services["account"].resolve_selected_game_endpoint
         try:
             job = services["jobs"].start(
                 "arena",
@@ -427,6 +550,7 @@ def register_routes(app: Flask) -> None:
                     refresh_on_exhaustion,
                     emit,
                     stop_requested,
+                    refresh_endpoint=refresh_endpoint,
                 ),
             )
         except JobConflictError as exc:
@@ -469,6 +593,41 @@ def register_routes(app: Flask) -> None:
             raise ApiError(str(exc), 409) from exc
         return jsonify({"job": job, "config": _public_config(), "treasure": snapshot})
 
+    @app.post("/api/jobs/treasure-farm")
+    def start_treasure_farm_job():
+        payload = _require_json_body()
+        farm_area_id = _require_farm_area_id(payload)
+        farm_target_hearth = _require_farm_target_hearth(payload)
+        services = _services()
+        if services["jobs"].active_job_id() is not None:
+            raise ApiError("已有任务正在运行", 409)
+        try:
+            from treasure_farm import get_treasure_map_entry
+
+            get_treasure_map_entry(farm_area_id)
+            endpoint = services["account"].resolve_selected_game_endpoint()
+        except AccountLoginError as exc:
+            raise ApiError(str(exc)) from exc
+        except TreasureFarmError as exc:
+            raise ApiError(str(exc)) from exc
+        services["config_store"].set_treasure_farm(
+            farm_area_id, farm_target_hearth
+        )
+        try:
+            job = services["jobs"].start(
+                "treasure_farm",
+                lambda emit, stop_requested: services["treasure"].run_farm(
+                    endpoint,
+                    farm_area_id,
+                    farm_target_hearth,
+                    emit,
+                    stop_requested,
+                ),
+            )
+        except JobConflictError as exc:
+            raise ApiError(str(exc), 409) from exc
+        return jsonify({"job": job, "config": _public_config()})
+
     @app.post("/api/jobs/dungeon")
     def start_dungeon_job():
         dungeon_id = _require_dungeon_id(_require_json_body())
@@ -501,6 +660,36 @@ def register_routes(app: Flask) -> None:
         except JobConflictError as exc:
             raise ApiError(str(exc), 409) from exc
         return jsonify({"job": job, "config": _public_config(), "dungeon": snapshot})
+
+    @app.post("/api/jobs/abyss")
+    def start_abyss_job():
+        payload = _require_json_body()
+        max_rounds = _require_abyss_max_rounds(payload)
+        auto_buff = _require_bool(payload, "auto_buff")
+        services = _services()
+        if services["jobs"].active_job_id() is not None:
+            raise ApiError("已有任务正在运行", 409)
+        try:
+            endpoint = services["account"].resolve_selected_game_endpoint()
+        except AccountLoginError as exc:
+            raise ApiError(str(exc)) from exc
+        services["config_store"].set_abyss(max_rounds, auto_buff)
+        refresh_endpoint = services["account"].resolve_selected_game_endpoint
+        try:
+            job = services["jobs"].start(
+                "abyss",
+                lambda emit, stop_requested: services["abyss"].run(
+                    endpoint,
+                    emit,
+                    stop_requested,
+                    max_rounds=max_rounds,
+                    auto_buff=auto_buff,
+                    refresh_endpoint=refresh_endpoint,
+                ),
+            )
+        except JobConflictError as exc:
+            raise ApiError(str(exc), 409) from exc
+        return jsonify({"job": job, "config": _public_config()})
 
     @app.get("/api/jobs/<job_id>")
     def get_job(job_id: str):

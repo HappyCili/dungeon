@@ -10,6 +10,7 @@ from .credentials import CredentialStore, KeyringCredentialStore
 from .job_manager import JobManager
 from .routes import register_routes
 from .services.account_service import AccountService
+from .services.abyss_service import AbyssService
 from .services.arena_service import ArenaService
 from .services.daily_service import DailyService
 from .services.dungeon_service import DungeonService
@@ -31,6 +32,7 @@ def create_app(
     arena_service: ArenaService | None = None,
     treasure_service: TreasureService | None = None,
     dungeon_service: DungeonService | None = None,
+    abyss_service: AbyssService | None = None,
 ) -> Flask:
     app = Flask(__name__)
     app.config.from_mapping(
@@ -56,9 +58,10 @@ def create_app(
         "arena": arena_service or ArenaService(),
         "treasure": treasure_service or TreasureService(),
         "dungeon": dungeon_service or DungeonService(),
+        "abyss": abyss_service or AbyssService(),
         "jobs": job_manager or JobManager(),
     }
     app.extensions["daily_console"] = services
-    app.jinja_env.globals["asset_version"] = "dungeon-arena-v8"
+    app.jinja_env.globals["asset_version"] = "dungeon-abyss-v1"
     register_routes(app)
     return app

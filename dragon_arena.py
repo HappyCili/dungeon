@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import random
 import socket
 import subprocess
 import sys
@@ -139,7 +140,18 @@ SCARARENA_REWARD_SOURCES = frozenset(
 )
 
 BATTLE_TIMESCALE_X3 = 3
+# 胜利抉择 ID：来自客户端 scararena_winchoice 配置与真实样本（仁慈=2）。
+# 处决在 UI 中映射为 1；与仁慈共用 Scararena_winchoice 请求字段。
+EXECUTE_CHOICE_ID = 1
 MERCY_CHOICE_ID = 2
+OUTCOME_CHOICE_IDS = {
+    "execute": EXECUTE_CHOICE_ID,
+    "mercy": MERCY_CHOICE_ID,
+}
+OUTCOME_LABELS = {
+    "execute": "处决",
+    "mercy": "仁慈",
+}
 LOGIN_KICKOUT_RETRY_DELAY = 3.0
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_JS_CODEC_BRIDGE = PROJECT_ROOT / "dragon_arena_js_codec_bridge.mjs"
@@ -363,6 +375,7 @@ class DragonArenaChoiceResult:
     buff_choice_index: int
     daily_reward_num: int
     item_changes: tuple[ItemChange, ...]
+    rewardbox: tuple[tuple[int, int], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -806,9 +819,33 @@ def encode_scararena_win_choice(choice_id: int) -> bytes:
     return encode_int_field(1, choice_id)
 
 
+def _decode_rewardbox_entry(data: bytes) -> tuple[int, int] | None:
+    """Decode one ``rewardbox`` map entry: ``key`` is field 1, ``value`` is field 2."""
+
+    item_id = 0
+    amount = 0
+    for field_number, wire_type, value in ProtoReader(data).fields():
+        if field_number == 1 and wire_type == 0:
+            item_id = decode_int32(int(value))
+        elif field_number == 2 and wire_type == 0:
+            amount = decode_int32(int(value))
+    if item_id <= 0 or amount == 0:
+        return None
+    return item_id, amount
+
+
 def decode_scararena_win_choice_response(
-    data: bytes, item_changes: Iterable[ItemChange] = ()
+    data: bytes,
+    item_changes: Iterable[ItemChange] = (),
+    *,
+    item_totals: dict[int, int] | None = None,
 ) -> DragonArenaChoiceResult:
+    """Decode ``Scararena_winchoice``；``rewardbox`` 是字段 8 的 map<entry>。
+
+    当结算窗口内没有 ``Storage_notify_itemchange`` 时，用 ``rewardbox`` 补齐
+    物品变动，并按 ``item_totals``（若提供）推算变动后的总量。
+    """
+
     values = {
         "ret": 0,
         "choice_id": 0,
@@ -819,6 +856,7 @@ def decode_scararena_win_choice_response(
         "buff_choice_index": 0,
         "daily_reward_num": 0,
     }
+    rewardbox: list[tuple[int, int]] = []
     for field_number, wire_type, value in ProtoReader(data).fields():
         if field_number == 1 and wire_type == 0:
             values["ret"] = decode_int32(int(value))
@@ -834,12 +872,54 @@ def decode_scararena_win_choice_response(
             values["buff_choice_id"] = decode_int32(int(value))
         elif field_number == 7 and wire_type == 0:
             values["buff_choice_index"] = decode_int32(int(value))
+        elif field_number == 8 and wire_type == 2:
+            entry = _decode_rewardbox_entry(bytes(value))
+            if entry is not None:
+                rewardbox.append(entry)
         elif field_number == 9 and wire_type == 0:
             values["daily_reward_num"] = decode_int32(int(value))
+
+    changes = tuple(item_changes)
+    if not changes and rewardbox:
+        totals = item_totals or {}
+        synthesized: list[ItemChange] = []
+        running = dict(totals)
+        for item_id, delta in rewardbox:
+            previous = running.get(item_id, 0)
+            total = previous + delta
+            running[item_id] = total
+            synthesized.append(ItemChange(item_id, delta, total))
+        changes = tuple(synthesized)
+
     return DragonArenaChoiceResult(
         **values,
-        item_changes=tuple(item_changes),
+        item_changes=changes,
+        rewardbox=tuple(rewardbox),
     )
+
+
+def resolve_win_choice_id(
+    *,
+    win_choice_id: int | None = None,
+    mercy_choice_id: int | None = None,
+    outcome: str | None = None,
+) -> int:
+    """将 UI 结果模式或显式 ID 解析为 ``Scararena_winchoice.choiceid``。"""
+
+    if win_choice_id is not None:
+        if win_choice_id <= 0:
+            raise HarvestError("龙痕竞技场抉择 ID 必须为正整数")
+        return win_choice_id
+    if mercy_choice_id is not None:
+        if mercy_choice_id <= 0:
+            raise HarvestError("龙痕竞技场抉择 ID 必须为正整数")
+        return mercy_choice_id
+    if outcome is not None:
+        choice_id = OUTCOME_CHOICE_IDS.get(outcome)
+        if choice_id is None:
+            raise HarvestError("龙痕竞技场胜利抉择无效")
+        return choice_id
+    return MERCY_CHOICE_ID
 
 
 def encode_battle_timescale(timescale: int = BATTLE_TIMESCALE_X3) -> bytes:
@@ -1003,6 +1083,13 @@ class DragonArenaClient:
             raise HarvestError("游戏服 Login 失败")
         if header.message_id == KICKOUT_MESSAGE_ID:
             kickout = decode_kickout(header.data)
+            # 业务名「登录会话中止」只表示消息 ID=Kickout，不表示原因。
+            # 必须把 ret/msg 打出来才能区分 token 过期(51)、校验失败、关服等。
+            detail = f"，msg={kickout.message}" if kickout.message else ""
+            self.log(
+                f"[登录] 收到 Kickout：ret={kickout.ret}，"
+                f"载荷={len(header.data)} 字节{detail}"
+            )
             raise GameLoginKickout(kickout.ret, kickout.message)
         return header.message_id == LOGIN_REUNIQUE_MESSAGE_ID
 
@@ -1179,10 +1266,17 @@ class DragonArenaClient:
     def resume_pending_battle(
         self,
         *,
-        mercy_choice_id: int = MERCY_CHOICE_ID,
+        win_choice_id: int | None = None,
+        mercy_choice_id: int | None = None,
+        outcome: str | None = None,
     ) -> DragonArenaRoundResult | None:
         """Continue the battle or settlement packets replayed during login."""
 
+        choice_id = resolve_win_choice_id(
+            win_choice_id=win_choice_id,
+            mercy_choice_id=mercy_choice_id,
+            outcome=outcome,
+        )
         state = self.inspect_initial_battle_state()
         if state.phase == "空闲":
             return None
@@ -1217,7 +1311,7 @@ class DragonArenaClient:
 
         mercy: DragonArenaChoiceResult | None = None
         if battle.win and battle.choice_pending:
-            mercy = self.choose_mercy(mercy_choice_id)
+            mercy = self.choose_outcome(choice_id)
             if mercy.ret != 0:
                 self._log_current_dragon_coin()
                 raise HarvestError(f"遗留战斗胜利抉择结算返回 ret={mercy.ret}")
@@ -1619,8 +1713,12 @@ class DragonArenaClient:
                 self.log("[战斗] 收到 Battle_C2S_start 回显。")
             self._log_background_message(header)
 
-    def choose_mercy(self, choice_id: int = MERCY_CHOICE_ID) -> DragonArenaChoiceResult:
-        """提交胜利抉择，并采集该结算窗口内的竞技场物品变动。"""
+    def choose_outcome(self, choice_id: int = MERCY_CHOICE_ID) -> DragonArenaChoiceResult:
+        """提交胜利抉择，并采集该结算窗口内的竞技场物品变动。
+
+        优先使用结算窗口内的 ``Storage_notify_itemchange``；若窗口内没有物品
+        通知，则用 ``Scararena_winchoice.rewardbox`` 补齐奖励并更新本地总量。
+        """
 
         self._send_message(
             SCARARENA_WIN_CHOICE_MESSAGE_ID,
@@ -1637,14 +1735,14 @@ class DragonArenaClient:
             if remaining <= 0:
                 if response_data is None:
                     raise HarvestError("等待龙痕竞技场胜利抉择结算超时")
-                return decode_scararena_win_choice_response(response_data, item_changes)
+                return self._finalize_win_choice(response_data, item_changes)
             try:
                 header = self._next_header(remaining)
             except GameSessionClosed:
                 raise
             except HarvestError:
                 if response_data is not None:
-                    return decode_scararena_win_choice_response(response_data, item_changes)
+                    return self._finalize_win_choice(response_data, item_changes)
                 raise
             if header.message_id == SCARARENA_WIN_CHOICE_MESSAGE_ID:
                 response_data = header.data
@@ -1654,19 +1752,52 @@ class DragonArenaClient:
                 notice: ItemChangeNotify = decode_item_change_notify(header.data)
                 if notice.source in SCARARENA_REWARD_SOURCES:
                     item_changes.extend(notice.items)
+                    for change in notice.items:
+                        if change.item_id > 0:
+                            self._item_totals[change.item_id] = change.total
                     if response_data is not None:
                         quiet_deadline = min(deadline, time.monotonic() + 0.2)
                 continue
             self._log_background_message(header)
 
+    def choose_mercy(self, choice_id: int = MERCY_CHOICE_ID) -> DragonArenaChoiceResult:
+        """兼容入口：等同于 ``choose_outcome``。"""
+
+        return self.choose_outcome(choice_id)
+
+    def _finalize_win_choice(
+        self,
+        response_data: bytes,
+        item_changes: Sequence[ItemChange],
+    ) -> DragonArenaChoiceResult:
+        result = decode_scararena_win_choice_response(
+            response_data,
+            item_changes,
+            item_totals=self._item_totals,
+        )
+        for change in result.item_changes:
+            if change.item_id > 0:
+                self._item_totals[change.item_id] = change.total
+                if self.dragon_coin_item_id is None and change.delta != 0:
+                    # 胜利抉择奖励里若只有一种物品变动，通常即龙痕币。
+                    self.dragon_coin_item_id = change.item_id
+        return result
+
     def run_round(
         self,
         index: int,
         *,
-        mercy_choice_id: int = MERCY_CHOICE_ID,
+        win_choice_id: int | None = None,
+        mercy_choice_id: int | None = None,
+        outcome: str | None = None,
     ) -> DragonArenaRoundResult:
         """挑战一个候选对手；胜利且出现抉择时提交指定选项。"""
 
+        choice_id = resolve_win_choice_id(
+            win_choice_id=win_choice_id,
+            mercy_choice_id=mercy_choice_id,
+            outcome=outcome,
+        )
         self._begin_arena_settlement()
         challenge = self.challenge(index)
         if challenge.ret != 0:
@@ -1696,7 +1827,7 @@ class DragonArenaClient:
         mercy: DragonArenaChoiceResult | None = None
         if battle.win and battle.choice_pending:
             try:
-                mercy = self.choose_mercy(mercy_choice_id)
+                mercy = self.choose_outcome(choice_id)
             except GameSessionClosed:
                 self.log(f"[胜利抉择] 序号={index}，游戏服连接已关闭，停止竞技场循环。")
                 raise
@@ -1723,38 +1854,67 @@ class DragonArenaClient:
         self,
         *,
         rounds: int,
-        mercy_choice_id: int = MERCY_CHOICE_ID,
+        win_choice_id: int | None = None,
+        mercy_choice_id: int | None = None,
+        outcome: str | None = None,
         refresh_on_exhaustion: bool = True,
+        require_wins: bool = False,
     ) -> tuple[DragonArenaRoundResult, ...]:
-        """按未挑战顺序循环；``rounds=0`` 表示直到当前循环没有可挑战对手。"""
+        """按未挑战顺序循环。
+
+        ``rounds`` 默认表示最大挑战次数；``rounds=0`` 表示直到当前候选无可挑战
+        对手。当 ``require_wins=True`` 时，``rounds`` 表示需要累计的胜利场次
+        （日常任务 112 使用该语义）。
+        """
 
         if rounds < 0:
             raise HarvestError("循环次数不能为负数")
+        choice_id = resolve_win_choice_id(
+            win_choice_id=win_choice_id,
+            mercy_choice_id=mercy_choice_id,
+            outcome=outcome,
+        )
         results: list[DragonArenaRoundResult] = []
+        wins = 0
         attempted: set[int] = set()
-        while rounds == 0 or len(results) < rounds:
+        refreshed_without_progress = False
+        while True:
+            if require_wins:
+                if rounds > 0 and wins >= rounds:
+                    break
+            elif rounds > 0 and len(results) >= rounds:
+                break
             info = self.get_info()
             candidates = [
                 index
                 for index, opponent in enumerate(info.opponents, start=1)
                 if not opponent.challenged and index not in attempted
             ]
-            if not candidates and refresh_on_exhaustion and not attempted:
-                matched = self.match()
-                self.log(
-                    f"[匹配] ret={matched.ret}，候选数={len(matched.opponents)}。"
-                )
-                if matched.ret == 0:
-                    continue
             if not candidates:
+                if refresh_on_exhaustion and not refreshed_without_progress:
+                    matched = self.match()
+                    self.log(
+                        f"[匹配] ret={matched.ret}，候选数={len(matched.opponents)}。"
+                    )
+                    if matched.ret == 0:
+                        attempted.clear()
+                        refreshed_without_progress = True
+                        continue
                 break
-            index = candidates[0]
-            result = self.run_round(index, mercy_choice_id=mercy_choice_id)
+            # 客户端 UI 用 RandomMdata 打乱展示顺序；这里在未挑战候选中随机选序号，
+            # 避免固定从服务端列表第 1 位一路往下打。
+            index = random.choice(candidates)
+            self.log(
+                f"[挑战] 随机选择序号={index}（未挑战候选 {len(candidates)} 人）。"
+            )
+            result = self.run_round(index, win_choice_id=choice_id)
             results.append(result)
             attempted.add(index)
-            # 服务端可能在匹配/获胜后替换候选列表；下一轮会以最新 info 决定序号。
             if result.battle is not None and result.battle.win:
+                wins += 1
+                # 服务端可能在匹配/获胜后替换候选列表；下一轮会以最新 info 决定序号。
                 attempted.clear()
+                refreshed_without_progress = False
         return tuple(results)
 
 
@@ -1991,9 +2151,19 @@ def run_self_tests() -> None:
             encode_int_field(2, MERCY_CHOICE_ID),
             encode_int_field(3, 90),
             encode_int_field(4, -50),
+            encode_bytes_field(
+                8,
+                encode_int_field(1, 440) + encode_int_field(2, 4),
+            ),
             encode_int_field(9, 320),
         )
     )
+    rewardbox_only = decode_scararena_win_choice_response(
+        choice_response,
+        item_totals={440: 8844},
+    )
+    assert rewardbox_only.rewardbox == ((440, 4),)
+    assert rewardbox_only.item_changes == (ItemChange(440, 4, 8848),)
     item = encode_int_field(1, 9901) + encode_int_field(2, 80) + encode_int_field(3, 3424)
     item_change = encode_int_field(1, SCARARENA_CHOICE_REWARD_SOURCE) + encode_bytes_field(2, item)
     battle_reward_change = (

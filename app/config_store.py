@@ -9,10 +9,12 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 
-CONFIG_VERSION = 4
+CONFIG_VERSION = 6
 DEFAULT_ENABLED_TASK_IDS = [104, 112, 119]
 VALID_OUTCOMES = frozenset({"mercy", "execute"})
 MAX_TREASURE_SWEEP_TIMES = 30
+MAX_TREASURE_FARM_HEARTH = 10000
+MAX_ABYSS_ROUNDS = 900
 
 
 @dataclass
@@ -45,11 +47,22 @@ class ArenaSettings:
 class TreasureSettings:
     area_id: int = 0
     times: int = 1
+    # 默认沉默之城（较早解锁、常见可刷）
+    farm_area_id: int = 530101
+    farm_target_hearth: int = 100
 
 
 @dataclass
 class DungeonSettings:
     dungeon_id: int = 0
+
+
+@dataclass
+class AbyssSettings:
+    """罪者深渊：默认不限轮数（0=直到失败），并自动选赛季增益。"""
+
+    max_rounds: int = 0
+    auto_buff: bool = True
 
 
 @dataclass
@@ -61,6 +74,7 @@ class UiSettings:
     arena: ArenaSettings = field(default_factory=ArenaSettings)
     treasure: TreasureSettings = field(default_factory=TreasureSettings)
     dungeon: DungeonSettings = field(default_factory=DungeonSettings)
+    abyss: AbyssSettings = field(default_factory=AbyssSettings)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -83,6 +97,7 @@ def settings_from_mapping(value: Mapping[str, object]) -> UiSettings:
     arena = _mapping(value.get("arena"))
     treasure = _mapping(value.get("treasure"))
     dungeon = _mapping(value.get("dungeon"))
+    abyss = _mapping(value.get("abyss"))
 
     selected = daily.get("enabled_task_ids")
     enabled_task_ids = (
@@ -114,6 +129,20 @@ def settings_from_mapping(value: Mapping[str, object]) -> UiSettings:
         or not 1 <= times <= MAX_TREASURE_SWEEP_TIMES
     ):
         times = 1
+    farm_area_id = treasure.get("farm_area_id")
+    if (
+        not isinstance(farm_area_id, int)
+        or isinstance(farm_area_id, bool)
+        or not 0 <= farm_area_id <= 0x7FFFFFFF
+    ):
+        farm_area_id = 0
+    farm_target_hearth = treasure.get("farm_target_hearth")
+    if (
+        not isinstance(farm_target_hearth, int)
+        or isinstance(farm_target_hearth, bool)
+        or not 1 <= farm_target_hearth <= MAX_TREASURE_FARM_HEARTH
+    ):
+        farm_target_hearth = 100
 
     dungeon_id = dungeon.get("dungeon_id")
     if (
@@ -122,6 +151,17 @@ def settings_from_mapping(value: Mapping[str, object]) -> UiSettings:
         or not 0 <= dungeon_id <= 0x7FFFFFFF
     ):
         dungeon_id = 0
+
+    abyss_max_rounds = abyss.get("max_rounds")
+    if (
+        not isinstance(abyss_max_rounds, int)
+        or isinstance(abyss_max_rounds, bool)
+        or not 0 <= abyss_max_rounds <= MAX_ABYSS_ROUNDS
+    ):
+        abyss_max_rounds = 0
+    abyss_auto_buff = abyss.get("auto_buff")
+    if not isinstance(abyss_auto_buff, bool):
+        abyss_auto_buff = True
 
     zone_id = _bounded_string(zone.get("id"), 64)
     zone_name = _bounded_string(zone.get("name"), 128)
@@ -144,8 +184,17 @@ def settings_from_mapping(value: Mapping[str, object]) -> UiSettings:
             outcome=outcome,
             refresh_on_exhaustion=refresh_on_exhaustion,
         ),
-        treasure=TreasureSettings(area_id=area_id, times=times),
+        treasure=TreasureSettings(
+            area_id=area_id,
+            times=times,
+            farm_area_id=farm_area_id,
+            farm_target_hearth=farm_target_hearth,
+        ),
         dungeon=DungeonSettings(dungeon_id=dungeon_id),
+        abyss=AbyssSettings(
+            max_rounds=abyss_max_rounds,
+            auto_buff=abyss_auto_buff,
+        ),
     )
 
 
@@ -243,7 +292,23 @@ class ConfigStore:
             )
         )
 
+    def set_treasure_farm(self, farm_area_id: int, farm_target_hearth: int) -> UiSettings:
+        return self.update(
+            lambda settings: (
+                setattr(settings.treasure, "farm_area_id", farm_area_id),
+                setattr(settings.treasure, "farm_target_hearth", farm_target_hearth),
+            )
+        )
+
     def set_dungeon(self, dungeon_id: int) -> UiSettings:
         return self.update(
             lambda settings: setattr(settings.dungeon, "dungeon_id", dungeon_id)
+        )
+
+    def set_abyss(self, max_rounds: int, auto_buff: bool) -> UiSettings:
+        return self.update(
+            lambda settings: (
+                setattr(settings.abyss, "max_rounds", max_rounds),
+                setattr(settings.abyss, "auto_buff", auto_buff),
+            )
         )

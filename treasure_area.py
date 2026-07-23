@@ -22,6 +22,7 @@ from harvest_fief import (
     SOCKET_PACK_KEY,
     GameEndpoint,
     HarvestError,
+    ItemChange,
     MessageHeader,
     NativeWebSocket,
     ProtoReader,
@@ -42,6 +43,21 @@ MAP_TREASURE_CLEAR_RESULT_MESSAGE_ID = 15572
 KICKOUT_MESSAGE_ID = 10030
 MAX_SWEEP_TIMES_PER_REQUEST = 30
 
+# 客户端 ``tbX`` 扫荡拒绝码（见 decrypted-js Map_treasure_sweep 处理）。
+SWEEP_RET_HAS_RESULT = 1
+SWEEP_RET_AREA_CANNOT_SWEEP = 2
+SWEEP_RET_ITEM_LACK = 3
+SWEEP_RET_TIMES_LACK = 4
+SWEEP_RET_EQUIP_STORAGE_FULL = 5
+
+SWEEP_RET_LABELS = {
+    SWEEP_RET_HAS_RESULT: "尚有未领取的扫荡结果",
+    SWEEP_RET_AREA_CANNOT_SWEEP: "所选地图当前不可扫荡",
+    SWEEP_RET_ITEM_LACK: "寻宝卷轴不足",
+    SWEEP_RET_TIMES_LACK: "今日扫荡次数不足",
+    SWEEP_RET_EQUIP_STORAGE_FULL: "装备仓库已满",
+}
+
 
 class TreasureAreaError(HarvestError):
     """聚宝之地会话或服务端状态不可用于扫荡。"""
@@ -52,7 +68,17 @@ class TreasureAreaRejected(TreasureAreaError):
 
     def __init__(self, ret: int) -> None:
         self.ret = ret
-        super().__init__(f"聚宝之地扫荡失败：ret={ret}")
+        label = SWEEP_RET_LABELS.get(ret, "未登记的拒绝原因")
+        super().__init__(f"聚宝之地扫荡失败：{label}（ret {ret}）")
+
+
+@dataclass(frozen=True)
+class TreasureSweepLoot:
+    """扫荡结算 ``results``：区域与物品变动（已去掉密文载荷）。"""
+
+    area_id: int
+    items: tuple[ItemChange, ...]
+    multi: bool = False
 
 
 @dataclass(frozen=True)
@@ -65,6 +91,7 @@ class TreasureAreaStatus:
     daily_sweep_limit: int
     area_ids: tuple[int, ...]
     has_pending_results: bool = False
+    sweep_loot: TreasureSweepLoot | None = None
 
     @property
     def sweep_remaining(self) -> int:
@@ -88,6 +115,55 @@ def _decode_packed_int32(data: bytes) -> tuple[int, ...]:
     return tuple(values)
 
 
+def _decode_loot_item_change(data: bytes) -> ItemChange:
+    """Decode Zn ``{id, num, sum}`` as an ``ItemChange``."""
+
+    item_id = 0
+    delta = 0
+    total = 0
+    for field_number, wire_type, value in ProtoReader(data).fields():
+        if wire_type != 0:
+            continue
+        if field_number == 1:
+            item_id = decode_int32(int(value))
+        elif field_number == 2:
+            delta = decode_int32(int(value))
+        elif field_number == 3:
+            total = decode_int32(int(value))
+    return ItemChange(item_id=item_id, delta=delta, total=total)
+
+
+def _decode_loot_reward_package(data: bytes) -> tuple[ItemChange, ...]:
+    """Decode one Jn reward package; only surface item deltas."""
+
+    items: list[ItemChange] = []
+    for field_number, wire_type, value in ProtoReader(data).fields():
+        if field_number == 2 and wire_type == 2:
+            change = _decode_loot_item_change(bytes(value))
+            if change.item_id > 0 and change.delta != 0:
+                items.append(change)
+    return tuple(items)
+
+
+def decode_treasure_sweep_loot(data: bytes) -> TreasureSweepLoot:
+    """Decode TreasureData.results (area + reward packages)."""
+
+    area_id = 0
+    items: list[ItemChange] = []
+    multi = False
+    for field_number, wire_type, value in ProtoReader(data).fields():
+        if field_number == 1 and wire_type == 0:
+            area_id = decode_int32(int(value))
+        elif field_number == 2 and wire_type == 2:
+            items.extend(_decode_loot_reward_package(bytes(value)))
+        elif field_number == 4 and wire_type == 2:
+            # rare 额外奖励包
+            items.extend(_decode_loot_reward_package(bytes(value)))
+        elif field_number == 5 and wire_type == 0:
+            multi = bool(value)
+    return TreasureSweepLoot(area_id=area_id, items=tuple(items), multi=multi)
+
+
 def decode_treasure_area_status(data: bytes) -> TreasureAreaStatus:
     """Decode the generated ``TreasureData`` message from the client bundle."""
 
@@ -97,6 +173,7 @@ def decode_treasure_area_status(data: bytes) -> TreasureAreaStatus:
     daily_sweep_limit = 0
     area_ids: list[int] = []
     has_pending_results = False
+    sweep_loot: TreasureSweepLoot | None = None
     for field_number, wire_type, value in ProtoReader(data).fields():
         if field_number == 1 and wire_type == 0:
             open_times = decode_int32(int(value))
@@ -111,8 +188,9 @@ def decode_treasure_area_status(data: bytes) -> TreasureAreaStatus:
         elif field_number == 5 and wire_type == 2:
             area_ids.extend(_decode_packed_int32(bytes(value)))
         elif field_number == 6 and wire_type == 2:
-            # The native client clears this result before enabling another sweep.
+            # 原生客户端在再次扫荡前会清除未读 results。
             has_pending_results = True
+            sweep_loot = decode_treasure_sweep_loot(bytes(value))
 
     if swept_today < 0 or daily_sweep_limit < swept_today:
         raise TreasureAreaError("聚宝之地当日扫荡次数状态无效")
@@ -127,6 +205,7 @@ def decode_treasure_area_status(data: bytes) -> TreasureAreaStatus:
         daily_sweep_limit=daily_sweep_limit,
         area_ids=tuple(area_ids),
         has_pending_results=has_pending_results,
+        sweep_loot=sweep_loot,
     )
 
 

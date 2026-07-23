@@ -27,6 +27,9 @@ EVENT_SPECS = frozenset({
     "ancient_law_court_daily_free_engraving",
     "adventurer_guild_daily_auto_refresh",
     "websocket_business",
+    "dragon_arena",
+    "treasure_area",
+    "smithy_forge",
 })
 REGISTERED_MANAGED_EVENTS = EVENT_SPECS
 _EVENT_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")

@@ -17,14 +17,17 @@ from harvest_fief import (
     pack1_decode,
     pack1_encode,
 )
+from harvest_fief import ItemChange
 from treasure_area import (
     MAP_TREASURE_CLEAR_RESULT_MESSAGE_ID,
     MAP_TREASURE_INFO_MESSAGE_ID,
     MAP_TREASURE_SWEEP_MESSAGE_ID,
     MAX_SWEEP_TIMES_PER_REQUEST,
+    SWEEP_RET_TIMES_LACK,
     TreasureAreaClient,
     TreasureAreaRejected,
     decode_treasure_area_status,
+    decode_treasure_sweep_loot,
     encode_treasure_sweep_request,
 )
 
@@ -35,6 +38,7 @@ def _treasure_status_payload(
     daily_sweep_limit: int,
     area_ids: tuple[int, ...],
     has_pending_results: bool = False,
+    results: bytes | None = None,
 ) -> bytes:
     packed_areas = b"".join(encode_varint(area_id) for area_id in area_ids)
     payload = (
@@ -44,7 +48,9 @@ def _treasure_status_payload(
         + encode_int_field(4, daily_sweep_limit)
         + encode_bytes_field(5, packed_areas)
     )
-    if has_pending_results:
+    if results is not None:
+        payload += encode_bytes_field(6, results)
+    elif has_pending_results:
         payload += encode_bytes_field(6, b"")
     return payload
 
@@ -236,6 +242,38 @@ class TreasureAreaProtocolTestCase(unittest.TestCase):
             client.sweep(1001, 1)
 
         self.assertEqual(context.exception.ret, 4)
+        self.assertIn("今日扫荡次数不足", str(context.exception))
+        self.assertIn(str(SWEEP_RET_TIMES_LACK), str(context.exception))
+
+    def test_status_decodes_sweep_loot_item_names_payload(self) -> None:
+        # results: area=1001, one reward package with item id=1 delta=5 total=20
+        item_change = (
+            encode_int_field(1, 1)
+            + encode_int_field(2, 5)
+            + encode_int_field(3, 20)
+        )
+        reward_package = encode_bytes_field(2, item_change)
+        results = encode_int_field(1, 1001) + encode_bytes_field(2, reward_package)
+        status = decode_treasure_area_status(
+            _treasure_status_payload(
+                swept_today=3,
+                daily_sweep_limit=9,
+                area_ids=(1001,),
+                results=results,
+            )
+        )
+
+        self.assertTrue(status.has_pending_results)
+        assert status.sweep_loot is not None
+        self.assertEqual(status.sweep_loot.area_id, 1001)
+        self.assertEqual(
+            status.sweep_loot.items,
+            (ItemChange(item_id=1, delta=5, total=20),),
+        )
+
+        loot = decode_treasure_sweep_loot(results)
+        self.assertEqual(loot.area_id, 1001)
+        self.assertEqual(loot.items[0].item_id, 1)
 
 
 if __name__ == "__main__":

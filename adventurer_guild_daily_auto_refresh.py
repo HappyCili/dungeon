@@ -1382,6 +1382,48 @@ def run_self_tests(
         REFRESH_TYPE_AUTO, REFRESH_COST_GEM
     )
 
+    # 日常补足模式允许 200 金币单价，以便在已用过高价刷新后仍能完成 5 次目标。
+    daily_gold_limit = 201
+    assert quote_gold_refresh(
+        catalog, TavernRefreshParam(0, {REFRESH_COST_GOLD: 10, REFRESH_COST_GEM: 0}, 0, 0)
+    ).cost == 200
+    max_price_game_data = _encode_game_data_for_test(
+        initial_s,
+        _encode_refresh_param_for_test(free_count=0),
+        threshold_manual,
+    )
+    max_price_responses = [
+        _encode_refresh_response_for_test(
+            _encode_tavern_hero_for_test(s_cid, tid=6010 + index, potential=70),
+            _encode_refresh_param_for_test(gold_count=10 + index, gem_count=0),
+            cost_type=REFRESH_COST_GOLD,
+        )
+        for index in range(1, 3)
+    ]
+    max_price_socket = TestSocket(
+        [
+            (0x2, encode_message_header(PACK_PASSWORD_MESSAGE_ID, password_payload)),
+            encrypted(GAME_DATA_MESSAGE_ID, max_price_game_data),
+            encrypted(LOGIN_REUNIQUE_MESSAGE_ID),
+            encrypted(TAVERN_REFRESH_MESSAGE_ID, max_price_responses[0]),
+            encrypted(TAVERN_REFRESH_MESSAGE_ID, max_price_responses[1]),
+        ]
+    )
+    max_price_result = AdventurerGuildClient(
+        endpoint,
+        1.0,
+        socket_factory=lambda _url, _timeout: max_price_socket,
+    ).run_daily(
+        catalog,
+        gold_cost_limit=daily_gold_limit,
+        max_refreshes=2,
+        target_refreshes=2,
+    )
+    assert max_price_result.stop_reason == "daily_target_reached"
+    assert len(max_price_result.attempts) == 2
+    assert all(item.quote.channel == "gold" for item in max_price_result.attempts)
+    assert all(item.quote.cost == 200 for item in max_price_result.attempts)
+
     initial_ss_game_data = _encode_game_data_for_test(
         _encode_tavern_hero_for_test(ss_cid, tid=6004, potential=95),
         initial_auto,

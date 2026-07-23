@@ -112,16 +112,48 @@ class TokenStore:
         os.replace(temporary, self.path)
         os.chmod(self.path, 0o600)
 
-    def refresh_token(self) -> str:
+    def _read_payload(self) -> dict[str, Any] | None:
         try:
             payload = json.loads(self.path.read_text(encoding="utf-8"))
-        except FileNotFoundError as exc:
-            raise LoginError(f"令牌文件不存在：{self.path}") from exc
-        except json.JSONDecodeError as exc:
-            raise LoginError(f"令牌文件不是有效的 JSON：{self.path}") from exc
+        except (FileNotFoundError, OSError, json.JSONDecodeError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        return payload
 
+    def load_game_tokens(self) -> dict[str, str] | None:
+        """读取游戏侧 userid / verify_token；文件缺失或字段无效时返回 None。"""
+
+        payload = self._read_payload()
+        if payload is None:
+            return None
+        userid = payload.get("userid")
+        verify_token = payload.get("verify_token")
+        if (
+            not isinstance(userid, str)
+            or not userid
+            or not isinstance(verify_token, str)
+            or not verify_token
+        ):
+            return None
+        return {"userid": userid, "verify_token": verify_token}
+
+    def load_refresh_token(self) -> str | None:
+        """读取 refrsh_token；文件缺失或字段无效时返回 None。"""
+
+        payload = self._read_payload()
+        if payload is None:
+            return None
         token = payload.get("refrsh_token")
         if not isinstance(token, str) or not token:
+            return None
+        return token
+
+    def refresh_token(self) -> str:
+        token = self.load_refresh_token()
+        if token is None:
+            if not self.path.exists():
+                raise LoginError(f"令牌文件不存在：{self.path}")
             raise LoginError("令牌文件不包含 refrsh_token")
         return token
 

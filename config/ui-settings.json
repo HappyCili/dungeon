@@ -1,5 +1,5 @@
 {
-  "version": 4,
+  "version": 6,
   "account": {
     "username": "17767051461",
     "remember_password": true
@@ -10,7 +10,12 @@
   },
   "daily": {
     "enabled_task_ids": [
-      101
+      101,
+      104,
+      105,
+      106,
+      109,
+      119
     ]
   },
   "arena": {
@@ -19,10 +24,16 @@
     "refresh_on_exhaustion": true
   },
   "treasure": {
-    "area_id": 230101,
-    "times": 8
+    "area_id": 730101,
+    "times": 1,
+    "farm_area_id": 530101,
+    "farm_target_hearth": 1000
   },
   "dungeon": {
     "dungeon_id": 3
+  },
+  "abyss": {
+    "max_rounds": 0,
+    "auto_buff": true
   }
 }

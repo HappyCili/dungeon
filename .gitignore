@@ -1,1 +1,4 @@
 tools/frida-server/
+__pycache__/
+*.py[cod]
+*$py.class

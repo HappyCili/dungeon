@@ -614,11 +614,12 @@ class GraveAbyssClient(DragonArenaClient):
         battle_start_codec: str = "js",
         grave_table: Path = DEFAULT_GRAVE_TABLE,
         log_server_messages: bool = True,
-        websocket_log: Path | None = None,
+        websocket_log: Path | bool | None = True,
         business_log: Path | None = None,
         state_probe_timeout: float = 0.35,
         socket_factory: object | None = None,
         log: Callable[[str], None] = print,
+        task: str = "grave_abyss",
         **kwargs: object,
     ) -> None:
         init_kwargs: dict[str, object] = {
@@ -629,6 +630,7 @@ class GraveAbyssClient(DragonArenaClient):
             "business_log": business_log,
             "state_probe_timeout": state_probe_timeout,
             "log": log,
+            "task": task,
         }
         if socket_factory is not None:
             init_kwargs["socket_factory"] = socket_factory
@@ -1213,8 +1215,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         timeout=float(args.timeout),
         battle_timeout=float(args.battle_timeout),
         log_server_messages=False,
-        websocket_log=None,
         business_log=None,
+        task="grave_abyss",
     ) as client:
         if args.command == "status":
             status = client.get_status(sync=True)

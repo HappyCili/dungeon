@@ -527,8 +527,8 @@ def run_knight_arena_action(
         timeout,
         log=lambda _message: None,
         log_server_messages=False,
-        websocket_log=None,
         business_log=None,
+        task="knight_arena",
     )
     try:
         enter = getattr(client, "__enter__", None)
@@ -584,14 +584,14 @@ def run_dragon_arena_action(
         mercy_choice_id=mercy_choice_id,
         outcome=None if (win_choice_id is not None or mercy_choice_id is not None) else outcome,
     )
-    # 统一入口不创建完整 WebSocket 原始载荷日志，也不向页面回显服务端报文。
+    # 不向页面回显服务端报文；原始 WebSocket 帧默认写入 logs/websocket_raw/。
     client = factory(
         endpoint,
         timeout,
         log=lambda _message: None,
         log_server_messages=False,
-        websocket_log=None,
         business_log=None,
+        task="dragon_arena",
     )
     try:
         enter = getattr(client, "__enter__", None)

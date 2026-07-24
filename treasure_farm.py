@@ -4,13 +4,18 @@
 流程：
 1. ``Map_enter_treasure`` 进入指定地图组；
 2. 选择一个明确的 ACTIVE/OPEN 地标，只发送一次 ``Map_processloc``；
-3. 宝箱按「宝箱交互 → 打开宝箱 → 获得炉温奖励」推进；
+3. 宝箱按「宝箱交互 → 确定用钥匙打开宝箱（``Event_option``）→
+   打开宝箱 → 获得炉温奖励」推进；
 4. 怪物按「怪物交互 → 战斗准备（非自动战斗）→ 进入战斗 →
    战斗胜利 → 带走钥匙 → 获得钥匙奖励」推进；
 5. 只有对应奖励到账后才提交节点计数并选择下一个地标。
 
 普通宝箱消耗 1 枚地图钥匙，大宝箱消耗 5 枚；大宝箱每日开启上限 3 次
 （与客户端 ``treasureopentimes2`` 一致）。
+
+开箱确认：``Map_processloc`` 后服务端常下发 ``Event_start``，选项带
+``use``/``useNum``（地图钥匙与数量）。官方客户端在 UI 点确认后发送
+``Event_option``；脚本在收到该选项时自动补发，否则会卡在交互后无结算。
 """
 
 from __future__ import annotations
@@ -88,6 +93,7 @@ from harvest_fief import (
     pack1_encode,
     resolve_game_endpoint,
 )
+from ws_traffic_log import bind_traffic_logging
 from id_descriptions import item_name, treasure_area_name
 from project_paths import NATIVE_APP_ROOT, UI_APP_ROOT
 
@@ -174,10 +180,10 @@ ENTERWAY_RESET = 1
 ENTER_TREASURE_RET_LABELS = {
     1: "没有该地图组",
     2: "地图组无可进入区域",
-    3: "随机结果异常",
-    4: "道具扣除数量异常",
+    3: "随机结果异常（常见于图内地标/战斗未清就重置）",
+    4: "道具扣除数量异常（进图/重置时服务端扣费校验失败；聚宝 costid 多为空，更常见于状态异常而非真缺道具）",
     5: "道具不足或条件不满足（客户端进图无门票校验；请确认地图已解锁）",
-    6: "进入目标区域失败",
+    6: "进入目标区域失败（节点占用/未退出旧图/战斗未结算）",
     7: "已在当前地图组区域",
     8: "当前不在藏宝地，无法重置",
 }
@@ -185,11 +191,20 @@ ENTER_TREASURE_RET_LABELS = {
 # Map_enter_area 客户端有文案的部分 ret
 ENTER_AREA_RET_LABELS = {
     1: "不满足进入要求",
+    3: "进入区域随机/状态异常（常见于重置时节点占用未清）",
     5: "进入区域失败（可能仍卡在其它图内、地图未解锁，或服务端拒绝切换）",
     10: "处理节点失败 ret=10（会话未就绪/条件不满足，可尝试重新进图后再交互）",
     6: "审判官等级不足，无法进入",
     9: "未满足解锁票据要求",
     103: "已达到今日挑战次数上限",
+}
+
+# Map_reset_area 与 Map_enter_treasure 拒绝码不同，禁止混用文案
+MAP_RESET_AREA_RET_LABELS = {
+    1: "重置失败",
+    3: "重置条件不满足",
+    4: "重置被拒（魂域式 Map_reset_area 不适用于聚宝；请用进图重置）",
+    5: "重置道具/条件不足",
 }
 
 LOC_STATUS_ACTIVE = 0
@@ -205,6 +220,7 @@ NODE_KIND_BIG_CHEST = "big_chest"
 # treated as the whole business action until the matching reward is observed.
 FARM_STEP_IDLE = "idle"
 FARM_STEP_CHEST_INTERACT = "chest_interact"
+FARM_STEP_CHEST_KEY_CONFIRM = "chest_key_confirm"
 FARM_STEP_CHEST_OPEN = "chest_open"
 FARM_STEP_CHEST_REWARD = "chest_reward"
 FARM_STEP_MONSTER_INTERACT = "monster_interact"
@@ -218,6 +234,7 @@ FARM_STEP_COMPLETE = "complete"
 FARM_STEP_LABELS = {
     FARM_STEP_IDLE: "等待选择节点",
     FARM_STEP_CHEST_INTERACT: "宝箱交互",
+    FARM_STEP_CHEST_KEY_CONFIRM: "确定用钥匙打开宝箱",
     FARM_STEP_CHEST_OPEN: "打开宝箱",
     FARM_STEP_CHEST_REWARD: "获得炉温奖励",
     FARM_STEP_MONSTER_INTERACT: "怪物交互",
@@ -457,12 +474,35 @@ class BattleEndResult:
     round_number: int | None = None
 
 
+# Client enum ``BATTLE_END_RESULT_*`` (decrypted-js/main.js).
+BATTLE_END_RESULT_NONE = 0
+BATTLE_END_RESULT_LOSE = 1
+BATTLE_END_RESULT_WIN = 2
+BATTLE_END_RESULT_RETREAT = 3
+BATTLE_END_RESULT_ABORT = 4
+BATTLE_END_RESULT_TIMEOUT = 5
+BATTLE_END_RESULT_LABELS = {
+    BATTLE_END_RESULT_NONE: "无结果",
+    BATTLE_END_RESULT_LOSE: "战败",
+    BATTLE_END_RESULT_WIN: "胜利",
+    BATTLE_END_RESULT_RETREAT: "撤退",
+    BATTLE_END_RESULT_ABORT: "作废(ABORT)",
+    BATTLE_END_RESULT_TIMEOUT: "超时",
+}
+
+
+def battle_end_result_label(result_code: int | None) -> str:
+    if result_code is None:
+        return "未知"
+    return BATTLE_END_RESULT_LABELS.get(result_code, f"未登记({result_code})")
+
+
 def decode_treasure_battle_end(data: bytes) -> BattleEndResult:
     """Decode the victory signal used by a monster node.
 
     The server normally supplies both ``win`` (field 2) and ``result``
-    (field 10).  Result codes 1/2 are the canonical lose/win values; the
-    boolean is retained as a fallback for older payloads.
+    (field 10).  Result codes follow ``BATTLE_END_RESULT_*``:
+    1=LOSE, 2=WIN, 3=RETREAT, 4=ABORT, 5=TIMEOUT.
     """
 
     win_flag: int | None = None
@@ -477,9 +517,14 @@ def decode_treasure_battle_end(data: bytes) -> BattleEndResult:
             win_flag = int(value)
         elif field_number == 10:
             result_code = decode_int32(int(value))
-    if result_code == 2:
+    if result_code == BATTLE_END_RESULT_WIN:
         win = True
-    elif result_code == 1:
+    elif result_code in (
+        BATTLE_END_RESULT_LOSE,
+        BATTLE_END_RESULT_RETREAT,
+        BATTLE_END_RESULT_ABORT,
+        BATTLE_END_RESULT_TIMEOUT,
+    ):
         win = False
     elif win_flag is not None:
         win = bool(win_flag)
@@ -489,6 +534,35 @@ def decode_treasure_battle_end(data: bytes) -> BattleEndResult:
         win=win,
         result_code=result_code,
         round_number=round_number,
+    )
+
+
+def format_battle_not_won_error(outcome: BattleEndResult) -> str:
+    """Human-readable failure for a non-winning ``Battle_S2C_end``."""
+
+    label = battle_end_result_label(outcome.result_code)
+    if outcome.result_code == BATTLE_END_RESULT_ABORT:
+        return (
+            "怪物战斗被服务端作废（ABORT/结果 4），未确认钥匙奖励。"
+            "常见原因：开战包 eteam 回传了未展开的坐标 -1/-1"
+            "（官方会先按坑位 seat 填真实格子）。"
+            "请更新后重试；若仍失败请退出手机端游戏避免顶号。"
+        )
+    if outcome.result_code == BATTLE_END_RESULT_RETREAT:
+        return "怪物战斗撤退结束，未确认钥匙奖励（结果 3）"
+    if outcome.result_code == BATTLE_END_RESULT_TIMEOUT:
+        return "怪物战斗超时结束，未确认钥匙奖励（结果 5）"
+    if outcome.result_code == BATTLE_END_RESULT_LOSE:
+        return "怪物战斗战败，未确认钥匙奖励（结果 1）"
+    return (
+        f"怪物战斗结束但未胜利，未确认钥匙奖励"
+        f"（{label}"
+        + (
+            f"，结果 {outcome.result_code}"
+            if outcome.result_code is not None
+            else ""
+        )
+        + "）"
     )
 
 
@@ -520,19 +594,142 @@ class EventFuncAction:
 
 
 @dataclass(frozen=True)
+class EventOptionEntry:
+    """``Event_start.option`` 中客户端展示的一条选项。
+
+    聚宝宝箱交互后常见选项会带 ``use`` / ``useNum``（地图钥匙与消耗数量），
+    玩家点确认后客户端发送 ``Event_option{opt:optidx}``。
+    """
+
+    title: str = ""
+    optidx: int = 0
+    use: int = 0
+    use_num: int = 0
+    color: int = 0
+    exit: int = 0
+    icon: int = 0
+    icommit: int = 0
+
+    @property
+    def is_item_cost_option(self) -> bool:
+        """是否为消耗物品的确认选项（如用钥匙开箱）。"""
+
+        return self.exit == 0 and self.use > 0 and self.use_num > 0
+
+    @property
+    def is_native_auto_index(self) -> bool:
+        """``optidx >= 100``：与 EventModule autoidx 自动分支同一编号段。"""
+
+        return self.exit == 0 and self.optidx >= 100
+
+    @property
+    def is_open_chest_title(self) -> bool:
+        text = self.title or ""
+        return any(marker in text for marker in ("打开宝箱", "开启宝箱", "打开", "拾取"))
+
+    @property
+    def is_take_key_title(self) -> bool:
+        """战后「带走钥匙」确认按钮。"""
+
+        text = self.title or ""
+        return "带走钥匙" in text or ("带走" in text and "钥匙" in text)
+
+
+@dataclass(frozen=True)
 class EventStart:
-    """客户端 ``Event_start`` 的自动选项信息。"""
+    """客户端 ``Event_start`` 的自动选项与可选分支。"""
 
     auto_option: int = 0
     event_id: int = 0
     dialog_id: int = 0
     location_id: int = 0
+    options: tuple[EventOptionEntry, ...] = ()
 
     @property
     def auto_confirmable(self) -> bool:
         # EventModule 对 autoidx >= 100 的事件直接发送 Event_option，
         # 不弹出可供玩家选择的分支。
-        return self.auto_option >= 100
+        if self.auto_option >= 100:
+            return True
+        # 战后「带走钥匙」等：autoidx=0 但 option.optidx>=100 / 文案明确。
+        # 聚宝开箱：带钥匙消耗的确认选项。
+        return self.choose_confirmable_option() is not None
+
+    def choose_take_key_option(self) -> EventOptionEntry | None:
+        """战后胜利「带走钥匙」按钮（实测 autoidx=0, optidx=100, title=带走钥匙）。"""
+
+        titled = [
+            opt
+            for opt in self.options
+            if opt.exit == 0 and opt.is_take_key_title
+        ]
+        if titled:
+            return titled[0]
+        # 同编号段的唯一自动选项（标题可能被本地化成「自动」等）
+        auto_opts = [opt for opt in self.options if opt.is_native_auto_index]
+        if len(auto_opts) == 1 and self.auto_option == 0:
+            return auto_opts[0]
+        return None
+
+    def choose_item_cost_option(
+        self,
+        *,
+        preferred_item_ids: frozenset[int] | set[int] | None = None,
+        item_totals: Mapping[int, int] | None = None,
+    ) -> EventOptionEntry | None:
+        """Pick a safe auto option that spends map keys / items to continue.
+
+        Preference order:
+        1. Non-exit options whose ``use`` is in ``preferred_item_ids`` (map keys);
+        2. Any non-exit option with a positive item cost;
+        3. Affordability when ``item_totals`` is provided.
+        """
+
+        candidates = [opt for opt in self.options if opt.is_item_cost_option]
+        if not candidates:
+            # Some chest prompts only put the open action in the title and leave
+            # cost on a separate UI layer; accept a single non-exit open label.
+            titled = [
+                opt
+                for opt in self.options
+                if opt.exit == 0 and opt.is_open_chest_title
+            ]
+            return titled[0] if len(titled) == 1 else None
+        preferred_ids = preferred_item_ids or frozenset()
+        preferred = [opt for opt in candidates if opt.use in preferred_ids]
+        pool = preferred or candidates
+        if item_totals is not None:
+            affordable = [
+                opt
+                for opt in pool
+                if int(item_totals.get(opt.use, 0)) >= opt.use_num
+            ]
+            if affordable:
+                return affordable[0]
+            # Prefer preferred keys even when totals are incomplete; the server
+            # is the final authority on inventory.
+            if preferred:
+                return preferred[0]
+            # Still try the first cost option: open-chest is usually the only
+            # spend branch, and missing local totals should not block progress.
+            return pool[0]
+        return pool[0]
+
+    def choose_confirmable_option(
+        self,
+        *,
+        preferred_item_ids: frozenset[int] | set[int] | None = None,
+        item_totals: Mapping[int, int] | None = None,
+    ) -> EventOptionEntry | None:
+        """Pick any option the farm script may safely auto-confirm."""
+
+        take_key = self.choose_take_key_option()
+        if take_key is not None:
+            return take_key
+        return self.choose_item_cost_option(
+            preferred_item_ids=preferred_item_ids,
+            item_totals=item_totals,
+        )
 
 
 def _load_json_rows(path: Path) -> list[dict[str, object]]:
@@ -934,16 +1131,66 @@ def _decode_event_info(data: bytes) -> tuple[int, int, int]:
     return event_id, dialog_id, location_id
 
 
+def decode_event_option_entry(data: bytes) -> EventOptionEntry:
+    """Decode one ``Event_start.option`` entry (client codec ``Zt``)."""
+
+    title = ""
+    optidx = 0
+    use = 0
+    use_num = 0
+    color = 0
+    exit_flag = 0
+    icon = 0
+    icommit = 0
+    for field_number, wire_type, value in ProtoReader(data).fields():
+        if field_number == 1 and wire_type == 2:
+            try:
+                title = bytes(value).decode("utf-8")
+            except UnicodeDecodeError:
+                title = ""
+            continue
+        if wire_type != 0:
+            continue
+        decoded = decode_int32(int(value))
+        if field_number == 2:
+            optidx = decoded
+        elif field_number == 3:
+            color = decoded
+        elif field_number == 4:
+            use = decoded
+        elif field_number == 5:
+            use_num = decoded
+        elif field_number == 6:
+            exit_flag = decoded
+        elif field_number == 7:
+            icon = decoded
+        elif field_number == 9:
+            icommit = decoded
+    return EventOptionEntry(
+        title=title,
+        optidx=optidx,
+        use=use,
+        use_num=use_num,
+        color=color,
+        exit=exit_flag,
+        icon=icon,
+        icommit=icommit,
+    )
+
+
 def decode_event_start(data: bytes) -> EventStart:
-    """Decode ``Event_start`` (13300) and its native automatic option."""
+    """Decode ``Event_start`` (13300): auto option and player-facing options."""
 
     auto_option = 0
     event_id = 0
     dialog_id = 0
     location_id = 0
+    options: list[EventOptionEntry] = []
     for field_number, wire_type, value in ProtoReader(data).fields():
         if field_number == 1 and wire_type == 2:
             event_id, dialog_id, location_id = _decode_event_info(bytes(value))
+        elif field_number == 3 and wire_type == 2:
+            options.append(decode_event_option_entry(bytes(value)))
         elif field_number == 4 and wire_type == 0:
             auto_option = decode_int32(int(value))
     return EventStart(
@@ -951,6 +1198,7 @@ def decode_event_start(data: bytes) -> EventStart:
         event_id=event_id,
         dialog_id=dialog_id,
         location_id=location_id,
+        options=tuple(options),
     )
 
 
@@ -983,8 +1231,19 @@ def decode_event_func_action(data: bytes) -> EventFuncAction:
     )
 
 
-def encode_event_option(option: int, dialog_id: int = 0, event_id: int = 0) -> bytes:
-    """Encode native ``Event_option`` for an already server-marked auto option."""
+def encode_event_option(
+    option: int,
+    dialog_id: int = 0,
+    event_id: int = 0,
+    *,
+    itemcommit: int = 0,
+    commits: tuple[int, ...] | list[int] = (),
+) -> bytes:
+    """Encode native ``Event_option`` after the player (or auto) picks a branch.
+
+    Fields match the generated client codec ``GvY`` / ``Gt``:
+    ``opt``, ``dialog``, ``evt``, repeated ``commits``, ``itemcommit``.
+    """
 
     payload = b""
     if option:
@@ -993,6 +1252,11 @@ def encode_event_option(option: int, dialog_id: int = 0, event_id: int = 0) -> b
         payload += encode_int_field(2, dialog_id)
     if event_id:
         payload += encode_int_field(3, event_id)
+    for commit in commits:
+        if int(commit):
+            payload += encode_int_field(4, int(commit))
+    if itemcommit:
+        payload += encode_int_field(5, int(itemcommit))
     return payload
 
 
@@ -1371,6 +1635,7 @@ class TreasureFarmClient:
         *,
         battle_timeout: float = DEFAULT_BATTLE_TIMEOUT,
         socket_factory: Callable[[str, float], NativeWebSocket] = NativeWebSocket.connect,
+        websocket_log: Path | bool | None = True,
     ) -> None:
         self.endpoint = endpoint
         self.timeout = timeout
@@ -1378,6 +1643,12 @@ class TreasureFarmClient:
         self.socket_factory = socket_factory
         self.socket: NativeWebSocket | None = None
         self.password: str | None = None
+        bind_traffic_logging(
+            self,
+            task="treasure_farm",
+            path=websocket_log,
+            error_cls=TreasureFarmError,
+        )
         self._item_totals: dict[int, int] = {}
         self._battle_context: GameDataBattleContext | None = None
         self._open_times = 0
@@ -1410,6 +1681,13 @@ class TreasureFarmClient:
         self._event_chain_active = False
         self._event_end_seen = False
         self._event_progress_notes: list[str] = []
+        # Set when an Event_start item-cost option (key open chest) was confirmed.
+        self._last_confirmed_key_option: EventOptionEntry | None = None
+        self._preferred_event_item_ids: frozenset[int] = frozenset(
+            entry.key_item_id
+            for entry in list_treasure_map_catalog()
+            if entry.key_item_id > 0
+        )
 
     def close(self) -> None:
         if self.socket is not None:
@@ -1472,7 +1750,7 @@ class TreasureFarmClient:
             self._pending_event_start = start
             self._event_chain_active = True
             self._event_end_seen = False
-            if start.auto_confirmable and self._auto_event_progress:
+            if start.auto_option >= 100 and self._auto_event_progress:
                 self._send_message(
                     EVENT_OPTION_MESSAGE_ID,
                     encode_event_option(
@@ -1484,10 +1762,52 @@ class TreasureFarmClient:
                 )
                 self._pending_event_start = None
                 self._note_event_progress("地图事件自动选项已确认")
-            elif start.auto_confirmable:
+            elif start.auto_option >= 100:
                 self._note_event_progress("检测到地图事件自动选项（状态查询未确认）")
             else:
-                self._note_event_progress("检测到需选择的地图事件，保留等待状态")
+                chosen = start.choose_confirmable_option(
+                    preferred_item_ids=getattr(
+                        self, "_preferred_event_item_ids", frozenset()
+                    ),
+                    item_totals=getattr(self, "_item_totals", None),
+                )
+                if chosen is not None and self._auto_event_progress:
+                    self._send_message(
+                        EVENT_OPTION_MESSAGE_ID,
+                        encode_event_option(
+                            chosen.optidx,
+                            start.dialog_id,
+                            start.event_id,
+                            itemcommit=chosen.icommit,
+                        ),
+                        encrypted=True,
+                    )
+                    self._pending_event_start = None
+                    if chosen.is_take_key_title or (
+                        chosen.is_native_auto_index and not chosen.is_item_cost_option
+                    ):
+                        self._note_event_progress(
+                            "带走钥匙已确认"
+                            f"（title={chosen.title!r}，opt={chosen.optidx}）"
+                        )
+                    elif chosen.is_item_cost_option:
+                        self._last_confirmed_key_option = chosen
+                        cost_name = item_name(chosen.use) if chosen.use else "道具"
+                        self._note_event_progress(
+                            "确定用钥匙打开宝箱已确认"
+                            f"（{cost_name}×{chosen.use_num}，opt={chosen.optidx}）"
+                        )
+                    else:
+                        self._note_event_progress(
+                            f"地图事件选项已确认（title={chosen.title!r}，"
+                            f"opt={chosen.optidx}）"
+                        )
+                elif chosen is not None:
+                    self._note_event_progress(
+                        "检测到可确认地图事件选项（状态查询未确认）"
+                    )
+                else:
+                    self._note_event_progress("检测到需选择的地图事件，保留等待状态")
             return True
 
         if header.message_id == EVENT_FUNC_ACTION_MESSAGE_ID:
@@ -2730,6 +3050,10 @@ class TreasureFarmClient:
             if header.message_id == MAP_ENTER_AREA_MESSAGE_ID:
                 ret, entered_id, locs, rands = decode_enter_area_full(header.data)
                 if ret != 0:
+                    # Reset 时服务端常先推一条失败的 enter_area，再回
+                    # Map_enter_treasure.ret；以 treasure 响应为准，勿抢先抛错。
+                    if reset or enter_ret is None:
+                        continue
                     detail = ENTER_AREA_RET_LABELS.get(ret, "")
                     if ret == 5:
                         detail = (
@@ -2779,71 +3103,49 @@ class TreasureFarmClient:
             # 忽略其它推送，继续等待进入结果。
 
     def reset_area(self) -> AreaSession:
-        """重置当前聚宝区域。
+        """刷新聚宝节点：回主城后再正常进图。
 
-        聚宝之地应使用 ``Map_enter_treasure(enterway=Reset)``，与客户端一致。
-        ``Map_reset_area`` 主要用于魂域等，在聚宝图上常返回莫名 ret。
+        不使用 ``Map_enter_treasure(enterway=Reset)``（易 ret=3/6）或
+        ``Map_reset_area``（魂域协议，易误报「道具扣除数量异常」）。
+        与客户端「退出关卡会重置聚宝之地」一致：``Map_exit_area`` →
+        ``Map_enter_treasure(enterway=Normal)``。
         """
 
         self.login()
         if self._curarea <= 0:
             raise TreasureFarmError("当前不在聚宝地图中，无法重置")
         area_id = self._curarea
-        # 先尝试结束挂起战斗，避免重置/进节点被 HAS_ACTIVE 挡住
+        # 先尽量结束挂起战斗 / 事件，否则 exit 常被拒绝
         self.clear_pending_map_activity(timeout=8.0)
+        self.finish_pending_battle(timeout=min(self.battle_timeout, 60.0))
         try:
-            return self.enter_treasure(area_id, reset=True)
+            self.exit_area()
         except TreasureFarmRejected as exc:
-            # 兼容：若 enterway=Reset 失败，再试 Map_reset_area 并正确解析响应
-            if exc.ret not in (3, 6, 8):
-                raise
-            self._send_message(MAP_RESET_AREA_MESSAGE_ID, encrypted=True)
-            deadline = time.monotonic() + self.timeout
-            while True:
-                header = self._receive_header(deadline, "重置聚宝区域")
-                if self._handle_common_message(header):
-                    continue
-                if header.message_id == MAP_RESET_AREA_MESSAGE_ID:
-                    ret, entered_id, locs = decode_map_reset_response(header.data)
-                    if ret != 0:
-                        raise TreasureFarmRejected(
-                            "重置",
-                            ret,
-                            detail=(
-                                ENTER_TREASURE_RET_LABELS.get(ret)
-                                or f"Map_reset_area 失败 ret={ret}"
-                            ),
-                        ) from exc
-                    if entered_id <= 0:
-                        entered_id = area_id
-                    if not locs:
-                        raise TreasureFarmError(
-                            "重置成功但未返回节点状态"
-                        ) from exc
-                    self._curarea = entered_id
-                    self._initial_locs = dict(locs)
-                    return AreaSession(
-                        area_id=entered_id,
-                        loc_status=dict(locs),
-                        open_times=self._open_times,
-                    )
-                if header.message_id == MAP_ENTER_AREA_MESSAGE_ID:
-                    ret, entered_id, locs = decode_enter_area_response(header.data)
-                    if ret != 0:
-                        raise TreasureFarmRejected("重置进入区域", ret) from exc
-                    if entered_id <= 0:
-                        entered_id = area_id
-                    if not locs:
-                        raise TreasureFarmError(
-                            "重置进入成功但未返回节点状态"
-                        ) from exc
-                    self._curarea = entered_id
-                    self._initial_locs = dict(locs)
-                    return AreaSession(
-                        area_id=entered_id,
-                        loc_status=dict(locs),
-                        open_times=self._open_times,
-                    )
+            raise TreasureFarmRejected(
+                "重置",
+                exc.ret,
+                detail=(
+                    f"无法退出回主城（ret {exc.ret}）："
+                    f"{exc.detail or '退出聚宝失败'}。"
+                    "请确认图内战斗/事件已结束；或完全退出手机端后重试。"
+                ),
+            ) from exc
+        except TreasureFarmError as exc:
+            raise TreasureFarmError(
+                f"无法退出回主城：{exc}。请确认图内战斗/事件已结束。"
+            ) from exc
+        try:
+            return self.enter_treasure(area_id, reset=False)
+        except TreasureFarmRejected as exc:
+            detail = ENTER_TREASURE_RET_LABELS.get(exc.ret, exc.detail or "")
+            raise TreasureFarmRejected(
+                "重置",
+                exc.ret,
+                detail=(
+                    f"已回主城，但再次进入失败：{detail or exc}。"
+                    "请确认地图已解锁且无其它客户端占用会话。"
+                ),
+            ) from exc
 
     def exit_area(self) -> None:
         self.login()
@@ -3291,16 +3593,74 @@ class TreasureFarmClient:
                     and final_result is not None
                     and bool(final_result.loc_updates)
                 )
+                # After victory the server still sends「带走钥匙」Event_start and
+                # then locchanges / item rewards.  Do not treat idle sockets as
+                # failure while that chain is active.
+                waiting_after_monster_victory = (
+                    node_kind == NODE_KIND_MONSTER
+                    and battle_ended
+                    and (
+                        final_result is None
+                        or not final_result.loc_updates
+                        or getattr(self, "_event_chain_active", False)
+                        or getattr(self, "_pending_event_start", None) is not None
+                    )
+                )
+                waiting_for_key_confirm = (
+                    node_kind in (NODE_KIND_SMALL_CHEST, NODE_KIND_BIG_CHEST)
+                    and getattr(self, "_event_chain_active", False)
+                    and final_result is None
+                )
                 if (
                     final_result is not None
                     and final_result.loc_updates
                     and not waiting_for_battle_end
+                    and not waiting_after_monster_victory
                 ):
                     break
-                if waiting_for_battle_end:
+                if (
+                    waiting_for_battle_end
+                    or waiting_for_key_confirm
+                    or waiting_after_monster_victory
+                ):
                     continue
+                pending_start = getattr(self, "_pending_event_start", None)
+                if (
+                    isinstance(pending_start, EventStart)
+                    and not pending_start.auto_confirmable
+                ):
+                    titles = "、".join(
+                        opt.title or f"opt{opt.optidx}" for opt in pending_start.options
+                    ) or "无选项"
+                    raise TreasureFarmError(
+                        f"{node_name}卡在事件确认：服务端下发了需手动选择的地图事件"
+                        f"（{titles}），脚本无法安全猜测分支"
+                    ) from None
                 raise
             if self._handle_common_message(header):
+                # Emit chest key-confirm workflow when open-chest cost option fired.
+                confirmed = getattr(self, "_last_confirmed_key_option", None)
+                if (
+                    confirmed is not None
+                    and node_kind in (NODE_KIND_SMALL_CHEST, NODE_KIND_BIG_CHEST)
+                ):
+                    self._last_confirmed_key_option = None
+                    self._emit_workflow_step(
+                        emit,
+                        FARM_STEP_CHEST_KEY_CONFIRM,
+                        "确定用钥匙打开宝箱",
+                        {
+                            "nodeid": nodeid,
+                            "kind": node_kind or "",
+                            "item_id": confirmed.use,
+                            "item_name": item_name(confirmed.use)
+                            if confirmed.use
+                            else "",
+                            "cost": confirmed.use_num,
+                            "optidx": confirmed.optidx,
+                            "title": confirmed.title,
+                        },
+                    )
                 continue
             if header.message_id == BATTLE_INFO_MESSAGE_ID:
                 self._note_battle_message(header)
@@ -3362,14 +3722,7 @@ class TreasureFarmClient:
                 self._note_battle_message(header)
                 outcome = decode_treasure_battle_end(header.data)
                 if not outcome.win:
-                    raise TreasureFarmError(
-                        "怪物战斗结束但未胜利，未确认钥匙奖励"
-                        + (
-                            f"（结果 {outcome.result_code}）"
-                            if outcome.result_code is not None
-                            else ""
-                        )
-                    )
+                    raise TreasureFarmError(format_battle_not_won_error(outcome))
                 battle_ended = True
                 if node_kind == NODE_KIND_MONSTER and not victory_emitted:
                     victory_emitted = True
@@ -3473,7 +3826,7 @@ class TreasureFarmClient:
                                 outcome = decode_treasure_battle_end(extra.data)
                                 if not outcome.win:
                                     raise TreasureFarmError(
-                                        "怪物战斗结束但未胜利，未确认钥匙奖励"
+                                        format_battle_not_won_error(outcome)
                                     )
                                 battle_ended = True
                                 if node_kind == NODE_KIND_MONSTER and not victory_emitted:
@@ -3557,16 +3910,26 @@ class TreasureFarmClient:
                     for change in items
                     if change.item_id == expected_reward_item_id
                 )
-            if reward_delta <= 0:
+            # Monster LOCEVT scripts run「判断是否获得钥匙」; the server may
+            # skip「带走钥匙」and grant nothing.  Node is still PASSED — do
+            # not hard-fail so the farm can fight the next monster.
+            monster_settled_without_key = (
+                node_kind == NODE_KIND_MONSTER
+                and battle_won is True
+                and bool(final_result.loc_updates)
+                and reward_delta <= 0
+                and not getattr(self, "_event_chain_active", False)
+            )
+            if reward_delta <= 0 and not monster_settled_without_key:
                 raise TreasureFarmError(
                     f"{node_name}已结算，但未收到{item_name(expected_reward_item_id)}奖励"
                 )
-            if getattr(self, "_event_chain_active", False):
+            if getattr(self, "_event_chain_active", False) and reward_delta > 0:
                 raise TreasureFarmError(
                     f"{node_name}已收到{item_name(expected_reward_item_id)}，"
                     "但奖励事件尚未结束"
                 )
-            if node_kind == NODE_KIND_MONSTER:
+            if reward_delta > 0 and node_kind == NODE_KIND_MONSTER:
                 self._emit_workflow_step(
                     emit,
                     FARM_STEP_KEY_REWARD,
@@ -3579,7 +3942,10 @@ class TreasureFarmClient:
                         "delta": reward_delta,
                     },
                 )
-            elif node_kind in (NODE_KIND_SMALL_CHEST, NODE_KIND_BIG_CHEST):
+            elif reward_delta > 0 and node_kind in (
+                NODE_KIND_SMALL_CHEST,
+                NODE_KIND_BIG_CHEST,
+            ):
                 self._emit_workflow_step(
                     emit,
                     FARM_STEP_CHEST_REWARD,
@@ -3591,6 +3957,10 @@ class TreasureFarmClient:
                         "item_name": item_name(expected_reward_item_id),
                         "delta": reward_delta,
                     },
+                )
+            elif monster_settled_without_key:
+                self._note_event_progress(
+                    "判断是否获得钥匙：本场未掉落钥匙（节点已结算）"
                 )
         elif expected_reward_item_id > 0:
             if node_kind == NODE_KIND_MONSTER:
@@ -4238,7 +4608,13 @@ def run_treasure_farm(
             last_actual_totals[item_id] = actual_after
 
         reward_delta = observed_deltas[reward_item_id]
-        if reward_delta <= 0:
+        monster_no_key = (
+            action.kind == NODE_KIND_MONSTER
+            and result.battle_won is True
+            and bool(result.loc_updates)
+            and reward_delta <= 0
+        )
+        if reward_delta <= 0 and not monster_no_key:
             raise TreasureFarmError(
                 f"{kind_label}已完成节点交互，但未收到"
                 f"{item_name(reward_item_id)}奖励；已停止，避免重复点击"
@@ -4257,7 +4633,17 @@ def run_treasure_farm(
                 _fallback_step(FARM_STEP_CHEST_OPEN, "打开宝箱")
 
         if action.kind == NODE_KIND_MONSTER:
-            if workflow_state["phase"] != FARM_STEP_KEY_REWARD:
+            if monster_no_key:
+                # Server event「判断是否获得钥匙」can end without「带走钥匙」.
+                set_workflow_step(
+                    FARM_STEP_KEY_TAKE,
+                    "本场未掉落钥匙（节点已结算，继续刷怪）",
+                    node=action,
+                    reward_item_id=reward_item_id,
+                    reward_delta=0,
+                    level="warning",
+                )
+            elif workflow_state["phase"] != FARM_STEP_KEY_REWARD:
                 set_workflow_step(
                     FARM_STEP_KEY_REWARD,
                     "获得钥匙奖励",
@@ -4280,7 +4666,9 @@ def run_treasure_farm(
         session = session.with_loc_updates(result.loc_updates)
 
         if action.kind == NODE_KIND_MONSTER:
-            monsters_killed += 1
+            # Count only kills that actually yielded map keys.
+            if reward_delta > 0:
+                monsters_killed += 1
         elif action.kind == NODE_KIND_SMALL_CHEST:
             small_opened += 1
         elif action.kind == NODE_KIND_BIG_CHEST:

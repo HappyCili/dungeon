@@ -425,7 +425,7 @@ class ProtocolCodecTestCase(unittest.TestCase):
         ]
         client._receive_header = lambda _deadline, _context: replies.pop(0)
 
-        with self.assertRaisesRegex(TreasureFarmError, "未胜利"):
+        with self.assertRaisesRegex(TreasureFarmError, "战败|未胜利|钥匙奖励"):
             client.process_node(
                 230101,
                 1,
@@ -528,6 +528,9 @@ class ProtocolCodecTestCase(unittest.TestCase):
         client._pending_event_action = None
         client._pending_event_start = None
         client._event_progress_notes = []
+        client._preferred_event_item_ids = frozenset()
+        client._item_totals = {}
+        client._last_confirmed_key_option = None
         sent: list[tuple[int, bytes, bool]] = []
         client._send_message = lambda mid, data=b"", *, encrypted: sent.append(
             (mid, data, encrypted)
@@ -545,6 +548,233 @@ class ProtocolCodecTestCase(unittest.TestCase):
             [(EVENT_OPTION_MESSAGE_ID, encode_event_option(100, 2001, 1001), True)],
         )
         self.assertIsNone(client._pending_event_start)
+
+    def test_event_start_confirms_take_key_option_after_battle(self) -> None:
+        """战后：autoidx=0 但 option 标题为「带走钥匙」且 optidx=100 时自动确认。"""
+
+        from dragon_arena_business_map import EVENT_OPTION_MESSAGE_ID, EVENT_START_MESSAGE_ID
+        from treasure_farm import (
+            TreasureFarmClient,
+            decode_event_start,
+            encode_event_option,
+            encode_string_field,
+        )
+
+        option_blob = (
+            encode_string_field(1, "带走钥匙")
+            + encode_int_field(2, 100)
+        )
+        event_info = encode_int_field(1, 730101) + encode_int_field(4, 6)
+        payload = (
+            encode_bytes_field(1, event_info)
+            + encode_bytes_field(3, option_blob)
+            + encode_int_field(4, 0)
+        )
+        start = decode_event_start(payload)
+        self.assertEqual(start.auto_option, 0)
+        self.assertTrue(start.auto_confirmable)
+        chosen = start.choose_take_key_option()
+        self.assertIsNotNone(chosen)
+        assert chosen is not None
+        self.assertEqual(chosen.optidx, 100)
+        self.assertEqual(chosen.title, "带走钥匙")
+
+        client = object.__new__(TreasureFarmClient)
+        client._auto_event_progress = True
+        client._pending_event_action = None
+        client._pending_event_start = None
+        client._event_progress_notes = []
+        client._preferred_event_item_ids = frozenset()
+        client._item_totals = {}
+        client._last_confirmed_key_option = None
+        sent: list[tuple[int, bytes, bool]] = []
+        client._send_message = lambda mid, data=b"", *, encrypted: sent.append(
+            (mid, data, encrypted)
+        )
+        self.assertTrue(
+            client._handle_common_message(
+                SimpleNamespace(message_id=EVENT_START_MESSAGE_ID, data=payload)
+            )
+        )
+        self.assertEqual(
+            sent,
+            [(EVENT_OPTION_MESSAGE_ID, encode_event_option(100, 6, 730101), True)],
+        )
+        self.assertIsNone(client._pending_event_start)
+        self.assertIn("带走钥匙已确认", client.drain_event_progress_notes()[0])
+
+    def test_event_start_confirms_key_cost_open_chest_option(self) -> None:
+        """宝箱交互后：Event_start 带 use/useNum 钥匙消耗时自动 Event_option。"""
+
+        from dragon_arena_business_map import EVENT_OPTION_MESSAGE_ID, EVENT_START_MESSAGE_ID
+        from treasure_farm import (
+            EventOptionEntry,
+            TreasureFarmClient,
+            decode_event_start,
+            encode_event_option,
+            encode_string_field,
+        )
+
+        key_item_id = 1809
+        option_blob = (
+            encode_string_field(1, "打开宝箱")
+            + encode_int_field(2, 1)
+            + encode_int_field(4, key_item_id)
+            + encode_int_field(5, 1)
+        )
+        event_info = encode_int_field(1, 5001) + encode_int_field(4, 6001)
+        payload = (
+            encode_bytes_field(1, event_info)
+            + encode_bytes_field(3, option_blob)
+        )
+        start = decode_event_start(payload)
+        self.assertEqual(start.auto_option, 0)
+        self.assertEqual(len(start.options), 1)
+        self.assertEqual(
+            start.options[0],
+            EventOptionEntry(
+                title="打开宝箱",
+                optidx=1,
+                use=key_item_id,
+                use_num=1,
+            ),
+        )
+        self.assertTrue(start.auto_confirmable)
+        chosen = start.choose_item_cost_option(
+            preferred_item_ids={key_item_id},
+            item_totals={key_item_id: 3},
+        )
+        self.assertIsNotNone(chosen)
+        assert chosen is not None
+        self.assertEqual(chosen.optidx, 1)
+
+        client = object.__new__(TreasureFarmClient)
+        client._auto_event_progress = True
+        client._pending_event_action = None
+        client._pending_event_start = None
+        client._event_progress_notes = []
+        client._preferred_event_item_ids = frozenset({key_item_id})
+        client._item_totals = {key_item_id: 3}
+        client._last_confirmed_key_option = None
+        sent: list[tuple[int, bytes, bool]] = []
+        client._send_message = lambda mid, data=b"", *, encrypted: sent.append(
+            (mid, data, encrypted)
+        )
+
+        self.assertTrue(
+            client._handle_common_message(
+                SimpleNamespace(message_id=EVENT_START_MESSAGE_ID, data=payload)
+            )
+        )
+        self.assertEqual(
+            sent,
+            [(EVENT_OPTION_MESSAGE_ID, encode_event_option(1, 6001, 5001), True)],
+        )
+        self.assertIsNone(client._pending_event_start)
+        self.assertIsNotNone(client._last_confirmed_key_option)
+        self.assertIn("确定用钥匙打开宝箱已确认", client.drain_event_progress_notes()[0])
+
+    def test_process_node_chest_confirms_key_then_opens(self) -> None:
+        """开箱主路径：processloc → Event_start 钥匙确认 → locchanges → 炉温。"""
+
+        from dragon_arena_business_map import (
+            EVENT_END_MESSAGE_ID,
+            EVENT_OPTION_MESSAGE_ID,
+            EVENT_START_MESSAGE_ID,
+        )
+        from harvest_fief import STORAGE_ITEM_CHANGE_MESSAGE_ID
+        from treasure_farm import (
+            FARM_STEP_CHEST_KEY_CONFIRM,
+            FARM_STEP_CHEST_OPEN,
+            FARM_STEP_CHEST_REWARD,
+            MAP_PROCESSLOC_MESSAGE_ID,
+            TreasureFarmClient,
+            TreasureFarmError,
+            encode_event_option,
+            encode_processloc_request,
+            encode_string_field,
+        )
+
+        key_item_id = 1809
+        option_blob = (
+            encode_string_field(1, "打开宝箱")
+            + encode_int_field(2, 1)
+            + encode_int_field(4, key_item_id)
+            + encode_int_field(5, 1)
+        )
+        event_info = encode_int_field(1, 5001) + encode_int_field(4, 6001)
+        event_payload = encode_bytes_field(1, event_info) + encode_bytes_field(
+            3, option_blob
+        )
+        loc_entry = encode_int_field(1, 6) + encode_int_field(2, LOC_STATUS_PASSED)
+        loc_changes = encode_bytes_field(1, loc_entry)
+        result_payload = encode_int_field(1, 0) + encode_bytes_field(2, loc_changes)
+        item_change = (
+            encode_int_field(1, HEARTH_ITEM_ID)
+            + encode_int_field(2, 30)
+            + encode_int_field(3, 130)
+        )
+        item_notice = encode_bytes_field(2, item_change)
+
+        client = object.__new__(TreasureFarmClient)
+        client.login = lambda: None
+        client.battle_timeout = 2.0
+        client._item_totals = {key_item_id: 5, HEARTH_ITEM_ID: 100}
+        client._auto_event_progress = True
+        client._pending_event_action = None
+        client._pending_event_start = None
+        client._event_progress_notes = []
+        client._event_chain_active = False
+        client._preferred_event_item_ids = frozenset({key_item_id})
+        client._last_confirmed_key_option = None
+        sent: list[tuple[int, bytes, bool]] = []
+        client._send_message = lambda mid, data=b"", *, encrypted: sent.append(
+            (mid, data, encrypted)
+        )
+        replies = [
+            SimpleNamespace(message_id=EVENT_START_MESSAGE_ID, data=event_payload),
+            SimpleNamespace(message_id=MAP_PROCESSLOC_MESSAGE_ID, data=result_payload),
+            SimpleNamespace(
+                message_id=STORAGE_ITEM_CHANGE_MESSAGE_ID, data=item_notice
+            ),
+            SimpleNamespace(message_id=EVENT_END_MESSAGE_ID, data=b""),
+        ]
+
+        def receive(_deadline: float, _context: str) -> SimpleNamespace:
+            if replies:
+                return replies.pop(0)
+            raise TreasureFarmError("测试收包结束")
+
+        client._receive_header = receive
+        steps: list[str] = []
+
+        result = client.process_node(
+            530101,
+            6,
+            node_kind=NODE_KIND_SMALL_CHEST,
+            expected_reward_item_id=HEARTH_ITEM_ID,
+            emit=lambda _level, _message, data: steps.append(
+                str(data.get("workflow_step") or "")
+            ),
+        )
+
+        self.assertEqual(result.loc_updates, {6: LOC_STATUS_PASSED})
+        self.assertEqual(result.reward_delta, 30)
+        self.assertIn(
+            (
+                EVENT_OPTION_MESSAGE_ID,
+                encode_event_option(1, 6001, 5001),
+                True,
+            ),
+            sent,
+        )
+        self.assertEqual(
+            sent[0],
+            (MAP_PROCESSLOC_MESSAGE_ID, encode_processloc_request(6, 530101), True),
+        )
+        self.assertIn(FARM_STEP_CHEST_KEY_CONFIRM, steps)
+        self.assertIn(FARM_STEP_CHEST_OPEN, steps)
+        self.assertIn(FARM_STEP_CHEST_REWARD, steps)
 
     def test_event_status_mode_observes_but_does_not_confirm(self) -> None:
         from dragon_arena_business_map import EVENT_FUNC_ACTION_MESSAGE_ID

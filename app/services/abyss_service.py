@@ -122,8 +122,8 @@ class AbyssService:
                 battle_timeout=battle_timeout,
                 log=log,
                 log_server_messages=False,
-                websocket_log=None,
                 business_log=None,
+                task="grave_abyss",
             )
         )
         self._kickout_retry_delay = kickout_retry_delay

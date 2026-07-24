@@ -11,10 +11,12 @@
   "daily": {
     "enabled_task_ids": [
       101,
+      103,
       104,
       105,
       106,
       109,
+      112,
       119
     ]
   },
@@ -26,8 +28,8 @@
   "treasure": {
     "area_id": 730101,
     "times": 1,
-    "farm_area_id": 530101,
-    "farm_target_hearth": 1000
+    "farm_area_id": 730101,
+    "farm_target_hearth": 2000
   },
   "dungeon": {
     "dungeon_id": 3

@@ -37,8 +37,11 @@ import tempfile
 import time
 from collections import deque
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
-from typing import Callable, Deque, Iterable, Iterator, Sequence
+from typing import Callable, Deque, Iterable, Iterator, Mapping, Sequence
+
+from project_paths import NATIVE_APP_ROOT
 
 from dragon_arena_business_map import (
     BATTLE_C2S_AUTO_ARTIFACT_SKILL_MESSAGE_ID,
@@ -936,11 +939,155 @@ def encode_battle_auto(enabled: bool = True) -> bytes:
     return encode_int_field(1, int(enabled)) if enabled else b""
 
 
+def _encode_battle_grid_position(x: int, y: int) -> bytes:
+    """Encode ``Tr`` grid coords the same way as the native Vdo codec.
+
+    Official ``Tr.encode`` only writes non-zero ``x`` / ``y``.  Map LOCEVT
+    battles often deliver enemy units with ``x=y=-1`` (seat-not-expanded
+    sentinel).  The real client runs ``setEnemiesToSeat`` first; when a seat
+    is missing it falls back to 0/0, which is then omitted.
+    """
+
+    payload = b""
+    if isinstance(x, int) and not isinstance(x, bool) and x > 0:
+        payload += encode_int_field(1, x)
+    if isinstance(y, int) and not isinstance(y, bool) and y > 0:
+        payload += encode_int_field(2, y)
+    return payload
+
+
+@lru_cache(maxsize=1)
+def _battle_design_by_id() -> Mapping[int, Mapping[str, object]]:
+    path = NATIVE_APP_ROOT / "decrypted-data" / "tables" / "battle.json"
+    if not path.is_file():
+        return {}
+    try:
+        rows = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(rows, list):
+        return {}
+    result: dict[int, Mapping[str, object]] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        battle_id = row.get("id")
+        if isinstance(battle_id, int) and not isinstance(battle_id, bool) and battle_id > 0:
+            result[battle_id] = row
+    return result
+
+
+@lru_cache(maxsize=64)
+def load_enemy_seat_positions(editor_id: int) -> Mapping[int, tuple[int, int]]:
+    """Load seat → (x, y) from battlefield editor JSON (``zone-layouts/{id}.json``).
+
+    Matches client ``getByEditorId`` + ``getEnemySeatData``: only cells with
+    ``visible`` and a positive ``seat`` contribute.  Stage-map layouts without
+    ``cellsize`` are ignored (they are not battle fields).
+    """
+
+    if not isinstance(editor_id, int) or isinstance(editor_id, bool) or editor_id <= 0:
+        return {}
+    path = NATIVE_APP_ROOT / "decrypted-data" / "zone-layouts" / f"{editor_id}.json"
+    if not path.is_file():
+        return {}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(raw, dict) or "cellsize" not in raw:
+        return {}
+    data = raw.get("data")
+    seats: dict[int, tuple[int, int]] = {}
+    cells: Iterable[object]
+    if isinstance(data, list):
+        cells = data
+    elif isinstance(data, dict):
+        cells = data.values()
+    else:
+        return {}
+    for cell in cells:
+        if not isinstance(cell, dict):
+            continue
+        seat = cell.get("seat")
+        if not isinstance(seat, int) or isinstance(seat, bool) or seat <= 0:
+            continue
+        visible = cell.get("visible", True)
+        if visible is False:
+            continue
+        x = cell.get("x")
+        y = cell.get("y")
+        if (
+            isinstance(x, int)
+            and not isinstance(x, bool)
+            and isinstance(y, int)
+            and not isinstance(y, bool)
+        ):
+            seats[seat] = (x, y)
+    return seats
+
+
+def enemy_seat_id(unit_id: int) -> int:
+    """Client ``getEnemySeatById``: ``unitId % 10000``."""
+
+    return int(unit_id) % 10_000
+
+
+def expand_enemy_team_seats(
+    battle: BattleInfo,
+) -> tuple[BattleTeamUnit, ...]:
+    """Expand LOCEVT enemy ``x=y=-1`` seats like client ``setEnemiesToSeat``.
+
+    1. Look up ``battle.json[id=battle_id].editorid``
+    2. Load seat map from battlefield editor layout
+    3. For each enemy unit, ``seat = unit.id % 10000`` → real ``(x, y)``
+    4. Missing seat falls back to ``(0, 0)`` (native omit on encode)
+    """
+
+    if not battle.enemy_team:
+        return ()
+    if all(unit.x > 0 and unit.y > 0 for unit in battle.enemy_team):
+        return battle.enemy_team
+
+    design = _battle_design_by_id().get(battle.battle_id)
+    editor_id = 0
+    if design is not None:
+        raw_editor = design.get("editorid")
+        if isinstance(raw_editor, int) and not isinstance(raw_editor, bool):
+            editor_id = raw_editor
+    seat_map: Mapping[int, tuple[int, int]] = {}
+    if editor_id > 0:
+        seat_map = load_enemy_seat_positions(editor_id)
+    # Some editor ids only have stage maps in the dump (e.g. 1001), not battle
+    # fields with cellsize.  Fall back to the standard 12-seat hex field (1002)
+    # used by most LOCEVT / 聚宝 map battles.
+    if not seat_map:
+        seat_map = load_enemy_seat_positions(1002)
+
+    expanded: list[BattleTeamUnit] = []
+    for unit in battle.enemy_team:
+        if unit.x > 0 and unit.y > 0:
+            expanded.append(unit)
+            continue
+        seat = enemy_seat_id(unit.hero_id)
+        pos = seat_map.get(seat)
+        if pos is not None:
+            expanded.append(BattleTeamUnit(hero_id=unit.hero_id, x=pos[0], y=pos[1]))
+        else:
+            # Native: missing seat logs error and keeps 0/0.
+            expanded.append(BattleTeamUnit(hero_id=unit.hero_id, x=0, y=0))
+    return tuple(expanded)
+
+
 def encode_battle_c2s_start(
     battle: BattleInfo,
     team: Sequence[BattleTeamUnit],
 ) -> bytes:
-    """Encode the production ``Battle_C2S_start`` request (bundle export ``Vdo``)."""
+    """Encode the production ``Battle_C2S_start`` request (bundle export ``Vdo``).
+
+    Enemy grid positions are expanded from battlefield editor seats before
+    encoding, matching client ``setEnemiesToSeat`` + ``requestBattleStart``.
+    """
 
     if battle.battle_id <= 0:
         raise HarvestError("Battle_info 缺少有效战斗 ID")
@@ -949,19 +1096,26 @@ def encode_battle_c2s_start(
     if not battle.enemy_team:
         raise HarvestError("Battle_info 缺少敌方站位，无法构造 Battle_C2S_start")
 
+    enemy_team = expand_enemy_team_seats(battle)
+
     payload = encode_int_field(1, battle.battle_id)
     for unit in team:
-        position = encode_int_field(1, unit.x) + encode_int_field(2, unit.y)
+        position = _encode_battle_grid_position(unit.x, unit.y)
+        if not position:
+            raise HarvestError(
+                f"我方站位无效：hero={unit.hero_id} x={unit.x} y={unit.y}"
+            )
         entry = encode_int_field(1, unit.hero_id) + encode_bytes_field(2, position)
         payload += encode_bytes_field(2, entry)
 
-    for unit in battle.enemy_team:
-        position = encode_int_field(1, unit.x) + encode_int_field(2, unit.y)
+    for unit in enemy_team:
+        position = _encode_battle_grid_position(unit.x, unit.y)
         entry = encode_int_field(1, unit.hero_id) + encode_bytes_field(2, position)
         payload += encode_bytes_field(3, entry)
 
     # ``BattleExtra`` is field 4 in the production request. The debug-only C7x
     # request instead puts battle data in field 2 and must not be sent here.
+    # Native ``ar``: auto=bool field1, speed=int32 field2.
     extra = encode_int_field(1, 1) + encode_int_field(2, BATTLE_TIMESCALE_X3)
     payload += encode_bytes_field(4, extra)
     return payload
@@ -981,11 +1135,12 @@ class DragonArenaClient:
         node_binary: str = "node",
         dragon_coin_item_id: int | None = None,
         log_server_messages: bool = True,
-        websocket_log: Path | None = None,
+        websocket_log: Path | bool | None = True,
         business_log: Path | None = None,
         state_probe_timeout: float = 0.35,
         socket_factory: SocketFactory = DEFAULT_SOCKET_FACTORY,
         log: Callable[[str], None] = print,
+        task: str = "dragon_arena",
     ) -> None:
         if battle_start_codec not in {"js", "python"}:
             raise HarvestError("battle_start_codec 必须是 js 或 python")
@@ -1008,6 +1163,7 @@ class DragonArenaClient:
         self.log = log
         self.websocket_log = websocket_log
         self.business_log = business_log
+        self.task = task
         self.websocket = DragonArenaWebSocket(
             self.endpoint.url,
             self.timeout,
@@ -1015,6 +1171,7 @@ class DragonArenaClient:
             business_log=self.business_log,
             socket_factory=socket_factory,
             output=self.log,
+            task=task,
         )
         self.business_logger = self.websocket.business_logger
         self._queued_headers: Deque[MessageHeader] = deque()

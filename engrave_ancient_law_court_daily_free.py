@@ -56,6 +56,7 @@ from harvest_fief import (
     pack1_encode,
     resolve_game_endpoint,
 )
+from ws_traffic_log import bind_traffic_logging
 from harvest_fief import build_parser as build_base_parser
 from logging_store import MANAGED_DESTINATION, LogPersistenceError, write_standard_log
 from id_descriptions import (
@@ -931,12 +932,19 @@ class AncientLawCourtClient:
         timeout: float,
         *,
         socket_factory: Callable[[str, float], NativeWebSocket] = NativeWebSocket.connect,
+        websocket_log: Path | bool | None = True,
     ) -> None:
         self.endpoint = endpoint
         self.timeout = timeout
         self.socket_factory = socket_factory
         self.socket: NativeWebSocket | None = None
         self.password: str | None = None
+        bind_traffic_logging(
+            self,
+            task="ancient_law_court",
+            path=websocket_log,
+            error_cls=HarvestError,
+        )
 
     def _send_message(self, message_id: int, data: bytes = b"", *, encrypted: bool) -> None:
         if self.socket is None:

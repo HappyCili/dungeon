@@ -2,14 +2,10 @@
 
 from __future__ import annotations
 
-import base64
-import json
 import time
-from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Mapping, Protocol, TextIO
+from typing import Any, Callable, Mapping, Protocol
 
-from dragon_arena_business_map import message_name
 from harvest_fief import (
     HarvestError,
     MessageHeader,
@@ -21,10 +17,15 @@ from harvest_fief import (
 )
 from logging_store import MANAGED_DESTINATION, LogPersistenceError, write_standard_log
 from id_descriptions import business_name
+from ws_traffic_log import (
+    WebSocketTrafficLogger,
+    default_ws_raw_log_path,
+    resolve_ws_log_path,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-DEFAULT_WEBSOCKET_LOG = PROJECT_ROOT / "dragon_arena_websocket.jsonl"
+DEFAULT_WEBSOCKET_LOG = default_ws_raw_log_path("dragon_arena")
 DEFAULT_BUSINESS_LOG = MANAGED_DESTINATION
 
 
@@ -107,89 +108,6 @@ class WebSocketBusinessLogger:
         self.output(line)
 
 
-class WebSocketTrafficLogger:
-    """逐行保存 WebSocket 线上帧和解码后的应用消息。"""
-
-    def __init__(
-        self,
-        *,
-        path: Path | None,
-        session_id: str,
-        output: Callable[[str], None] = print,
-    ) -> None:
-        self.path = path
-        self.session_id = session_id
-        self.output = output
-        self._file: TextIO | None = None
-        self._sequence = 0
-        if self.path is not None:
-            self._open()
-
-    def _open(self) -> None:
-        assert self.path is not None
-        try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            self._file = self.path.open("a", encoding="utf-8", buffering=1)
-        except OSError as exc:
-            raise HarvestError(f"打开 WebSocket 日志失败：{self.path}：{exc}") from exc
-        self.output(f"[WebSocket日志] 完整收发内容追加到 {self.path}")
-
-    def close(self) -> None:
-        if self._file is not None:
-            self._file.close()
-            self._file = None
-
-    def write_frame(
-        self,
-        *,
-        direction: str,
-        opcode: int,
-        encrypted: bool,
-        wire_payload: bytes,
-        decoded_packet: bytes | None,
-        header: MessageHeader | None,
-        decode_error: str | None = None,
-    ) -> None:
-        if self._file is None:
-            return
-        self._sequence += 1
-        message_id = header.message_id if header is not None else None
-        record = {
-            "timestamp": datetime.now().astimezone().isoformat(timespec="milliseconds"),
-            "session_id": self.session_id,
-            "sequence": self._sequence,
-            "direction": direction,
-            "opcode": opcode,
-            "frame_type": "text" if opcode == 0x1 else "binary",
-            "encrypted": encrypted,
-            "message_id": message_id,
-            "message_name": message_name(message_id) if message_id is not None else None,
-            "sid": header.sid if header is not None else None,
-            "wire_size": len(wire_payload),
-            "wire_payload_base64": base64.b64encode(wire_payload).decode("ascii"),
-            "decoded_size": len(decoded_packet) if decoded_packet is not None else None,
-            "decoded_packet_base64": (
-                base64.b64encode(decoded_packet).decode("ascii")
-                if decoded_packet is not None
-                else None
-            ),
-            "payload_size": len(header.data) if header is not None else None,
-            "message_payload_base64": (
-                base64.b64encode(header.data).decode("ascii")
-                if header is not None
-                else None
-            ),
-            "decode_error": decode_error,
-        }
-        try:
-            self._file.write(
-                json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
-            )
-            self._file.flush()
-        except OSError as exc:
-            raise HarvestError(f"写入 WebSocket 日志失败：{self.path}：{exc}") from exc
-
-
 class DragonArenaWebSocket:
     """封装游戏服 WebSocket、会话密码以及两类日志。"""
 
@@ -198,10 +116,11 @@ class DragonArenaWebSocket:
         url: str,
         timeout: float,
         *,
-        websocket_log: Path | None = None,
+        websocket_log: Path | bool | None = True,
         business_log: Path | None = None,
         socket_factory: SocketFactory = DEFAULT_SOCKET_FACTORY,
         output: Callable[[str], None] = print,
+        task: str = "dragon_arena",
     ) -> None:
         self.url = url
         self.timeout = timeout
@@ -215,9 +134,11 @@ class DragonArenaWebSocket:
             output=output,
         )
         try:
+            resolved = resolve_ws_log_path(task, websocket_log)
             self.traffic_logger = WebSocketTrafficLogger(
-                path=websocket_log,
+                path=resolved,
                 session_id=self.session_id,
+                task=task,
                 output=output,
             )
         except Exception:

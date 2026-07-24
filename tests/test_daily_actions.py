@@ -600,9 +600,11 @@ class ExistingActionWrapperTestCase(unittest.TestCase):
 
         self.assertTrue(captured["entered"])
         self.assertTrue(captured["closed"])
-        self.assertIsNone(captured["factory_kwargs"]["websocket_log"])
+        # Raw WS logging uses the client default path; batch entry no longer forces it off.
+        self.assertNotIn("websocket_log", captured["factory_kwargs"])
         self.assertIsNone(captured["factory_kwargs"]["business_log"])
         self.assertFalse(captured["factory_kwargs"]["log_server_messages"])
+        self.assertEqual(captured["factory_kwargs"].get("task"), "dragon_arena")
         self.assertEqual(captured["loop"]["rounds"], 1)
         self.assertTrue(captured["loop"]["require_wins"])
         self.assertEqual(captured["choice_id"], 2)
@@ -638,8 +640,9 @@ class ExistingActionWrapperTestCase(unittest.TestCase):
 
         self.assertTrue(captured["entered"])
         self.assertTrue(captured["closed"])
-        self.assertIsNone(captured["factory_kwargs"]["websocket_log"])
+        self.assertNotIn("websocket_log", captured["factory_kwargs"])
         self.assertFalse(captured["factory_kwargs"]["log_server_messages"])
+        self.assertEqual(captured["factory_kwargs"].get("task"), "knight_arena")
         self.assertEqual(captured["loop"]["rounds"], 3)
         self.assertNotIn("require_wins", captured["loop"])
         self.assertEqual(execution.attempted_count, 3)

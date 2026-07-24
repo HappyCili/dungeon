@@ -8,6 +8,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import socket
 import time
 from dataclasses import dataclass, field, replace
@@ -39,6 +41,7 @@ from harvest_fief import (
     pack1_decode,
     pack1_encode,
 )
+from ws_traffic_log import bind_traffic_logging
 
 
 GAME_DATA_MESSAGE_ID = 10490
@@ -321,12 +324,19 @@ class DungeonSweepClient:
         timeout: float,
         *,
         socket_factory: Callable[[str, float], NativeWebSocket] = NativeWebSocket.connect,
+        websocket_log: Path | bool | None = True,
     ) -> None:
         self.endpoint = endpoint
         self.timeout = timeout
         self.socket_factory = socket_factory
         self.socket: NativeWebSocket | None = None
         self.password: str | None = None
+        bind_traffic_logging(
+            self,
+            task="dungeon_sweep",
+            path=websocket_log,
+            error_cls=DungeonSweepError,
+        )
         self._status: DungeonStatus | None = None
 
     def __enter__(self) -> "DungeonSweepClient":

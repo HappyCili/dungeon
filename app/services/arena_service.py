@@ -183,8 +183,8 @@ class ArenaService:
                 game_timeout,
                 log=log,
                 log_server_messages=False,
-                websocket_log=None,
                 business_log=None,
+                task="dragon_arena",
             )
         )
         self._kickout_retry_delay = kickout_retry_delay

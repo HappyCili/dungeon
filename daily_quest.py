@@ -50,6 +50,7 @@ from harvest_fief import (
     pack1_encode,
     resolve_game_endpoint,
 )
+from ws_traffic_log import bind_traffic_logging
 from harvest_fief import build_parser as build_base_parser
 from logging_store import MANAGED_DESTINATION, LogPersistenceError, write_standard_log
 from id_descriptions import activity_reward_name, daily_task_name, quest_name
@@ -470,12 +471,19 @@ class DailyQuestClient:
         timeout: float,
         *,
         socket_factory: Callable[[str, float], NativeWebSocket] = NativeWebSocket.connect,
+        websocket_log: Path | bool | None = True,
     ) -> None:
         self.endpoint = endpoint
         self.timeout = timeout
         self.socket_factory = socket_factory
         self.socket: NativeWebSocket | None = None
         self.password: str | None = None
+        bind_traffic_logging(
+            self,
+            task="daily_quest",
+            path=websocket_log,
+            error_cls=DailyQuestError,
+        )
         self._game_data_status: DailyQuestStatus | None = None
 
     def __enter__(self) -> "DailyQuestClient":

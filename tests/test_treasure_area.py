@@ -9,6 +9,7 @@ from harvest_fief import (
     PACK_PASSWORD_MESSAGE_ID,
     SOCKET_PACK_KEY,
     GameEndpoint,
+    MessageHeader,
     decode_message_header,
     encode_bytes_field,
     encode_int_field,
@@ -26,6 +27,7 @@ from treasure_area import (
     SWEEP_RET_TIMES_LACK,
     TreasureAreaClient,
     TreasureAreaRejected,
+    TreasureSweepLoot,
     decode_treasure_area_status,
     decode_treasure_sweep_loot,
     encode_treasure_sweep_request,
@@ -110,11 +112,18 @@ class TreasureAreaProtocolTestCase(unittest.TestCase):
                 ).encode("utf-8"),
             )
 
+        change = (
+            encode_int_field(1, 1)
+            + encode_int_field(2, 3)
+            + encode_int_field(3, 10)
+        )
+        reward_package = encode_bytes_field(2, change)
+        pending_results = encode_int_field(1, 1001) + encode_bytes_field(2, reward_package)
         pending = _treasure_status_payload(
             swept_today=2,
             daily_sweep_limit=10,
             area_ids=(1001,),
-            has_pending_results=True,
+            results=pending_results,
         )
         cleared = _treasure_status_payload(
             swept_today=2,
@@ -139,6 +148,13 @@ class TreasureAreaProtocolTestCase(unittest.TestCase):
 
         self.assertFalse(status.has_pending_results)
         self.assertEqual(status.sweep_remaining, 8)
+        self.assertEqual(
+            status.cleared_sweep_loot,
+            TreasureSweepLoot(
+                area_id=1001,
+                items=(ItemChange(item_id=1, delta=3, total=10),),
+            ),
+        )
         sent_ids = [
             decode_message_header(pack1_decode(frame, session_password)).message_id
             for frame in fake_socket.text_frames
@@ -147,6 +163,49 @@ class TreasureAreaProtocolTestCase(unittest.TestCase):
             sent_ids,
             [MAP_TREASURE_INFO_MESSAGE_ID, MAP_TREASURE_CLEAR_RESULT_MESSAGE_ID],
         )
+
+    def test_shared_session_preserves_unrelated_pushes_while_waiting_for_status(self) -> None:
+        class SharedSession:
+            def __init__(self, headers: list[MessageHeader]) -> None:
+                self.headers = list(headers)
+                self.sent: list[int] = []
+                self.password = "shared-password"
+
+            def ensure_ready(self, _endpoint: GameEndpoint) -> None:
+                return None
+
+            def send_message(
+                self, message_id: int, _data: bytes = b"", *, encrypted: bool
+            ) -> None:
+                self.sent.append(message_id)
+                assert encrypted
+
+            def receive_header(self, _timeout: float) -> MessageHeader:
+                if not self.headers:
+                    raise socket.timeout()
+                return self.headers.pop(0)
+
+            def push_headers(self, headers: list[MessageHeader]) -> None:
+                self.headers[0:0] = headers
+
+        unrelated = MessageHeader(message_id=10490, sid=0, data=b"game-data")
+        status_header = MessageHeader(
+            message_id=MAP_TREASURE_INFO_MESSAGE_ID,
+            sid=0,
+            data=_treasure_status_payload(
+                swept_today=2,
+                daily_sweep_limit=10,
+                area_ids=(1001,),
+            ),
+        )
+        session = SharedSession([unrelated, status_header])
+        client = TreasureAreaClient(self.endpoint, 1.0, session=session)
+
+        status = client.get_status()
+
+        self.assertEqual(status.sweep_remaining, 8)
+        self.assertEqual(session.sent, [MAP_TREASURE_INFO_MESSAGE_ID])
+        self.assertEqual(session.receive_header(0), unrelated)
 
     def test_sweep_request_uses_native_area_useitem_and_times_fields(self) -> None:
         request = encode_treasure_sweep_request(1001, MAX_SWEEP_TIMES_PER_REQUEST)

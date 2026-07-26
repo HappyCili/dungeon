@@ -21,6 +21,7 @@ class FakeTreasureClient:
 
     def get_status(self) -> TreasureAreaStatus:
         loot = self.state.get("loot")
+        cleared_loot = self.state.get("cleared_loot")
         return TreasureAreaStatus(
             open_times=1,
             refresh_seconds=60,
@@ -28,6 +29,9 @@ class FakeTreasureClient:
             daily_sweep_limit=int(self.state["daily_sweep_limit"]),
             area_ids=tuple(self.state["area_ids"]),  # type: ignore[arg-type]
             sweep_loot=loot if isinstance(loot, TreasureSweepLoot) else None,
+            cleared_sweep_loot=(
+                cleared_loot if isinstance(cleared_loot, TreasureSweepLoot) else None
+            ),
         )
 
     def sweep(self, area_id: int, times: int) -> TreasureSweepResponse:
@@ -107,6 +111,31 @@ class TreasureServiceTestCase(unittest.TestCase):
             [{"id": 1, "name": "金币", "delta": 5, "total": 12}]
         )
         self.assertEqual(summary, "金币：+5（当前 12）")
+
+    def test_snapshot_surfaces_and_persists_acknowledged_sweep_result(self) -> None:
+        self.state["cleared_loot"] = TreasureSweepLoot(
+            area_id=1001,
+            items=(ItemChange(item_id=1, delta=4, total=14),),
+        )
+        with TemporaryDirectory() as directory:
+            log_path = Path(directory) / "treasure.jsonl"
+            payload = self._service(log_path).snapshot(self.endpoint, 1001)
+
+            self.assertEqual(
+                payload["cleared_result"],
+                {
+                    "acknowledged": True,
+                    "area_id": 1001,
+                    "area_name": payload["areas"][0]["name"],
+                    "rewards": [
+                        {"id": 1, "name": "金币", "delta": 4, "total": 14}
+                    ],
+                    "summary": "金币：+4（当前 14）",
+                },
+            )
+            record = json.loads(log_path.read_text(encoding="utf-8"))
+            self.assertEqual(record["operation"], "clear_result")
+            self.assertTrue(record["details"]["acknowledged_while_refreshing_status"])
 
     def test_format_loot_summary_merges_duplicate_items(self) -> None:
         """同一扫荡结果里多次掉落同物品时，日志只显示合并后的一行。"""

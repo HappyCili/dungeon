@@ -1331,20 +1331,34 @@ class FiefClient:
         timeout: float,
         socket_factory: Callable[[str, float], NativeWebSocket] = NativeWebSocket.connect,
         websocket_log: Path | bool | None = True,
+        *,
+        session: "GameSession | None" = None,
     ) -> None:
         self.endpoint = endpoint
         self.timeout = timeout
+        self._session = session
+        self._owns_connection = session is None
         self.socket_factory = socket_factory
         self.socket: NativeWebSocket | None = None
         self.password: str | None = None
-        bind_traffic_logging(
-            self,
-            task="fief_harvest",
-            path=websocket_log,
-            error_cls=HarvestError,
-        )
+        if self._owns_connection:
+            bind_traffic_logging(
+                self,
+                task="fief_harvest",
+                path=websocket_log,
+                error_cls=HarvestError,
+            )
 
     def _send_message(self, message_id: int, data: bytes = b"", *, encrypted: bool) -> None:
+        if self._session is not None:
+            from game_session import GameSessionError
+
+            try:
+                self._session.send_message(message_id, data, encrypted=encrypted)
+            except GameSessionError as exc:
+                raise HarvestError(str(exc)) from exc
+            self.password = self._session.password
+            return
         if self.socket is None:
             raise HarvestError("WebSocket 尚未连接")
         packet = encode_message_header(message_id, data)
@@ -1366,6 +1380,24 @@ class FiefClient:
             payload = pack1_decode(payload, self.password)
         return decode_message_header(payload)
 
+    def _receive_header(self, remaining: float, context: str) -> MessageHeader:
+        if self._session is not None:
+            from game_session import GameSessionError
+
+            try:
+                return self._session.receive_header(remaining)
+            except GameSessionError as exc:
+                raise HarvestError(str(exc)) from exc
+        if self.socket is None:
+            raise HarvestError("WebSocket 尚未连接")
+        try:
+            opcode, frame = self.socket.recv_message(remaining)
+        except socket.timeout as exc:
+            raise HarvestError(f"等待{context}超时") from exc
+        except OSError as exc:
+            raise HarvestError(f"读取{context}报文失败：{exc}") from exc
+        return self._decode_frame(opcode, frame)
+
     def _handle_pre_harvest_message(self, header: MessageHeader) -> bool:
         if header.message_id == PACK_PASSWORD_MESSAGE_ID:
             encrypted_password = decode_pack_password(header.data)
@@ -1383,6 +1415,14 @@ class FiefClient:
             raise HarvestError("游戏服 Login 失败")
         return header.message_id == LOGIN_REUNIQUE_MESSAGE_ID
 
+    def _close_owned(self) -> None:
+        if not self._owns_connection:
+            self.socket = None
+            return
+        if self.socket is not None:
+            self.socket.close()
+            self.socket = None
+
     def harvest(
         self,
         mode: int | str = HARVEST_NORMAL,
@@ -1396,6 +1436,19 @@ class FiefClient:
             factory_type=factory_type,
             times=times,
         )
+        if self._session is not None:
+            from game_session import GameSessionError
+
+            try:
+                self._session.ensure_ready(self.endpoint)
+            except GameSessionError as exc:
+                raise HarvestError(str(exc)) from exc
+            self.password = self._session.password
+            try:
+                return self._harvest_business(request_payload)
+            finally:
+                self._close_owned()
+
         self.socket = self.socket_factory(self.endpoint.url, self.timeout)
         try:
             self._send_message(
@@ -1408,59 +1461,56 @@ class FiefClient:
                 remaining = login_deadline - time.monotonic()
                 if remaining <= 0:
                     raise HarvestError("等待游戏服登录完成超时")
-                try:
-                    opcode, frame = self.socket.recv_message(remaining)
-                except socket.timeout as exc:
-                    raise HarvestError("等待游戏服登录完成超时") from exc
-                except OSError as exc:
-                    raise HarvestError(f"读取游戏服登录报文失败：{exc}") from exc
-                if self._handle_pre_harvest_message(self._decode_frame(opcode, frame)):
+                header = self._receive_header(remaining, "游戏服登录完成")
+                if self._handle_pre_harvest_message(header):
                     break
 
             # SocketManager.throwCachedMsg() dispatches cached business traffic
             # 100 ms after Login_reunique.  Mirror that ordering before sending
             # the standalone client request.
             time.sleep(0.1)
-            self._send_message(FIEF_HARVEST_MESSAGE_ID, request_payload, encrypted=True)
-            response: FiefHarvestResponse | None = None
-            item_changes: tuple[ItemChange, ...] = ()
-            props: tuple[RewardProp, ...] = ()
-            deadline = time.monotonic() + self.timeout
-            reward_deadline: float | None = None
-            while True:
-                now = time.monotonic()
-                current_deadline = reward_deadline if reward_deadline is not None else deadline
-                if now >= current_deadline:
-                    if response is not None:
-                        return HarvestResult(response, item_changes, props)
-                    raise HarvestError("等待 Fief_harvest_res 响应超时")
-                try:
-                    opcode, frame = self.socket.recv_message(current_deadline - now)
-                except socket.timeout as exc:
-                    if response is not None:
-                        return HarvestResult(response, item_changes, props)
-                    raise HarvestError("等待 Fief_harvest_res 响应超时") from exc
-                except OSError as exc:
-                    raise HarvestError(f"读取庄园收获报文失败：{exc}") from exc
-                header = self._decode_frame(opcode, frame)
-                if header.message_id == HEARTBEAT_MESSAGE_ID:
-                    self._send_message(HEARTBEAT_RET_MESSAGE_ID, b"", encrypted=True)
-                    continue
-                if header.message_id == FIEF_HARVEST_MESSAGE_ID:
-                    response = decode_fief_harvest_response(header.data)
-                    if response.ret != 0:
-                        raise FiefHarvestRejected(response.ret)
-                    reward_deadline = min(deadline, time.monotonic() + 1.0)
-                    continue
-                if header.message_id == STORAGE_ITEM_CHANGE_MESSAGE_ID:
-                    notice = decode_item_change_notify(header.data)
-                    if notice.source == FIEF_HARVEST_SOURCE:
-                        item_changes = notice.items
-                        props = notice.props
-                        if response is not None:
-                            return HarvestResult(response, item_changes, props)
+            return self._harvest_business(request_payload)
         finally:
-            self.socket.close()
+            self._close_owned()
+
+    def _harvest_business(self, request_payload: bytes) -> HarvestResult:
+        self._send_message(FIEF_HARVEST_MESSAGE_ID, request_payload, encrypted=True)
+        response: FiefHarvestResponse | None = None
+        item_changes: tuple[ItemChange, ...] = ()
+        props: tuple[RewardProp, ...] = ()
+        deadline = time.monotonic() + self.timeout
+        reward_deadline: float | None = None
+        while True:
+            now = time.monotonic()
+            current_deadline = reward_deadline if reward_deadline is not None else deadline
+            if now >= current_deadline:
+                if response is not None:
+                    return HarvestResult(response, item_changes, props)
+                raise HarvestError("等待 Fief_harvest_res 响应超时")
+            try:
+                header = self._receive_header(
+                    current_deadline - now, "Fief_harvest_res 响应"
+                )
+            except HarvestError as exc:
+                if response is not None and "超时" in str(exc):
+                    return HarvestResult(response, item_changes, props)
+                raise
+            if header.message_id == HEARTBEAT_MESSAGE_ID:
+                self._send_message(HEARTBEAT_RET_MESSAGE_ID, b"", encrypted=True)
+                continue
+            if header.message_id == FIEF_HARVEST_MESSAGE_ID:
+                response = decode_fief_harvest_response(header.data)
+                if response.ret != 0:
+                    raise FiefHarvestRejected(response.ret)
+                reward_deadline = min(deadline, time.monotonic() + 1.0)
+                continue
+            if header.message_id == STORAGE_ITEM_CHANGE_MESSAGE_ID:
+                notice = decode_item_change_notify(header.data)
+                if notice.source == FIEF_HARVEST_SOURCE:
+                    item_changes = notice.items
+                    props = notice.props
+                    if response is not None:
+                        return HarvestResult(response, item_changes, props)
 
 
 def harvest_normal_times(

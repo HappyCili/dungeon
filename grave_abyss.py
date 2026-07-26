@@ -34,6 +34,7 @@ from dragon_arena import (
     BATTLE_S2C_FRAME_HASH_VERIFY_MESSAGE_ID,
     BATTLE_S2C_START_MESSAGE_ID,
     GAME_DATA_MESSAGE_ID,
+    BattleSessionState,
     DragonArenaClient,
     GameLoginKickout,
     GameMessageTimeout,
@@ -502,11 +503,46 @@ def load_season_meta(
     return "", False, -1
 
 
+def max_challenge_id_from_last_passes(
+    activity: GraveActivityState,
+    floors: Sequence[GraveFloor],
+    *,
+    fallback_id: int,
+) -> int:
+    """对齐客户端 ``getAbyssMaxChallengeId``。
+
+    上赛季 ``lastPasses`` 层的 ``canselect`` 表示本赛季可直接挑战的最高
+    *level*（不是 last+1）。若 lastPasses 无效则返回 ``fallback_id``。
+    """
+
+    group = ABYSS_GROUP_ID
+    last = int(activity.last_passes.get(group, 0) or 0)
+    if last <= 0:
+        return fallback_id
+    last_floor = floor_by_id(floors, last)
+    if last_floor is None:
+        return fallback_id
+    canselect_level = int(last_floor.canselect or 0)
+    if canselect_level <= 0:
+        return fallback_id
+    max_id = fallback_id
+    for floor in floors:
+        if floor.level <= canselect_level and floor.id > max_id:
+            max_id = floor.id
+    return max_id
+
+
 def resolve_next_challenge_id(
     activity: GraveActivityState | None,
     floors: Sequence[GraveFloor],
 ) -> int:
-    """计算下一可挑战层 id；已通关全部返回 0。"""
+    """计算下一可挑战层 id；已通关全部返回 0。
+
+    对齐客户端 ``getAbyssChallengeId`` / ``getAbyssMaxChallengeId``：
+    - 本赛季 ``passes==0`` 时，取 lastPasses 对应层 ``canselect`` 允许的最高层
+      （常见为上赛季进度回退若干层后的起点，而非 last+1）
+    - 已有通关进度时，下一层为 pass+1；若 ``currgrave`` 停在该层则优先重试
+    """
 
     if not floors:
         return 0
@@ -519,23 +555,20 @@ def resolve_next_challenge_id(
     passed = int(activity.passes.get(group, 0) or 0)
     curr = int(activity.currgrave or 0)
 
-    # 未通关任何层：优先 lastPasses 推导的起点，否则第一层
+    # 未通关任何层：用 lastPasses.canselect 上限（客户端 getAbyssMaxChallengeId）
     if passed <= 0:
-        last = int(activity.last_passes.get(group, 0) or 0)
-        if last > 0 and last in floor_ids:
-            # lastPasses 表示上赛季进度；可挑战 last+1 或 last 的 canselect 范围
-            idx = floor_ids.index(last)
-            if idx + 1 < len(floor_ids):
-                return floor_ids[idx + 1]
-            return last
-        return first_id
+        return max_challenge_id_from_last_passes(
+            activity, floors, fallback_id=first_id
+        )
 
     if passed not in floor_ids:
-        # 异常 pass id：尝试 +1 或回退第一层
+        # 异常 pass id：尝试 +1 或回退 lastPasses / 第一层
         candidate = passed + 1
         if candidate in floor_ids:
             return candidate
-        return first_id
+        return max_challenge_id_from_last_passes(
+            activity, floors, fallback_id=first_id
+        )
 
     idx = floor_ids.index(passed)
     if idx >= len(floor_ids) - 1:
@@ -760,6 +793,33 @@ class GraveAbyssClient(DragonArenaClient):
             self._activity, passes=new_passes, currgrave=0
         )
 
+    def resume_pending_battle(self) -> AbyssBattleResult | None:
+        """结算登录期遗留的 Battle_info（地图/地牢/深渊等），解除 ret=3 占用。
+
+        龙痕竞技场有同名能力；罪者深渊共用登录会话时，任意未结束战斗都会
+        导致 ``Grave_chanllenge_start`` 返回 startRet3「已经在战斗中」。
+        """
+
+        state = self.inspect_initial_battle_state()
+        if state.phase == "空闲":
+            return None
+        labels = "、".join(str(mid) for mid in state.message_ids) or "未知"
+        self.log(
+            f"[恢复] 检测到登录期{state.phase}"
+            f"（battle_id={state.battle_id or '未知'}，消息={labels}），"
+            "先结算遗留战斗再开罪者深渊。"
+        )
+        battle = self.await_battle_result(
+            challenge_id=0,
+            level=0,
+            name="遗留战斗",
+        )
+        self._initial_battle_state = BattleSessionState("空闲", 0, ())
+        self.log(
+            f"[恢复] 遗留战斗已结束：胜利={'是' if battle.win else '否'}。"
+        )
+        return battle
+
     def challenge_start(
         self, grave_id: int, *, grave_type: int = GRAVE_TYPE_ACTIVITY
     ) -> GraveChallengeResponse:
@@ -938,6 +998,15 @@ class GraveAbyssClient(DragonArenaClient):
             f"[挑战] 第 {level} 层（id={challenge_id}，{name}）开始。"
         )
         start = self.challenge_start(challenge_id)
+        # startRet3：已在战斗中。再尝试清一次遗留战斗后重试（竞态/漏检）
+        if start.ret == 3:
+            self.log("[挑战] 开始返回已在战斗中，尝试结算遗留战斗后重试。")
+            try:
+                self.resume_pending_battle()
+            except HarvestError as exc:
+                self.log(f"[挑战] 遗留战斗恢复失败：{exc}")
+                return AbyssRoundResult(challenge_id, level, name, start, None)
+            start = self.challenge_start(challenge_id)
         if start.ret != 0:
             label = START_RET_LABELS.get(start.ret, f"ret={start.ret}")
             self.log(f"[挑战] 开始失败：{label}。")
@@ -996,6 +1065,13 @@ class GraveAbyssClient(DragonArenaClient):
                 self.ensure_buff_selected()
             except HarvestError as exc:
                 self.log(f"[罪者深渊] 增益选择跳过：{exc}")
+
+        # 登录可能回放未结束的地图/其它战斗；不结算则 start 恒为 ret=3
+        try:
+            self.resume_pending_battle()
+        except HarvestError as exc:
+            self.log(f"[罪者深渊] 遗留战斗恢复失败：{exc}")
+            raise
 
         status = self.get_status(sync=False)
         self.log(
@@ -1166,6 +1242,19 @@ def run_self_tests() -> None:
         )
         == 30002
     )
+    # lastPasses.canselect：上赛季 30003、canselect=2 → 本赛季从 30002 起
+    floors_with_select = (
+        GraveFloor(30001, 3, 1, "罪者深渊-1", 68, 1, 1),
+        GraveFloor(30002, 3, 2, "罪者深渊-2", 68, 1, 1),
+        GraveFloor(30003, 3, 3, "罪者深渊-3", 68, 1, 2),
+    )
+    assert (
+        resolve_next_challenge_id(
+            GraveActivityState(passes={3: 0}, last_passes={3: 30003}),
+            floors_with_select,
+        )
+        == 30002
+    )
 
     status = build_abyss_status(
         GraveActivityState(passes={3: 30001}, season=1024, optbuf=201),
@@ -1175,11 +1264,20 @@ def run_self_tests() -> None:
     assert status.next_id == 30002
     assert status.next_level == 2
 
-    # 真实配置表可加载
+    # 真实配置表可加载；复现日志：lastPasses=30031、canselect=25 → 30025
     real_floors = load_abyss_floors()
     assert len(real_floors) == 900
     assert real_floors[0].id == 30001
     assert real_floors[-1].id == 30900
+    floor_31 = floor_by_id(real_floors, 30031)
+    assert floor_31 is not None and floor_31.canselect == 25
+    assert (
+        resolve_next_challenge_id(
+            GraveActivityState(passes={3: 0}, last_passes={3: 30031}),
+            real_floors,
+        )
+        == 30025
+    )
 
     print("grave_abyss self-test OK")
 

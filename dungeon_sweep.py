@@ -316,26 +316,30 @@ def decode_dungeon_draw_response(data: bytes) -> DungeonDrawResponse:
 
 
 class DungeonSweepClient:
-    """短生命周期的地下城查询、扫荡与全部抽取会话。"""
+    """地下城查询、扫荡与全部抽取会话；可注入共享 GameSession。"""
 
     def __init__(
         self,
         endpoint: GameEndpoint,
         timeout: float,
         *,
+        session: object | None = None,
         socket_factory: Callable[[str, float], NativeWebSocket] = NativeWebSocket.connect,
         websocket_log: Path | bool | None = True,
     ) -> None:
+        from game_session import bind_shared_session
+
         self.endpoint = endpoint
         self.timeout = timeout
         self.socket_factory = socket_factory
         self.socket: NativeWebSocket | None = None
         self.password: str | None = None
-        bind_traffic_logging(
+        bind_shared_session(
             self,
-            task="dungeon_sweep",
-            path=websocket_log,
+            session,  # type: ignore[arg-type]
             error_cls=DungeonSweepError,
+            task="dungeon_sweep",
+            websocket_log=websocket_log,
         )
         self._status: DungeonStatus | None = None
 
@@ -347,6 +351,10 @@ class DungeonSweepClient:
         self.close()
 
     def close(self) -> None:
+        from game_session import shared_close
+
+        if not shared_close(self):
+            return
         if self.socket is not None:
             self.socket.close()
             self.socket = None
@@ -354,6 +362,10 @@ class DungeonSweepClient:
     def _send_message(
         self, message_id: int, data: bytes = b"", *, encrypted: bool
     ) -> None:
+        from game_session import session_send_message
+
+        if session_send_message(self, message_id, data, encrypted=encrypted):
+            return
         if self.socket is None:
             raise DungeonSweepError("WebSocket 尚未连接")
         packet = encode_message_header(message_id, data)
@@ -374,6 +386,13 @@ class DungeonSweepClient:
     def _receive_header(
         self, deadline: float, context: str, *, allow_timeout: bool = False
     ) -> MessageHeader | None:
+        from game_session import try_session_receive_header
+
+        handled, header = try_session_receive_header(
+            self, deadline, context, allow_timeout=allow_timeout
+        )
+        if handled:
+            return header
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             if allow_timeout:
@@ -412,6 +431,15 @@ class DungeonSweepClient:
         return False
 
     def login(self) -> DungeonStatus:
+        from game_session import try_session_ensure_ready
+
+        if try_session_ensure_ready(self, self.endpoint):
+            game_data = getattr(self._session, "game_data", None)
+            if not game_data:
+                raise DungeonSweepError("地下城会话缺少 Game_data")
+            self._status = decode_game_data_dungeon_status(bytes(game_data))
+            return self._status
+
         if self.socket is not None:
             if self._status is None:
                 raise DungeonSweepError("地下城会话缺少 Game_data")

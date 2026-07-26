@@ -575,6 +575,16 @@ select:hover {
   opacity: 0.78;
 }
 
+.treasure-settlement {
+  margin: 14px 0 0;
+  padding: 9px 12px;
+  color: #765000;
+  background: var(--amber-soft);
+  border: 1px solid #e7c77f;
+  border-radius: 5px;
+  font-weight: 600;
+}
+
 .arena-controls,
 .treasure-controls,
 .dungeon-controls {
@@ -714,6 +724,10 @@ select:hover {
 }
 
 .arena-stats__last {
+  grid-column: 1 / -1;
+}
+
+.treasure-stats__last {
   grid-column: 1 / -1;
 }
 

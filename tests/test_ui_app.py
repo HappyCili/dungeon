@@ -373,6 +373,22 @@ class UiAppTestCase(unittest.TestCase):
         self.assertNotIn("ID ${reward.id}", script)
         self.assertNotIn("reward.description", script)
 
+    def test_index_includes_treasure_settlement_and_farm_transition_fields(self) -> None:
+        response = self.client.get("/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(b'id="treasure-cleared-result"', response.data)
+        self.assertNotIn(b'id="treasure-farm-actions"', response.data)
+        self.assertNotIn(b'id="treasure-farm-resets"', response.data)
+        self.assertIn(b'id="treasure-farm-transition"', response.data)
+        script = (Path(__file__).resolve().parents[1] / "app" / "static" / "app.js").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("cleared_result", script)
+        self.assertNotIn("treasureFarmActions", script)
+        self.assertNotIn("treasureFarmResets", script)
+        self.assertIn("last_transition", script)
+
     def test_index_hides_saved_zone_until_current_login_loads_zones(self) -> None:
         self.app.extensions["daily_console"]["config_store"].set_zone(
             "4101", "旧缓存一区"
@@ -613,6 +629,14 @@ class UiAppTestCase(unittest.TestCase):
             {"used": 3, "limit": 8, "available": 5, "request_limit": 5},
         )
         self.assertEqual(len(self.treasure_live_endpoints), 1)
+
+    def test_treasure_farm_catalog_exposes_farm_areas_without_budgets(self) -> None:
+        response = self.client.get("/api/treasure/farm-catalog")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()["farm"]
+        self.assertNotIn("limits", payload)
+        self.assertTrue(payload["farm_areas"])
 
     def test_treasure_settings_and_job_enforce_30_per_request(self) -> None:
         invalid = self.put_json(

@@ -6,6 +6,7 @@ from typing import Callable, Mapping, Protocol, Sequence
 
 from app.config_store import ConfigStore
 from app.credentials import CredentialStore
+from game_session import GameSessionManager
 from harvest_fief import (
     AccountZone,
     GameEndpoint,
@@ -101,6 +102,7 @@ class AccountService:
         zone_loader: ZoneLoader = _load_account_zones,
         endpoint_resolver: EndpointResolver = resolve_game_endpoint,
         restore_on_init: bool = True,
+        session_manager: GameSessionManager | None = None,
     ) -> None:
         self._config_store = config_store
         self._credentials = credentials
@@ -108,11 +110,18 @@ class AccountService:
         self._token_store = token_store or TokenStore(DEFAULT_TOKEN_FILE)
         self._zone_loader = zone_loader
         self._endpoint_resolver = endpoint_resolver
+        self._session_manager = session_manager
         self._connection_status = "unconfigured"
         self._zones: tuple[Zone, ...] = ()
         self._game_tokens: dict[str, str] | None = None
         if restore_on_init:
             self.restore_session()
+
+    def _close_game_session(self) -> None:
+        """Drop the shared game WebSocket (SocketManager.destroy / logout)."""
+
+        if self._session_manager is not None:
+            self._session_manager.close()
 
     def login(
         self, username: str, password: str, remember_password: bool
@@ -120,6 +129,7 @@ class AccountService:
         resolved_password = self._resolve_password(username, password)
         self._connection_status = "logging_in"
         self._game_tokens = None
+        self._close_game_session()
         try:
             result = self._login_client_factory().login_with_password(
                 username=username,
@@ -281,7 +291,11 @@ class AccountService:
         zone = next((item for item in self._zones if item.id == zone_id), None)
         if zone is None or zone.name != zone_name:
             raise ValueError("区服不在当前登录结果中")
+        previous = self._config_store.snapshot().zone
         self._config_store.set_zone(zone.id, zone.name)
+        if previous.id != zone.id or previous.name != zone.name:
+            # New zone needs a fresh game-server Login (native reconnect path).
+            self._close_game_session()
 
     def resolve_selected_game_endpoint(self) -> GameEndpoint:
         """为当前登录和已选区服解析一次临时游戏服入口。"""

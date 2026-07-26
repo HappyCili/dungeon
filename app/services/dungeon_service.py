@@ -13,6 +13,7 @@ from dungeon_sweep import (
     DungeonSweepError,
     DungeonSweepRejected,
 )
+from game_session import GameSessionManager
 from harvest_fief import GameEndpoint, HarvestError
 from id_descriptions import drop_name, dungeon_name, reward_name
 from project_paths import NATIVE_APP_ROOT, UI_APP_ROOT
@@ -165,9 +166,19 @@ class DungeonService:
         dungeon_names: Mapping[int, str] | None = None,
         reward_names: Mapping[int, str] | None = None,
         game_timeout: float = 15.0,
+        session_manager: GameSessionManager | None = None,
     ) -> None:
+        self._session_manager = session_manager
         self._live_client_builder = live_client_builder or (
-            lambda endpoint: DungeonSweepClient(endpoint, game_timeout)
+            lambda endpoint: DungeonSweepClient(
+                endpoint,
+                game_timeout,
+                session=(
+                    self._session_manager.session_for(endpoint)
+                    if self._session_manager is not None
+                    else None
+                ),
+            )
         )
         self._dungeon_names = dict(dungeon_names or _load_dungeon_names(DEFAULT_DUNGEON_DATA_PATH))
         self._dungeon_limits = _load_dungeon_limits(DEFAULT_DUNGEON_DATA_PATH)

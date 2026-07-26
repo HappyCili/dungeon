@@ -24,6 +24,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
+from game_session import GameSession, GameSessionError, GameSessionKickout as SharedKickout
 from harvest_fief import (
     HEARTBEAT_MESSAGE_ID,
     HEARTBEAT_RET_MESSAGE_ID,
@@ -463,27 +464,35 @@ def decode_daily_score_reward_response(data: bytes) -> DailyScoreRewardResponse:
 
 
 class DailyQuestClient:
-    """单个游戏服会话中的日常状态查询与领取操作。"""
+    """单个游戏服会话中的日常状态查询与领取操作。
+
+    可注入共享 ``GameSession``（对齐原生 SocketManager 单连接）；未注入时
+    保持 CLI 兼容的短生命周期连接。
+    """
 
     def __init__(
         self,
         endpoint: GameEndpoint,
         timeout: float,
         *,
+        session: GameSession | None = None,
         socket_factory: Callable[[str, float], NativeWebSocket] = NativeWebSocket.connect,
         websocket_log: Path | bool | None = True,
     ) -> None:
         self.endpoint = endpoint
         self.timeout = timeout
+        self._session = session
+        self._owns_connection = session is None
         self.socket_factory = socket_factory
         self.socket: NativeWebSocket | None = None
         self.password: str | None = None
-        bind_traffic_logging(
-            self,
-            task="daily_quest",
-            path=websocket_log,
-            error_cls=DailyQuestError,
-        )
+        if self._owns_connection:
+            bind_traffic_logging(
+                self,
+                task="daily_quest",
+                path=websocket_log,
+                error_cls=DailyQuestError,
+            )
         self._game_data_status: DailyQuestStatus | None = None
 
     def __enter__(self) -> "DailyQuestClient":
@@ -494,11 +503,24 @@ class DailyQuestClient:
         self.close()
 
     def close(self) -> None:
+        if not self._owns_connection:
+            # Shared session is closed by GameSessionManager / account lifecycle.
+            self.socket = None
+            return
         if self.socket is not None:
             self.socket.close()
             self.socket = None
 
     def _send_message(self, message_id: int, data: bytes = b"", *, encrypted: bool) -> None:
+        if self._session is not None:
+            try:
+                self._session.send_message(message_id, data, encrypted=encrypted)
+            except (GameSessionError, SharedKickout) as exc:
+                if isinstance(exc, SharedKickout):
+                    raise GameSessionKickout(exc.ret, exc.message) from exc
+                raise DailyQuestError(str(exc)) from exc
+            self.password = self._session.password
+            return
         if self.socket is None:
             raise DailyQuestError("WebSocket 尚未连接")
         packet = encode_message_header(message_id, data)
@@ -517,6 +539,16 @@ class DailyQuestClient:
         return decode_message_header(payload)
 
     def _receive_header(self, deadline: float, context: str) -> MessageHeader:
+        if self._session is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise DailyQuestError(f"等待{context}超时")
+            try:
+                return self._session.receive_header(remaining)
+            except SharedKickout as exc:
+                raise GameSessionKickout(exc.ret, exc.message) from exc
+            except GameSessionError as exc:
+                raise DailyQuestError(str(exc)) from exc
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise DailyQuestError(f"等待{context}超时")
@@ -550,6 +582,19 @@ class DailyQuestClient:
         return False
 
     def login(self) -> DailyQuestStatus:
+        if self._session is not None:
+            try:
+                self._session.ensure_ready(self.endpoint)
+            except SharedKickout as exc:
+                raise GameSessionKickout(exc.ret, exc.message) from exc
+            except GameSessionError as exc:
+                raise DailyQuestError(str(exc)) from exc
+            self.password = self._session.password
+            if self._session.game_data is None:
+                raise DailyQuestError("日常任务会话缺少 Game_data")
+            self._game_data_status = decode_game_data_daily_status(self._session.game_data)
+            return self._game_data_status
+
         if self.socket is not None:
             if self._game_data_status is None:
                 raise DailyQuestError("日常任务会话缺少 Game_data")

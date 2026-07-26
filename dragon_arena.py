@@ -1122,7 +1122,10 @@ def encode_battle_c2s_start(
 
 
 class DragonArenaClient:
-    """保持一个游戏服会话并执行龙痕竞技场协议流程。"""
+    """保持一个游戏服会话并执行龙痕竞技场协议流程。
+
+    可注入共享 ``GameSession``：登录与收发走单例连接，``close()`` 不销毁底层 WS。
+    """
 
     def __init__(
         self,
@@ -1141,6 +1144,7 @@ class DragonArenaClient:
         socket_factory: SocketFactory = DEFAULT_SOCKET_FACTORY,
         log: Callable[[str], None] = print,
         task: str = "dragon_arena",
+        session: object | None = None,
     ) -> None:
         if battle_start_codec not in {"js", "python"}:
             raise HarvestError("battle_start_codec 必须是 js 或 python")
@@ -1154,6 +1158,8 @@ class DragonArenaClient:
         self.battle_start_codec = battle_start_codec
         self.log_server_messages = log_server_messages
         self.state_probe_timeout = state_probe_timeout
+        self._session = session
+        self._owns_connection = session is None
         self._js_codec_bridge = (
             JsCodecBridge(js_codec_bridge, node_binary=node_binary)
             if battle_start_codec == "js"
@@ -1161,8 +1167,8 @@ class DragonArenaClient:
         )
         self.dragon_coin_item_id = dragon_coin_item_id
         self.log = log
-        self.websocket_log = websocket_log
-        self.business_log = business_log
+        self.websocket_log = websocket_log if self._owns_connection else False
+        self.business_log = business_log if self._owns_connection else None
         self.task = task
         self.websocket = DragonArenaWebSocket(
             self.endpoint.url,
@@ -1211,10 +1217,16 @@ class DragonArenaClient:
         self.websocket.password = value
 
     def close(self) -> None:
+        if not self._owns_connection:
+            # Shared GameSession is closed by GameSessionManager / account lifecycle.
+            return
         self.websocket.close()
 
     def _send_message(self, message_id: int, data: bytes = b"", *, encrypted: bool) -> None:
-        self.websocket.send_message(message_id, data, encrypted=encrypted)
+        if self._session is not None:
+            self._session.send_message(message_id, data, encrypted=encrypted)
+        else:
+            self.websocket.send_message(message_id, data, encrypted=encrypted)
         if message_id not in {HEARTBEAT_MESSAGE_ID, HEARTBEAT_RET_MESSAGE_ID}:
             self.log(f"[发送] {business_name(message_id)}，载荷={len(data)} 字节")
 
@@ -1581,6 +1593,14 @@ class DragonArenaClient:
         )
 
     def login(self) -> None:
+        if self._session is not None:
+            self._session.ensure_ready(self.endpoint)
+            game_data = getattr(self._session, "game_data", None)
+            if game_data:
+                self._remember_header(
+                    MessageHeader(GAME_DATA_MESSAGE_ID, 0, bytes(game_data))
+                )
+            return
         if self.websocket.connected:
             return
         self.websocket.connect()
@@ -1617,6 +1637,21 @@ class DragonArenaClient:
     def _next_header(self, timeout: float) -> MessageHeader:
         if self._queued_headers:
             return self._queued_headers.popleft()
+        if self._session is not None:
+            try:
+                header = self._session.receive_header(timeout)
+            except Exception as exc:
+                # game_session raises GameSessionError / Kickout with HarvestError base.
+                text = str(exc)
+                if "超时" in text:
+                    raise GameMessageTimeout("等待游戏服消息超时") from exc
+                if "关闭" in text or "Kickout" in type(exc).__name__ or "终止会话" in text:
+                    raise GameSessionClosed(text) from exc
+                raise
+            self._remember_header(header)
+            # Heartbeats are already answered inside GameSession.receive_header.
+            self._log_server_message(header)
+            return header
         try:
             header = self.websocket.receive_header(timeout)
         except socket.timeout as exc:
@@ -1724,7 +1759,13 @@ class DragonArenaClient:
         context = self._game_data_context
         if context is None:
             raise HarvestError("本会话没有可用的 Game_data 编队，无法构造 Battle_C2S_start")
-        if self._js_codec_bridge is not None:
+        # Map LOCEVT (and similar) often deliver enemy x=y=-1 before seat
+        # expansion. Official JS protobuf rejects uint32 4294967295 for those
+        # coords; Python encode_battle_c2s_start expands seats first.
+        needs_seat_expand = any(
+            unit.x <= 0 or unit.y <= 0 for unit in battle.enemy_team
+        )
+        if self._js_codec_bridge is not None and not needs_seat_expand:
             payload = self._js_codec_bridge.encode_battle_start(
                 battle,
                 context.team,
@@ -1735,7 +1776,11 @@ class DragonArenaClient:
                 battle,
                 context.team,
             )
-            codec_name = "Python codec"
+            codec_name = (
+                "Python codec (seat expand)"
+                if needs_seat_expand
+                else "Python codec"
+            )
         self._send_message(BATTLE_C2S_START_MESSAGE_ID, payload, encrypted=True)
         positions = ", ".join(
             f"{hero_name(unit.hero_id)}@({unit.x},{unit.y})" for unit in context.team

@@ -26,10 +26,10 @@
     "refresh_on_exhaustion": true
   },
   "treasure": {
-    "area_id": 730101,
-    "times": 1,
-    "farm_area_id": 730101,
-    "farm_target_hearth": 2000
+    "area_id": 530101,
+    "times": 10,
+    "farm_area_id": 530101,
+    "farm_target_hearth": 5000
   },
   "dungeon": {
     "dungeon_id": 3

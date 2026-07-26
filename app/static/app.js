@@ -68,6 +68,7 @@
     treasureLimit: document.getElementById("treasure-limit"),
     treasureAvailable: document.getElementById("treasure-available"),
     treasureRequestLimit: document.getElementById("treasure-request-limit"),
+    treasureClearedResult: document.getElementById("treasure-cleared-result"),
     treasureFarmArea: document.getElementById("treasure-farm-area"),
     treasureFarmHearth: document.getElementById("treasure-farm-hearth"),
     decreaseTreasureHearth: document.getElementById("treasure-hearth-decrease"),
@@ -80,6 +81,7 @@
     treasureFarmTotal: document.getElementById("treasure-farm-total"),
     treasureFarmKeys: document.getElementById("treasure-farm-keys"),
     treasureFarmPhase: document.getElementById("treasure-farm-phase"),
+    treasureFarmTransition: document.getElementById("treasure-farm-transition"),
     dungeonSelect: document.getElementById("dungeon-select"),
     refreshDungeon: document.getElementById("refresh-dungeon"),
     runDungeon: document.getElementById("run-dungeon"),
@@ -372,6 +374,18 @@
 
   function renderTreasure(treasure) {
     state.treasure = treasure;
+    const clearedResult = treasure?.cleared_result;
+    if (elements.treasureClearedResult) {
+      if (clearedResult?.acknowledged) {
+        const areaLabel = clearedResult.area_name || "聚宝之地";
+        const rewardSummary = clearedResult.summary || "服务端未返回物品明细";
+        elements.treasureClearedResult.textContent = `已确认未读扫荡结算 · ${areaLabel} · ${rewardSummary}`;
+        elements.treasureClearedResult.hidden = false;
+      } else {
+        elements.treasureClearedResult.textContent = "";
+        elements.treasureClearedResult.hidden = true;
+      }
+    }
     const selectedAreaId = state.config.treasure.area_id;
     const fragment = document.createDocumentFragment();
     const placeholder = document.createElement("option");
@@ -432,6 +446,7 @@
       fragment.append(placeholder);
       elements.treasureFarmArea.replaceChildren(fragment);
       elements.treasureFarmArea.disabled = true;
+      if (elements.treasureFarmTransition) elements.treasureFarmTransition.textContent = "等待开始";
       return;
     }
     placeholder.textContent = "请选择任务地图";
@@ -453,6 +468,9 @@
         state.config.treasure.farm_target_hearth || 100
       );
     }
+    if (elements.treasureFarmTransition) {
+      elements.treasureFarmTransition.textContent = "等待开始";
+    }
   }
 
   function renderTreasureFarmProgress(farm) {
@@ -468,6 +486,11 @@
     if (elements.treasureFarmPhase) {
       elements.treasureFarmPhase.textContent = String(
         farm.phase_label || farm.phase || "等待选择节点"
+      );
+    }
+    if (elements.treasureFarmTransition) {
+      elements.treasureFarmTransition.textContent = String(
+        farm.last_transition || farm.last_reset_reason || "等待开始"
       );
     }
     if (farm.target_hearth != null && elements.treasureFarmTarget) {

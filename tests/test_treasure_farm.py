@@ -18,11 +18,14 @@ from treasure_farm import (
     NODE_KIND_BIG_CHEST,
     NODE_KIND_MONSTER,
     NODE_KIND_SMALL_CHEST,
+    REWARD_WAIT_CHEST_SETTLED_S,
+    REWARD_WAIT_MONSTER_SETTLED_S,
     SMALL_CHEST_KEY_COST,
     AreaSession,
     FarmProgress,
     MapNodeSpec,
     TreasureFarmKickout,
+    chest_key_cost,
     choose_next_action,
     decode_enter_area_response,
     decode_enter_treasure_response,
@@ -32,9 +35,11 @@ from treasure_farm import (
     encode_processloc_request,
     format_kickout_error,
     get_treasure_map_entry,
+    is_treasure_map_area,
     list_treasure_map_catalog,
     load_area_nodes,
     progress_payload,
+    reward_wait_timeout,
     run_treasure_farm,
 )
 
@@ -161,6 +166,79 @@ class EnterRejectMessageTestCase(unittest.TestCase):
 
 
 class ProtocolCodecTestCase(unittest.TestCase):
+    def test_shared_login_does_not_replay_stale_game_data_after_entry(self) -> None:
+        from treasure_farm import decode_game_data_curarea, TreasureFarmClient
+
+        def game_data_with_area(area_id: int) -> bytes:
+            area_info = encode_int_field(2, area_id)
+            return encode_bytes_field(11, encode_bytes_field(6, area_info))
+
+        class SharedSession:
+            def __init__(self, game_data: bytes) -> None:
+                self.game_data = game_data
+                self.password = "test-password"
+                self.sent: list[int] = []
+
+            def ensure_ready(self, _endpoint: GameEndpoint) -> None:
+                return None
+
+            def send_message(
+                self, message_id: int, _data: bytes = b"", *, encrypted: bool = True
+            ) -> None:
+                self.sent.append(message_id)
+
+        shared = SharedSession(game_data_with_area(10002))
+        client = TreasureFarmClient(
+            GameEndpoint("ws://test.invalid", "token", "1", "test"),
+            session=shared,
+            websocket_log=False,
+        )
+        recovery_calls = {"collect": 0, "stage": 0, "refresh": 0}
+        client._collect_post_login_battle_signals = lambda _seconds: recovery_calls.__setitem__(
+            "collect", recovery_calls["collect"] + 1
+        )
+        client._signal_stage_ready = lambda: recovery_calls.__setitem__(
+            "stage", recovery_calls["stage"] + 1
+        )
+        client._refresh_treasure_info = lambda: recovery_calls.__setitem__(
+            "refresh", recovery_calls["refresh"] + 1
+        )
+        applied_areas: list[int] = []
+
+        def apply_game_data(data: bytes, *, request_client_data: bool) -> None:
+            del request_client_data
+            area_id = decode_game_data_curarea(data)
+            applied_areas.append(area_id)
+            client._raw_game_data = data
+            client._curarea = area_id
+            client._initial_locs = {}
+            client._client_data_requested = True
+
+        client._apply_game_data = apply_game_data
+
+        client.login()
+        self.assertEqual(client._curarea, 10002)
+        self.assertEqual(applied_areas, [10002])
+
+        # Map_enter_area has already confirmed the target map.  A nested
+        # ensure_actionable() login must preserve that newer state rather than
+        # restoring the shared session's login-time snapshot.
+        client._curarea = 530101
+        client._initial_locs = {1: LOC_STATUS_ACTIVE}
+        client.login()
+
+        self.assertEqual(client._curarea, 530101)
+        self.assertEqual(client._initial_locs, {1: LOC_STATUS_ACTIVE})
+        self.assertEqual(applied_areas, [10002])
+        self.assertEqual(recovery_calls, {"collect": 3, "stage": 2, "refresh": 1})
+
+        # A newly connected shared session publishes a distinct Game_data
+        # object, which must still initialize the client.
+        shared.game_data = bytes(bytearray(game_data_with_area(730101)))
+        client.login()
+        self.assertEqual(client._curarea, 730101)
+        self.assertEqual(applied_areas, [10002, 730101])
+
     def test_decode_treasure_battle_end_requires_victory(self) -> None:
         win = decode_treasure_battle_end(
             encode_int_field(1, 7)
@@ -235,6 +313,113 @@ class ProtocolCodecTestCase(unittest.TestCase):
 
         self.assertTrue(client.move_toward_node(530101, 99))
         self.assertEqual(sent, [MAP_MOVE_MESSAGE_ID])
+
+    def test_process_node_ret60_requires_a_ready_move_trigger(self) -> None:
+        from treasure_farm import (
+            MAP_PROCESSLOC_MESSAGE_ID,
+            TreasureFarmClient,
+            TreasureFarmError,
+        )
+
+        client = object.__new__(TreasureFarmClient)
+        client.login = lambda: None
+        client.battle_timeout = 1.0
+        client._item_totals = {}
+        client._move_trigger = None
+        client._send_message = lambda *_args, **_kwargs: sent.append(_args[0])
+        client._handle_common_message = lambda _header: False
+        sent: list[int] = []
+        replies = [
+            SimpleNamespace(
+                message_id=MAP_PROCESSLOC_MESSAGE_ID,
+                data=encode_int_field(1, 60),
+            )
+        ]
+        client._receive_header = lambda _deadline, _context: replies.pop(0)
+
+        with self.assertRaisesRegex(TreasureFarmError, "无可激活移动触发器"):
+            client.process_node(530101, 99)
+
+        self.assertEqual(sent, [MAP_PROCESSLOC_MESSAGE_ID])
+
+    def test_process_node_ret60_activates_once_then_stops_after_one_retry(self) -> None:
+        from treasure_farm import (
+            MAP_MOVETRIGGER_ACTIVE_MESSAGE_ID,
+            MAP_PROCESSLOC_MESSAGE_ID,
+            MoveTriggerState,
+            TreasureFarmClient,
+            TreasureFarmError,
+        )
+
+        client = object.__new__(TreasureFarmClient)
+        client.login = lambda: None
+        client.battle_timeout = 1.0
+        client._item_totals = {}
+        client._move_trigger = MoveTriggerState(
+            max=1,
+            remain=0,
+            area=530101,
+            triggernum=1,
+        )
+        client._handle_common_message = lambda _header: False
+        sent: list[int] = []
+        client._send_message = lambda mid, data=b"", *, encrypted: sent.append(mid)
+        replies = [
+            SimpleNamespace(
+                message_id=MAP_PROCESSLOC_MESSAGE_ID,
+                data=encode_int_field(1, 60),
+            ),
+            SimpleNamespace(
+                message_id=MAP_PROCESSLOC_MESSAGE_ID,
+                data=encode_int_field(1, 60),
+            ),
+        ]
+
+        def receive(_deadline: float, _context: str) -> SimpleNamespace:
+            reply = replies.pop(0)
+            return reply
+
+        client._receive_header = receive
+
+        with self.assertRaisesRegex(TreasureFarmError, "移动触发重试已达上限"):
+            client.process_node(530101, 99)
+
+        self.assertEqual(
+            sent,
+            [
+                MAP_PROCESSLOC_MESSAGE_ID,
+                MAP_MOVETRIGGER_ACTIVE_MESSAGE_ID,
+                MAP_PROCESSLOC_MESSAGE_ID,
+            ],
+        )
+
+    def test_reset_area_exits_then_reenters_with_normal_enterway(self) -> None:
+        from treasure_farm import AreaSession, TreasureFarmClient
+
+        client = object.__new__(TreasureFarmClient)
+        client._curarea = 530101
+        client.battle_timeout = 2.0
+        calls: list[object] = []
+        client.login = lambda: calls.append("login")
+        client.clear_pending_map_activity = lambda *, timeout: calls.append(
+            ("clear", timeout)
+        )
+        client.finish_pending_battle = lambda *, timeout: calls.append(
+            ("finish", timeout)
+        )
+        client.exit_area = lambda: calls.append("exit")
+        expected = AreaSession(area_id=530101, loc_status={1: LOC_STATUS_ACTIVE})
+
+        def enter(area_id: int, *, reset: bool = False) -> AreaSession:
+            calls.append(("enter", area_id, reset))
+            return expected
+
+        client.enter_treasure = enter
+
+        self.assertEqual(client.reset_area(530101), expected)
+        self.assertEqual(calls[0], "login")
+        self.assertIn("exit", calls)
+        self.assertEqual(calls[-1], ("enter", 530101, False))
 
     def test_idle_preflight_does_not_interact_with_a_node(self) -> None:
         from treasure_farm import PHASE_ACTIONABLE, PHASE_MAP_IDLE, TreasureFarmClient
@@ -531,6 +716,7 @@ class ProtocolCodecTestCase(unittest.TestCase):
         client._preferred_event_item_ids = frozenset()
         client._item_totals = {}
         client._last_confirmed_key_option = None
+        client._active_event_context = {"node_kind": NODE_KIND_MONSTER, "key_item_id": 0}
         sent: list[tuple[int, bytes, bool]] = []
         client._send_message = lambda mid, data=b"", *, encrypted: sent.append(
             (mid, data, encrypted)
@@ -587,6 +773,7 @@ class ProtocolCodecTestCase(unittest.TestCase):
         client._preferred_event_item_ids = frozenset()
         client._item_totals = {}
         client._last_confirmed_key_option = None
+        client._active_event_context = {"node_kind": NODE_KIND_MONSTER, "key_item_id": 0}
         sent: list[tuple[int, bytes, bool]] = []
         client._send_message = lambda mid, data=b"", *, encrypted: sent.append(
             (mid, data, encrypted)
@@ -602,6 +789,166 @@ class ProtocolCodecTestCase(unittest.TestCase):
         )
         self.assertIsNone(client._pending_event_start)
         self.assertIn("带走钥匙已确认", client.drain_event_progress_notes()[0])
+
+    def test_event_start_confirms_single_no_cost_continue_after_battle(self) -> None:
+        """战后唯一的无消耗「继续前进」分支会自动确认。"""
+
+        from dragon_arena_business_map import EVENT_OPTION_MESSAGE_ID, EVENT_START_MESSAGE_ID
+        from treasure_farm import (
+            EventOptionEntry,
+            EventStart,
+            TreasureFarmClient,
+            decode_event_start,
+            encode_event_option,
+            encode_string_field,
+        )
+
+        option_blob = (
+            encode_string_field(1, "继续前进")
+            + encode_int_field(2, 100)
+        )
+        event_info = encode_int_field(1, 530101) + encode_int_field(4, 4)
+        payload = (
+            encode_bytes_field(1, event_info)
+            + encode_bytes_field(3, option_blob)
+            + encode_int_field(4, 0)
+        )
+        start = decode_event_start(payload)
+        self.assertFalse(start.auto_confirmable)
+        chosen = start.choose_battle_continue_option()
+        self.assertIsNotNone(chosen)
+        assert chosen is not None
+        self.assertEqual(chosen.optidx, 100)
+
+        # 同名但带消耗，或存在第二个分支时，均不能按战后继续处理。
+        self.assertIsNone(
+            EventStart(
+                options=(
+                    EventOptionEntry(title="继续前进", optidx=100, use=1809, use_num=1),
+                )
+            ).choose_battle_continue_option()
+        )
+        self.assertIsNone(
+            EventStart(
+                options=(
+                    EventOptionEntry(title="继续前进", optidx=100),
+                    EventOptionEntry(title="离开", optidx=101),
+                )
+            ).choose_battle_continue_option()
+        )
+
+        client = object.__new__(TreasureFarmClient)
+        client._auto_event_progress = True
+        client._pending_event_action = None
+        client._pending_event_start = None
+        client._event_progress_notes = []
+        client._preferred_event_item_ids = frozenset()
+        client._item_totals = {}
+        client._last_confirmed_key_option = None
+        client._active_event_context = {"node_kind": NODE_KIND_MONSTER, "key_item_id": 0}
+        sent: list[tuple[int, bytes, bool]] = []
+        client._send_message = lambda mid, data=b"", *, encrypted: sent.append(
+            (mid, data, encrypted)
+        )
+
+        self.assertTrue(
+            client._handle_common_message(
+                SimpleNamespace(message_id=EVENT_START_MESSAGE_ID, data=payload)
+            )
+        )
+        self.assertEqual(
+            sent,
+            [(EVENT_OPTION_MESSAGE_ID, encode_event_option(100, 4, 530101), True)],
+        )
+        self.assertIsNone(client._pending_event_start)
+        self.assertIn("战后继续前进已确认", client.drain_event_progress_notes()[0])
+
+    def test_event_start_confirms_touch_magic_circle_over_leave_after_battle(
+        self,
+    ) -> None:
+        """战后「触碰法阵 / 暂时离开」时明确选择前者。"""
+
+        from dragon_arena_business_map import EVENT_OPTION_MESSAGE_ID, EVENT_START_MESSAGE_ID
+        from treasure_farm import (
+            EventOptionEntry,
+            EventStart,
+            TreasureFarmClient,
+            decode_event_start,
+            encode_event_option,
+            encode_string_field,
+        )
+
+        touch_option_blob = (
+            encode_string_field(1, "触碰法阵")
+            + encode_int_field(2, 1)
+        )
+        leave_option_blob = (
+            encode_string_field(1, "暂时离开")
+            + encode_int_field(2, 2)
+        )
+        event_info = encode_int_field(1, 530101) + encode_int_field(4, 4)
+        payload = (
+            encode_bytes_field(1, event_info)
+            + encode_bytes_field(3, touch_option_blob)
+            + encode_bytes_field(3, leave_option_blob)
+            + encode_int_field(4, 0)
+        )
+        start = decode_event_start(payload)
+        chosen = start.choose_touch_magic_circle_option()
+        self.assertIsNotNone(chosen)
+        assert chosen is not None
+        self.assertEqual(chosen.optidx, 1)
+
+        # 标题相同但有消耗或存在歧义时，不得自动确认。
+        self.assertIsNone(
+            EventStart(
+                options=(
+                    EventOptionEntry(title="触碰法阵", optidx=100, use=1809, use_num=1),
+                )
+            ).choose_touch_magic_circle_option()
+        )
+        self.assertIsNone(
+            EventStart(
+                options=(
+                    EventOptionEntry(title="触碰法阵", optidx=1),
+                    EventOptionEntry(title="触碰法阵", optidx=2),
+                )
+            ).choose_touch_magic_circle_option()
+        )
+        self.assertIsNone(
+            EventStart(
+                options=(
+                    EventOptionEntry(title="触碰法阵", optidx=100),
+                    EventOptionEntry(title="离开", optidx=101),
+                )
+            ).choose_battle_continue_option()
+        )
+
+        client = object.__new__(TreasureFarmClient)
+        client._auto_event_progress = True
+        client._pending_event_action = None
+        client._pending_event_start = None
+        client._event_progress_notes = []
+        client._preferred_event_item_ids = frozenset()
+        client._item_totals = {}
+        client._last_confirmed_key_option = None
+        client._active_event_context = {"node_kind": NODE_KIND_MONSTER, "key_item_id": 0}
+        sent: list[tuple[int, bytes, bool]] = []
+        client._send_message = lambda mid, data=b"", *, encrypted: sent.append(
+            (mid, data, encrypted)
+        )
+
+        self.assertTrue(
+            client._handle_common_message(
+                SimpleNamespace(message_id=EVENT_START_MESSAGE_ID, data=payload)
+            )
+        )
+        self.assertEqual(
+            sent,
+            [(EVENT_OPTION_MESSAGE_ID, encode_event_option(1, 4, 530101), True)],
+        )
+        self.assertIsNone(client._pending_event_start)
+        self.assertIn("触碰法阵已确认", client.drain_event_progress_notes()[0])
 
     def test_event_start_confirms_key_cost_open_chest_option(self) -> None:
         """宝箱交互后：Event_start 带 use/useNum 钥匙消耗时自动 Event_option。"""
@@ -639,7 +986,7 @@ class ProtocolCodecTestCase(unittest.TestCase):
                 use_num=1,
             ),
         )
-        self.assertTrue(start.auto_confirmable)
+        self.assertFalse(start.auto_confirmable)
         chosen = start.choose_item_cost_option(
             preferred_item_ids={key_item_id},
             item_totals={key_item_id: 3},
@@ -647,6 +994,13 @@ class ProtocolCodecTestCase(unittest.TestCase):
         self.assertIsNotNone(chosen)
         assert chosen is not None
         self.assertEqual(chosen.optidx, 1)
+        # 钥匙为 0 时不得自动确认开箱
+        self.assertIsNone(
+            start.choose_item_cost_option(
+                preferred_item_ids={key_item_id},
+                item_totals={key_item_id: 0},
+            )
+        )
 
         client = object.__new__(TreasureFarmClient)
         client._auto_event_progress = True
@@ -656,6 +1010,10 @@ class ProtocolCodecTestCase(unittest.TestCase):
         client._preferred_event_item_ids = frozenset({key_item_id})
         client._item_totals = {key_item_id: 3}
         client._last_confirmed_key_option = None
+        client._active_event_context = {
+            "node_kind": NODE_KIND_SMALL_CHEST,
+            "key_item_id": key_item_id,
+        }
         sent: list[tuple[int, bytes, bool]] = []
         client._send_message = lambda mid, data=b"", *, encrypted: sent.append(
             (mid, data, encrypted)
@@ -674,6 +1032,79 @@ class ProtocolCodecTestCase(unittest.TestCase):
         self.assertIsNotNone(client._last_confirmed_key_option)
         self.assertIn("确定用钥匙打开宝箱已确认", client.drain_event_progress_notes()[0])
 
+        # 背包无钥匙：不应发送 Event_option
+        sent.clear()
+        client._item_totals = {key_item_id: 0}
+        client._pending_event_start = None
+        client._event_progress_notes = []
+        self.assertTrue(
+            client._handle_common_message(
+                SimpleNamespace(message_id=EVENT_START_MESSAGE_ID, data=payload)
+            )
+        )
+        self.assertEqual(sent, [])
+        self.assertIsNotNone(client._pending_event_start)
+
+    def test_event_start_never_spends_unrelated_item_cost(self) -> None:
+        from dragon_arena_business_map import EVENT_START_MESSAGE_ID
+        from treasure_farm import EventStart, EventOptionEntry, TreasureFarmClient, encode_string_field
+
+        key_item_id = 1809
+        unrelated_item_id = 9999
+        start = EventStart(
+            event_id=5001,
+            dialog_id=6001,
+            options=(
+                EventOptionEntry(
+                    title="继续",
+                    optidx=1,
+                    use=unrelated_item_id,
+                    use_num=1,
+                ),
+            ),
+        )
+        self.assertIsNone(
+            start.choose_open_chest_option(
+                preferred_item_ids={key_item_id},
+                item_totals={key_item_id: 5, unrelated_item_id: 5},
+            )
+        )
+
+        client = object.__new__(TreasureFarmClient)
+        client._auto_event_progress = True
+        client._pending_event_action = None
+        client._pending_event_start = None
+        client._event_progress_notes = []
+        client._preferred_event_item_ids = frozenset({key_item_id})
+        client._item_totals = {key_item_id: 5, unrelated_item_id: 5}
+        client._last_confirmed_key_option = None
+        client._active_event_context = {
+            "node_kind": NODE_KIND_SMALL_CHEST,
+            "key_item_id": key_item_id,
+        }
+        sent: list[int] = []
+        client._send_message = lambda mid, data=b"", *, encrypted: sent.append(mid)
+
+        option_blob = (
+            encode_string_field(1, "继续")
+            + encode_int_field(2, 1)
+            + encode_int_field(4, unrelated_item_id)
+            + encode_int_field(5, 1)
+        )
+        event_info = encode_int_field(1, 5001) + encode_int_field(4, 6001)
+        payload = encode_bytes_field(1, event_info) + encode_bytes_field(3, option_blob)
+
+        self.assertTrue(
+            client._handle_common_message(
+                SimpleNamespace(
+                    message_id=EVENT_START_MESSAGE_ID,
+                    data=payload,
+                )
+            )
+        )
+        self.assertEqual(sent, [])
+        self.assertIsNotNone(client._pending_event_start)
+
     def test_process_node_chest_confirms_key_then_opens(self) -> None:
         """开箱主路径：processloc → Event_start 钥匙确认 → locchanges → 炉温。"""
 
@@ -687,7 +1118,9 @@ class ProtocolCodecTestCase(unittest.TestCase):
             FARM_STEP_CHEST_KEY_CONFIRM,
             FARM_STEP_CHEST_OPEN,
             FARM_STEP_CHEST_REWARD,
+            MAP_MOVETRIGGER_ACTIVE_MESSAGE_ID,
             MAP_PROCESSLOC_MESSAGE_ID,
+            MoveTriggerState,
             TreasureFarmClient,
             TreasureFarmError,
             encode_event_option,
@@ -727,11 +1160,21 @@ class ProtocolCodecTestCase(unittest.TestCase):
         client._event_chain_active = False
         client._preferred_event_item_ids = frozenset({key_item_id})
         client._last_confirmed_key_option = None
+        client._move_trigger = MoveTriggerState(
+            max=1,
+            remain=0,
+            area=530101,
+            triggernum=1,
+        )
         sent: list[tuple[int, bytes, bool]] = []
         client._send_message = lambda mid, data=b"", *, encrypted: sent.append(
             (mid, data, encrypted)
         )
         replies = [
+            SimpleNamespace(
+                message_id=MAP_PROCESSLOC_MESSAGE_ID,
+                data=encode_int_field(1, 60),
+            ),
             SimpleNamespace(message_id=EVENT_START_MESSAGE_ID, data=event_payload),
             SimpleNamespace(message_id=MAP_PROCESSLOC_MESSAGE_ID, data=result_payload),
             SimpleNamespace(
@@ -772,9 +1215,44 @@ class ProtocolCodecTestCase(unittest.TestCase):
             sent[0],
             (MAP_PROCESSLOC_MESSAGE_ID, encode_processloc_request(6, 530101), True),
         )
+        self.assertEqual(sent[1][0], MAP_MOVETRIGGER_ACTIVE_MESSAGE_ID)
+        self.assertEqual(
+            sent[2],
+            (MAP_PROCESSLOC_MESSAGE_ID, encode_processloc_request(6, 530101), True),
+        )
         self.assertIn(FARM_STEP_CHEST_KEY_CONFIRM, steps)
         self.assertIn(FARM_STEP_CHEST_OPEN, steps)
         self.assertIn(FARM_STEP_CHEST_REWARD, steps)
+
+    def test_process_node_refuses_chest_without_keys(self) -> None:
+        """无钥匙时 process_node 不得发 processloc 开箱。"""
+        from treasure_farm import TreasureFarmClient, TreasureFarmError
+
+        client = object.__new__(TreasureFarmClient)
+        client.login = lambda: None
+        client._item_totals = {1809: 0, HEARTH_ITEM_ID: 100}
+        client._auto_event_progress = True
+        sent: list[object] = []
+        client._send_message = lambda *a, **k: sent.append(a)
+
+        with self.assertRaisesRegex(TreasureFarmError, "钥匙不足"):
+            client.process_node(
+                530101,
+                6,
+                node_kind=NODE_KIND_SMALL_CHEST,
+                expected_reward_item_id=HEARTH_ITEM_ID,
+            )
+        self.assertEqual(sent, [])
+        # 大宝箱 4 把不够 5
+        client._item_totals = {1809: 4}
+        with self.assertRaisesRegex(TreasureFarmError, "钥匙不足"):
+            client.process_node(
+                530101,
+                33,
+                node_kind=NODE_KIND_BIG_CHEST,
+                expected_reward_item_id=HEARTH_ITEM_ID,
+            )
+        self.assertEqual(sent, [])
 
     def test_event_status_mode_observes_but_does_not_confirm(self) -> None:
         from dragon_arena_business_map import EVENT_FUNC_ACTION_MESSAGE_ID
@@ -1041,6 +1519,36 @@ class CatalogTestCase(unittest.TestCase):
         self.assertIn(NODE_KIND_SMALL_CHEST, kinds)
         self.assertIn(NODE_KIND_BIG_CHEST, kinds)
 
+    def test_load_nodes_includes_boss_not_inn(self) -> None:
+        """Boss 座必须可刷；旅店事件仍跳过。
+
+        2026-07-24 石化森林日志：清普通怪/箱后仍有 node 27(boss)/26(旅店)
+        为 ACTIVE，旧逻辑漏掉 Boss 导致误报地图已清空。
+        """
+        from treasure_farm import load_area_nodes as load_nodes
+
+        load_nodes.cache_clear()
+        nodes = load_nodes(730101)
+        by_id = {node.nodeid: node for node in nodes}
+        self.assertIn(27, by_id)
+        self.assertEqual(by_id[27].kind, NODE_KIND_MONSTER)
+        self.assertEqual(str(by_id[27].notes).lower(), "boss")
+        self.assertNotIn(26, by_id)
+        # 尖啸山谷 boss 座号不同，同样应纳入
+        load_nodes.cache_clear()
+        tip_nodes = {node.nodeid: node for node in load_nodes(230101)}
+        self.assertIn(48, tip_nodes)
+        self.assertEqual(tip_nodes[48].kind, NODE_KIND_MONSTER)
+
+    def test_hub_and_story_maps_are_not_treasure_areas(self) -> None:
+        # 潮汐之门 / 流放者之岛·1年后 是进图中转或剧情图，不是聚宝目标
+        self.assertFalse(is_treasure_map_area(9004))
+        self.assertFalse(is_treasure_map_area(10001))
+        self.assertTrue(is_treasure_map_area(730101))
+        self.assertTrue(is_treasure_map_area(530101))
+        with self.assertRaisesRegex(Exception, "未知聚宝地图"):
+            get_treasure_map_entry(9004)
+
 
 class BigChestDailyLimitTestCase(unittest.TestCase):
     def test_is_big_chest_daily_limit_by_times_and_text(self) -> None:
@@ -1057,6 +1565,55 @@ class BigChestDailyLimitTestCase(unittest.TestCase):
                 detail="开启大宝箱被拒绝：当日已开启上限",
             )
         )
+
+
+class RewardWaitTimeoutTestCase(unittest.TestCase):
+    """结算后奖励等待：不得再空等 8s（日志里约一半小怪不掉钥匙）。"""
+
+    def test_monster_settled_without_key_uses_short_wait(self) -> None:
+        wait = reward_wait_timeout(
+            node_kind=NODE_KIND_MONSTER,
+            reward_delta=0,
+            event_active=False,
+            battle_won=True,
+            has_loc_updates=True,
+        )
+        self.assertEqual(wait, REWARD_WAIT_MONSTER_SETTLED_S)
+        self.assertLess(wait, 1.0)
+
+    def test_reward_already_received_skips_wait(self) -> None:
+        self.assertEqual(
+            reward_wait_timeout(
+                node_kind=NODE_KIND_MONSTER,
+                reward_delta=1,
+                event_active=False,
+                battle_won=True,
+                has_loc_updates=True,
+            ),
+            0.0,
+        )
+
+    def test_chest_settled_uses_short_wait(self) -> None:
+        wait = reward_wait_timeout(
+            node_kind=NODE_KIND_SMALL_CHEST,
+            reward_delta=0,
+            event_active=False,
+            battle_won=None,
+            has_loc_updates=True,
+        )
+        self.assertEqual(wait, REWARD_WAIT_CHEST_SETTLED_S)
+        self.assertLess(wait, 1.0)
+
+    def test_active_event_still_waits_briefly(self) -> None:
+        wait = reward_wait_timeout(
+            node_kind=NODE_KIND_MONSTER,
+            reward_delta=1,
+            event_active=True,
+            battle_won=True,
+            has_loc_updates=True,
+        )
+        self.assertGreater(wait, 0.0)
+        self.assertLessEqual(wait, 3.0)
 
 
 class ChooseActionTestCase(unittest.TestCase):
@@ -1111,6 +1668,45 @@ class ChooseActionTestCase(unittest.TestCase):
         assert action is not None
         self.assertEqual(action.kind, NODE_KIND_MONSTER)
 
+    def test_never_opens_chest_when_keys_zero(self) -> None:
+        """无钥匙时只能打怪，不能返回任何宝箱节点。"""
+        for keys in (0, -1):
+            action = choose_next_action(self.session, self.nodes, keys=keys)
+            assert action is not None
+            self.assertEqual(action.kind, NODE_KIND_MONSTER)
+        # 4 把钥匙够小箱不够大箱：只能开小箱，不能误开大箱
+        action = choose_next_action(self.session, self.nodes, keys=4)
+        assert action is not None
+        self.assertEqual(action.kind, NODE_KIND_SMALL_CHEST)
+        self.assertEqual(chest_key_cost(NODE_KIND_SMALL_CHEST), 1)
+        self.assertEqual(chest_key_cost(NODE_KIND_BIG_CHEST), 5)
+
+    def test_open_chest_option_prefers_open_over_leave(self) -> None:
+        """石化森林日志：打开宝箱(100)/暂时离开(101)，use 常为 0。"""
+        from treasure_farm import EventOptionEntry, EventStart
+
+        start = EventStart(
+            auto_option=0,
+            event_id=730103,
+            dialog_id=1,
+            options=(
+                EventOptionEntry(title="打开宝箱", optidx=100, use=0, use_num=0),
+                EventOptionEntry(title="暂时离开", optidx=101, use=0, use_num=0),
+            ),
+        )
+        chosen = start.choose_open_chest_option(
+            preferred_item_ids={1810},
+            item_totals={1810: 2},
+        )
+        assert chosen is not None
+        self.assertEqual(chosen.optidx, 100)
+        self.assertIsNone(
+            start.choose_open_chest_option(
+                preferred_item_ids={1810},
+                item_totals={1810: 0},
+            )
+        )
+
     def test_returns_none_when_all_passed(self) -> None:
         session = AreaSession(
             area_id=230101,
@@ -1127,6 +1723,21 @@ class ChooseActionTestCase(unittest.TestCase):
         action = choose_next_action(session, self.nodes, keys=1)
         assert action is not None
         self.assertEqual(action.nodeid, 2)
+
+    def test_fights_boss_when_only_boss_and_big_chest_remain(self) -> None:
+        # 复现日志终态：钥匙不足开大箱时，应优先打仍存活的 Boss
+        nodes = (
+            MapNodeSpec(27, NODE_KIND_MONSTER, notes="boss"),
+            MapNodeSpec(33, NODE_KIND_BIG_CHEST, notes="大宝箱"),
+        )
+        session = AreaSession(
+            area_id=730101,
+            loc_status={27: LOC_STATUS_ACTIVE, 33: LOC_STATUS_ACTIVE},
+        )
+        action = choose_next_action(session, nodes, keys=1)
+        assert action is not None
+        self.assertEqual(action.nodeid, 27)
+        self.assertEqual(action.kind, NODE_KIND_MONSTER)
 
 
 class FakeFarmClient:
@@ -1177,11 +1788,14 @@ class FakeFarmClient:
         return 0
 
     def enter_treasure(self, area_id: int, *, reset: bool = False) -> AreaSession:
+        self._curarea = area_id
         return self.session
 
-    def reset_area(self) -> AreaSession:
+    def reset_area(self, area_id: int | None = None) -> AreaSession:
+        target = int(area_id or 230101)
+        self._curarea = target
         self.session = AreaSession(
-            area_id=230101,
+            area_id=target,
             loc_status={nodeid: LOC_STATUS_ACTIVE for nodeid in self._nodes},
             open_times=0,
         )
@@ -1240,6 +1854,31 @@ class MissingRewardFarmClient(FakeFarmClient):
         )
 
 
+class HubThenTreasureFarmClient(FakeFarmClient):
+    """模拟登录落在潮汐之门：首次 enter 误回中转图，第二次才进目标聚宝图。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._curarea = 9004
+        self._enter_calls = 0
+        self.session = AreaSession(area_id=9004, loc_status={}, open_times=0)
+
+    def enter_treasure(self, area_id: int, *, reset: bool = False) -> AreaSession:
+        self._enter_calls += 1
+        if self._enter_calls == 1:
+            # 第一次：仍停在中转图（旧逻辑会 get_treasure_map_entry 报未知）
+            self._curarea = 9004
+            self.session = AreaSession(area_id=9004, loc_status={1: 0}, open_times=0)
+            return self.session
+        self._curarea = area_id
+        self.session = AreaSession(
+            area_id=area_id,
+            loc_status={nodeid: LOC_STATUS_ACTIVE for nodeid in self._nodes},
+            open_times=0,
+        )
+        return self.session
+
+
 class FarmLoopTestCase(unittest.TestCase):
     def test_run_reaches_target_hearth(self) -> None:
         client = FakeFarmClient()
@@ -1259,6 +1898,222 @@ class FarmLoopTestCase(unittest.TestCase):
         self.assertGreaterEqual(progress.small_chests_opened, 1)
         self.assertEqual(client.verify_calls, 0)
         self.assertTrue(any(level == "success" for level, _ in events))
+
+    def test_empty_map_reloads_past_legacy_reset_budget_until_stopped(self) -> None:
+        """Map reloads are unbounded; cooperative stop remains available."""
+
+        class EmptyMapClient(FakeFarmClient):
+            def __init__(self) -> None:
+                super().__init__()
+                self.reset_calls = 0
+                self._initial_locs = {999: LOC_STATUS_PASSED}
+                self.session = AreaSession(
+                    area_id=230101,
+                    loc_status=dict(self._initial_locs),
+                    open_times=0,
+                )
+
+            def reset_area(self, area_id: int | None = None) -> AreaSession:
+                self.reset_calls += 1
+                self._curarea = int(area_id or 230101)
+                self.session = AreaSession(
+                    area_id=self._curarea,
+                    loc_status=dict(self._initial_locs),
+                    open_times=0,
+                )
+                return self.session
+
+        client = EmptyMapClient()
+        progress = run_treasure_farm(
+            client,  # type: ignore[arg-type]
+            230101,
+            1,
+            stop_requested=lambda: client.reset_calls >= 21,
+        )
+
+        self.assertFalse(progress.completed)
+        self.assertEqual(client.reset_calls, 21)
+        self.assertEqual(progress.last_transition, "已请求停止")
+
+    def test_hearth_target_can_require_more_than_legacy_action_budget(self) -> None:
+        """Successful nodes continue until the requested hearth target is reached."""
+
+        class RepeatingChestClient(FakeFarmClient):
+            def __init__(self) -> None:
+                super().__init__()
+                chest = next(
+                    node
+                    for node in self._nodes.values()
+                    if node.kind == NODE_KIND_SMALL_CHEST
+                )
+                self._nodes = {chest.nodeid: chest}
+                self._items[1801] = SMALL_CHEST_KEY_COST
+                self._initial_locs = {chest.nodeid: LOC_STATUS_ACTIVE}
+                self.session = AreaSession(
+                    area_id=230101,
+                    loc_status=dict(self._initial_locs),
+                    open_times=0,
+                )
+
+            def process_node(self, area_id: int, nodeid: int) -> Any:
+                from treasure_farm import ProcessLocResult
+
+                self.processed_nodes.append(nodeid)
+                self._items[HEARTH_ITEM_ID] += 1
+                return ProcessLocResult(
+                    ret=0,
+                    loc_updates={nodeid: LOC_STATUS_ACTIVE},
+                    flag=1,
+                    items=(
+                        ItemChange(
+                            HEARTH_ITEM_ID,
+                            1,
+                            self._items[HEARTH_ITEM_ID],
+                        ),
+                    ),
+                )
+
+        client = RepeatingChestClient()
+        progress = run_treasure_farm(client, 230101, 501)  # type: ignore[arg-type]
+
+        self.assertTrue(progress.completed)
+        self.assertEqual(progress.hearth_gained, 501)
+        self.assertEqual(len(client.processed_nodes), 501)
+
+    def test_typed_node_receives_stop_callback_and_returns_stopped_progress(self) -> None:
+        from treasure_farm import TreasureFarmCancelled
+
+        stop_state = {"requested": False}
+
+        class StoppingFarmClient(FakeFarmClient):
+            def process_farm_node(
+                self,
+                _area_id: int,
+                _nodeid: int,
+                _node_kind: str,
+                *,
+                emit=None,
+                stop_requested=None,
+            ) -> Any:
+                self.stop_callback_received = callable(stop_requested)
+                stop_state["requested"] = True
+                if callable(stop_requested) and stop_requested():
+                    raise TreasureFarmCancelled("测试请求停止")
+                raise AssertionError("停止回调未传入")
+
+        client = StoppingFarmClient()
+        events: list[tuple[str, str, dict[str, object]]] = []
+        progress = run_treasure_farm(
+            client,  # type: ignore[arg-type]
+            230101,
+            30,
+            emit=lambda level, message, data: events.append((level, message, data)),
+            stop_requested=lambda: bool(stop_state["requested"]),
+        )
+
+        self.assertTrue(client.stop_callback_received)
+        self.assertFalse(progress.completed)
+        self.assertEqual(progress.last_transition, "已请求停止")
+        self.assertTrue(any(level == "warning" for level, _, _ in events))
+
+    def test_preloop_ret2_recovery_cancellation_returns_partial_progress(self) -> None:
+        from treasure_farm import TreasureFarmCancelled
+
+        stop_state = {"requested": False}
+
+        class CancellingRecoveryClient(FakeFarmClient):
+            def __init__(self) -> None:
+                super().__init__()
+                self._last_processloc_ret = 2
+                self.stop_callback_received = False
+
+            def recover_from_landmark_lock(
+                self, *, stop_requested=None, **_kwargs: object
+            ) -> bool:
+                self.stop_callback_received = callable(stop_requested)
+                stop_state["requested"] = True
+                if callable(stop_requested) and stop_requested():
+                    raise TreasureFarmCancelled("测试恢复阶段停止")
+                raise AssertionError("停止回调未传入")
+
+        client = CancellingRecoveryClient()
+        progress = run_treasure_farm(
+            client,  # type: ignore[arg-type]
+            230101,
+            30,
+            stop_requested=lambda: bool(stop_state["requested"]),
+        )
+
+        self.assertTrue(client.stop_callback_received)
+        self.assertFalse(progress.completed)
+        self.assertEqual(progress.last_transition, "已请求停止")
+
+    def test_rejected_node_uses_ret2_recovery_branch_before_generic_error(self) -> None:
+        from treasure_farm import TreasureFarmRejected
+
+        class Ret2ThenRecoverClient(FakeFarmClient):
+            def __init__(self) -> None:
+                super().__init__()
+                self._rejected_once = False
+                self.recovery_calls = 0
+
+            def process_node(self, area_id: int, nodeid: int) -> Any:
+                if not self._rejected_once:
+                    self._rejected_once = True
+                    self.processed_nodes.append(nodeid)
+                    raise TreasureFarmRejected("处理节点", 2)
+                return super().process_node(area_id, nodeid)
+
+            def recover_from_landmark_lock(self, **_kwargs: object) -> bool:
+                self.recovery_calls += 1
+                return True
+
+        client = Ret2ThenRecoverClient()
+        progress = run_treasure_farm(client, 230101, 30)
+
+        self.assertTrue(progress.completed)
+        self.assertEqual(client.recovery_calls, 1)
+
+    def test_preflight_stops_when_landmark_recovery_does_not_clear_ret2(self) -> None:
+        """未收到挂起战斗结算时，不得清掉 ret=2 后继续点下一地标。"""
+
+        from treasure_farm import TreasureFarmError
+
+        class LockedLandmarkClient(FakeFarmClient):
+            def __init__(self) -> None:
+                super().__init__()
+                self._last_processloc_ret = 2
+                self.recovery_calls = 0
+
+            def recover_from_landmark_lock(self, **_kwargs: object) -> bool:
+                self.recovery_calls += 1
+                return False
+
+        client = LockedLandmarkClient()
+        with self.assertRaisesRegex(TreasureFarmError, "地标交互仍未结算"):
+            run_treasure_farm(client, 230101, 30)
+
+        self.assertEqual(client.recovery_calls, 1)
+        self.assertEqual(client.processed_nodes, [])
+        self.assertEqual(client._last_processloc_ret, 2)
+
+    def test_unknown_hub_area_returns_to_city_and_reenters(self) -> None:
+        """落在潮汐之门时不得报「未知聚宝地图」，应回城重进目标图。"""
+        client = HubThenTreasureFarmClient()
+        events: list[tuple[str, str]] = []
+        progress = run_treasure_farm(
+            client,  # type: ignore[arg-type]
+            230101,
+            30,
+            emit=lambda level, message, _data: events.append((level, message)),
+            stop_requested=lambda: False,
+        )
+        self.assertTrue(progress.completed)
+        self.assertGreaterEqual(client._enter_calls, 2)
+        self.assertTrue(
+            any("非聚宝地图" in message and "潮汐之门" in message for _, message in events)
+        )
+        self.assertFalse(any("未知聚宝地图" in message for _, message in events))
 
     def test_workflow_emits_monster_and_chest_checkpoints(self) -> None:
         client = FakeFarmClient()
@@ -1339,9 +2194,12 @@ class FarmLoopTestCase(unittest.TestCase):
             monsters_killed=3,
             small_chests_opened=2,
             big_chests_opened=0,
-            resets=1,
-            actions=5,
             open_times=0,
+            settled_monsters=4,
+            no_key_monsters=1,
+            missing_hearth_chests=2,
+            last_transition="节点耗尽后重置",
+            last_reset_reason="节点耗尽后重置",
         )
         summary = format_farm_summary(progress)
         self.assertIn("尖啸山谷", summary)
@@ -1349,6 +2207,12 @@ class FarmLoopTestCase(unittest.TestCase):
         payload = progress_payload(progress)
         self.assertEqual(payload["area_name"], "尖啸山谷")
         self.assertEqual(payload["hearth_item_name"], "炉温")
+        self.assertEqual(payload["settled_monsters"], 4)
+        self.assertEqual(payload["no_key_monsters"], 1)
+        self.assertEqual(payload["missing_hearth_chests"], 2)
+        self.assertNotIn("actions", payload)
+        self.assertNotIn("resets", payload)
+        self.assertEqual(payload["last_transition"], "节点耗尽后重置")
 
 
 class TreasureFarmServiceTestCase(unittest.TestCase):

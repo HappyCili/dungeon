@@ -11,6 +11,7 @@ from grave_abyss import (
     AbyssStatus,
     GraveAbyssClient,
 )
+from game_session import GameSessionManager
 from harvest_fief import GameEndpoint, HarvestError
 from logging_store import MANAGED_DESTINATION, LogPersistenceError, write_standard_log
 
@@ -114,7 +115,9 @@ class AbyssService:
         battle_timeout: float = 180.0,
         kickout_retry_delay: float = LOGIN_KICKOUT_RETRY_DELAY,
         result_log_destination: object = MANAGED_DESTINATION,
+        session_manager: GameSessionManager | None = None,
     ) -> None:
+        self._session_manager = session_manager
         self._live_client_builder = live_client_builder or (
             lambda endpoint, log: GraveAbyssClient(
                 endpoint,
@@ -124,6 +127,11 @@ class AbyssService:
                 log_server_messages=False,
                 business_log=None,
                 task="grave_abyss",
+                session=(
+                    self._session_manager.session_for(endpoint)
+                    if self._session_manager is not None
+                    else None
+                ),
             )
         )
         self._kickout_retry_delay = kickout_retry_delay

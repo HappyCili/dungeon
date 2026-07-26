@@ -16,6 +16,7 @@ from dragon_arena import (
     GameLoginKickout,
     resolve_win_choice_id,
 )
+from game_session import GameSessionManager
 from harvest_fief import GameEndpoint, HarvestError
 from id_descriptions import (
     arena_stage_name,
@@ -176,7 +177,9 @@ class ArenaService:
         kickout_retry_delay: float = LOGIN_KICKOUT_RETRY_DELAY,
         result_log_destination: object = MANAGED_DESTINATION,
         opponent_picker: OpponentPicker | None = None,
+        session_manager: GameSessionManager | None = None,
     ) -> None:
+        self._session_manager = session_manager
         self._live_client_builder = live_client_builder or (
             lambda endpoint, log: DragonArenaClient(
                 endpoint,
@@ -185,6 +188,11 @@ class ArenaService:
                 log_server_messages=False,
                 business_log=None,
                 task="dragon_arena",
+                session=(
+                    self._session_manager.session_for(endpoint)
+                    if self._session_manager is not None
+                    else None
+                ),
             )
         )
         self._kickout_retry_delay = kickout_retry_delay

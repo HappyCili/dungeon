@@ -5,6 +5,8 @@ from typing import Any, Callable
 
 from flask import Flask
 
+from game_session import GameSessionManager
+
 from .config_store import ConfigStore
 from .credentials import CredentialStore, KeyringCredentialStore
 from .job_manager import JobManager
@@ -33,6 +35,7 @@ def create_app(
     treasure_service: TreasureService | None = None,
     dungeon_service: DungeonService | None = None,
     abyss_service: AbyssService | None = None,
+    game_session_manager: GameSessionManager | None = None,
 ) -> Flask:
     app = Flask(__name__)
     app.config.from_mapping(
@@ -46,19 +49,29 @@ def create_app(
     settings_path = config_path or PROJECT_ROOT / "config" / "ui-settings.json"
     config_store = ConfigStore(settings_path)
     credentials = credential_store or KeyringCredentialStore()
+    session_manager = game_session_manager or GameSessionManager(timeout=15.0)
     account = (
         account_service_factory(config_store, credentials)
         if account_service_factory is not None
-        else AccountService(config_store, credentials)
+        else AccountService(
+            config_store,
+            credentials,
+            session_manager=session_manager,
+        )
     )
     services = {
         "config_store": config_store,
         "account": account,
-        "daily": daily_service or DailyService(),
-        "arena": arena_service or ArenaService(),
-        "treasure": treasure_service or TreasureService(),
-        "dungeon": dungeon_service or DungeonService(),
-        "abyss": abyss_service or AbyssService(),
+        "game_session": session_manager,
+        "daily": daily_service
+        or DailyService(session_manager=session_manager),
+        "arena": arena_service
+        or ArenaService(session_manager=session_manager),
+        "treasure": treasure_service
+        or TreasureService(session_manager=session_manager),
+        "dungeon": dungeon_service
+        or DungeonService(session_manager=session_manager),
+        "abyss": abyss_service or AbyssService(session_manager=session_manager),
         "jobs": job_manager or JobManager(),
     }
     app.extensions["daily_console"] = services

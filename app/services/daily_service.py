@@ -9,6 +9,7 @@ from daily_actions import (
     build_live_daily_action_runner,
 )
 from daily_quest import DailyQuestStatus
+from game_session import GameSessionManager
 from harvest_fief import GameEndpoint
 from id_descriptions import activity_reward_name
 
@@ -30,11 +31,17 @@ class DailyService:
         *,
         live_runner_builder: LiveRunnerBuilder | None = None,
         game_timeout: float = 15.0,
+        session_manager: GameSessionManager | None = None,
     ) -> None:
         self._lock = threading.RLock()
         self._runner: DailyActionRunner | None = None
+        self._session_manager = session_manager
         self._live_runner_builder = live_runner_builder or (
-            lambda endpoint: build_live_daily_action_runner(endpoint, game_timeout)
+            lambda endpoint: build_live_daily_action_runner(
+                endpoint,
+                game_timeout,
+                session_manager=self._session_manager,
+            )
         )
         self._results = {task.task_id: "等待" for task in DAILY_TASKS}
 

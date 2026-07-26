@@ -11,7 +11,7 @@ from pathlib import Path
 
 import socket
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable
 
 from harvest_fief import (
@@ -95,6 +95,9 @@ class TreasureAreaStatus:
     area_ids: tuple[int, ...]
     has_pending_results: bool = False
     sweep_loot: TreasureSweepLoot | None = None
+    # ``get_status`` confirms an unread result before returning fresh state.
+    # Preserve that result separately so callers can show/log the acknowledgement.
+    cleared_sweep_loot: TreasureSweepLoot | None = None
 
     @property
     def sweep_remaining(self) -> int:
@@ -238,27 +241,31 @@ def decode_treasure_sweep_response(data: bytes) -> TreasureSweepResponse:
 
 
 class TreasureAreaClient:
-    """短生命周期的聚宝之地查询与扫荡会话。"""
+    """聚宝之地查询与扫荡会话；可注入共享 GameSession。"""
 
     def __init__(
         self,
         endpoint: GameEndpoint,
         timeout: float,
         *,
+        session: object | None = None,
         socket_factory: Callable[[str, float], NativeWebSocket] = NativeWebSocket.connect,
         websocket_log: Path | bool | None = True,
     ) -> None:
         self.endpoint = endpoint
         self.timeout = timeout
+        self._session = session
+        self._owns_connection = session is None
         self.socket_factory = socket_factory
         self.socket: NativeWebSocket | None = None
         self.password: str | None = None
-        bind_traffic_logging(
-            self,
-            task="treasure_area",
-            path=websocket_log,
-            error_cls=TreasureAreaError,
-        )
+        if self._owns_connection:
+            bind_traffic_logging(
+                self,
+                task="treasure_area",
+                path=websocket_log,
+                error_cls=TreasureAreaError,
+            )
 
     def __enter__(self) -> "TreasureAreaClient":
         self.login()
@@ -268,11 +275,21 @@ class TreasureAreaClient:
         self.close()
 
     def close(self) -> None:
+        if not self._owns_connection:
+            self.socket = None
+            return
         if self.socket is not None:
             self.socket.close()
             self.socket = None
 
     def _send_message(self, message_id: int, data: bytes = b"", *, encrypted: bool) -> None:
+        if self._session is not None:
+            try:
+                self._session.send_message(message_id, data, encrypted=encrypted)
+            except Exception as exc:
+                raise TreasureAreaError(str(exc)) from exc
+            self.password = getattr(self._session, "password", None)
+            return
         if self.socket is None:
             raise TreasureAreaError("WebSocket 尚未连接")
         packet = encode_message_header(message_id, data)
@@ -291,6 +308,14 @@ class TreasureAreaClient:
         return decode_message_header(payload)
 
     def _receive_header(self, deadline: float, context: str) -> MessageHeader:
+        if self._session is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TreasureAreaError(f"等待{context}超时")
+            try:
+                return self._session.receive_header(remaining)
+            except Exception as exc:
+                raise TreasureAreaError(str(exc)) from exc
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise TreasureAreaError(f"等待{context}超时")
@@ -321,7 +346,48 @@ class TreasureAreaClient:
             raise TreasureAreaError(f"游戏服终止聚宝之地会话：ret={ret}")
         return False
 
+    def _restore_shared_headers(self, headers: list[MessageHeader]) -> None:
+        """Put unrelated shared-session pushes back for their feature owner."""
+
+        if not headers or self._session is None:
+            return
+        push_headers = getattr(self._session, "push_headers", None)
+        if callable(push_headers):
+            push_headers(headers)
+            return
+        push_header = getattr(self._session, "push_header", None)
+        if callable(push_header):
+            for header in headers:
+                push_header(header)
+
+    def _wait_for_message(
+        self,
+        message_id: int,
+        deadline: float,
+        context: str,
+    ) -> MessageHeader:
+        """Wait for one response without dropping unrelated shared-session pushes."""
+
+        deferred: list[MessageHeader] = []
+        try:
+            while True:
+                header = self._receive_header(deadline, context)
+                if self._handle_common_message(header):
+                    continue
+                if header.message_id == message_id:
+                    return header
+                deferred.append(header)
+        finally:
+            self._restore_shared_headers(deferred)
+
     def login(self) -> None:
+        if self._session is not None:
+            try:
+                self._session.ensure_ready(self.endpoint)
+            except Exception as exc:
+                raise TreasureAreaError(str(exc)) from exc
+            self.password = getattr(self._session, "password", None)
+            return
         if self.socket is not None:
             return
         self.socket = self.socket_factory(self.endpoint.url, self.timeout)
@@ -357,25 +423,31 @@ class TreasureAreaClient:
         self.login()
         self._send_message(MAP_TREASURE_INFO_MESSAGE_ID, encrypted=True)
         deadline = time.monotonic() + self.timeout
-        while True:
-            header = self._receive_header(deadline, "Map_treasure_info 响应")
-            if self._handle_common_message(header):
-                continue
-            if header.message_id == MAP_TREASURE_INFO_MESSAGE_ID:
-                status = decode_treasure_area_status(header.data)
-                if not status.has_pending_results:
-                    return status
-                return self._clear_pending_results()
+        header = self._wait_for_message(
+            MAP_TREASURE_INFO_MESSAGE_ID,
+            deadline,
+            "Map_treasure_info 响应",
+        )
+        status = decode_treasure_area_status(header.data)
+        if not status.has_pending_results:
+            return status
+        return self._clear_pending_results(status.sweep_loot)
 
-    def _clear_pending_results(self) -> TreasureAreaStatus:
+    def _clear_pending_results(
+        self,
+        cleared_loot: TreasureSweepLoot | None,
+    ) -> TreasureAreaStatus:
         self._send_message(MAP_TREASURE_CLEAR_RESULT_MESSAGE_ID, encrypted=True)
         deadline = time.monotonic() + self.timeout
-        while True:
-            header = self._receive_header(deadline, "Map_treasure_clear_result 响应")
-            if self._handle_common_message(header):
-                continue
-            if header.message_id == MAP_TREASURE_CLEAR_RESULT_MESSAGE_ID:
-                return decode_treasure_area_status(header.data)
+        header = self._wait_for_message(
+            MAP_TREASURE_CLEAR_RESULT_MESSAGE_ID,
+            deadline,
+            "Map_treasure_clear_result 响应",
+        )
+        return replace(
+            decode_treasure_area_status(header.data),
+            cleared_sweep_loot=cleared_loot,
+        )
 
     def sweep(self, area_id: int, times: int) -> TreasureSweepResponse:
         self.login()
@@ -385,14 +457,14 @@ class TreasureAreaClient:
             encrypted=True,
         )
         deadline = time.monotonic() + self.timeout
-        while True:
-            header = self._receive_header(deadline, "Map_treasure_sweep 响应")
-            if self._handle_common_message(header):
-                continue
-            if header.message_id == MAP_TREASURE_SWEEP_MESSAGE_ID:
-                response = decode_treasure_sweep_response(header.data)
-                if response.ret != 0:
-                    raise TreasureAreaRejected(response.ret)
-                if response.status is None:
-                    raise TreasureAreaError("聚宝之地扫荡成功响应缺少最新状态")
-                return response
+        header = self._wait_for_message(
+            MAP_TREASURE_SWEEP_MESSAGE_ID,
+            deadline,
+            "Map_treasure_sweep 响应",
+        )
+        response = decode_treasure_sweep_response(header.data)
+        if response.ret != 0:
+            raise TreasureAreaRejected(response.ret)
+        if response.status is None:
+            raise TreasureAreaError("聚宝之地扫荡成功响应缺少最新状态")
+        return response

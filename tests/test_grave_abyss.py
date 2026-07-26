@@ -91,6 +91,43 @@ class GraveAbyssCodecTests(unittest.TestCase):
         self.assertEqual(status.pass_level, 1)
         self.assertEqual(status.next_level, 2)
 
+    def test_last_passes_canselect_not_last_plus_one(self) -> None:
+        """本赛季 passes=0 时不得挑战 lastPasses+1，应对齐 canselect 上限。
+
+        线上日志：lastPasses=30031（canselect=25）时误开 30032 → ret=2。
+        """
+
+        floors = (
+            GraveFloor(30001, 3, 1, "罪者深渊-1", 68, 1, 1),
+            GraveFloor(30020, 3, 20, "罪者深渊-20", 68, 1, 15),
+            GraveFloor(30025, 3, 25, "罪者深渊-25", 68, 1, 20),
+            GraveFloor(30031, 3, 31, "罪者深渊-31", 68, 1, 25),
+            GraveFloor(30032, 3, 32, "罪者深渊-32", 68, 1, 25),
+        )
+        next_id = resolve_next_challenge_id(
+            GraveActivityState(passes={3: 0}, last_passes={3: 30031}),
+            floors,
+        )
+        self.assertEqual(next_id, 30025)
+
+        real = load_abyss_floors()
+        self.assertEqual(
+            resolve_next_challenge_id(
+                GraveActivityState(passes={3: 0}, last_passes={3: 30031}),
+                real,
+            ),
+            30025,
+        )
+        status = build_abyss_status(
+            GraveActivityState(
+                passes={3: 0}, last_passes={3: 30031}, season=1024
+            ),
+            real,
+        )
+        self.assertEqual(status.pass_level, 0)
+        self.assertEqual(status.next_level, 25)
+        self.assertEqual(status.next_id, 30025)
+
     def test_battle_end_and_buff(self) -> None:
         win, code, rnd = decode_battle_end_result(
             encode_int_field(1, 12)

@@ -629,22 +629,30 @@ class AdventurerGuildClient:
         endpoint: GameEndpoint,
         timeout: float,
         *,
+        session: object | None = None,
         socket_factory: Callable[[str, float], NativeWebSocket] = NativeWebSocket.connect,
         websocket_log: Path | bool | None = True,
     ) -> None:
+        from game_session import bind_shared_session
+
         self.endpoint = endpoint
         self.timeout = timeout
         self.socket_factory = socket_factory
         self.socket: NativeWebSocket | None = None
         self.password: str | None = None
-        bind_traffic_logging(
+        bind_shared_session(
             self,
-            task="adventurer_guild",
-            path=websocket_log,
+            session,  # type: ignore[arg-type]
             error_cls=HarvestError,
+            task="adventurer_guild",
+            websocket_log=websocket_log,
         )
 
     def _send_message(self, message_id: int, data: bytes = b"", *, encrypted: bool) -> None:
+        from game_session import session_send_message
+
+        if session_send_message(self, message_id, data, encrypted=encrypted):
+            return
         if self.socket is None:
             raise HarvestError("WebSocket 尚未连接")
         packet = encode_message_header(message_id, data)
@@ -663,6 +671,12 @@ class AdventurerGuildClient:
         return decode_message_header(payload)
 
     def _receive_header(self, deadline: float, context: str) -> MessageHeader:
+        from game_session import try_session_receive_header
+
+        handled, header = try_session_receive_header(self, deadline, context)
+        if handled:
+            assert header is not None
+            return header
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise HarvestError(f"等待{context}超时")
@@ -691,6 +705,14 @@ class AdventurerGuildClient:
         return False
 
     def _login_and_read_state(self) -> TavernState:
+        from game_session import try_session_ensure_ready
+
+        if try_session_ensure_ready(self, self.endpoint):
+            game_data = getattr(self._session, "game_data", None)
+            if not game_data:
+                raise HarvestError("未收到冒险者公会 Game_data")
+            return decode_tavern_state_from_game_data(bytes(game_data))
+
         self.socket = self.socket_factory(self.endpoint.url, self.timeout)
         self._send_message(
             LOGIN_MESSAGE_ID,
@@ -994,8 +1016,11 @@ class AdventurerGuildClient:
                 stop_reason="policy_complete",
             )
         finally:
-            if self.socket is not None:
+            from game_session import shared_close
+
+            if shared_close(self) and self.socket is not None:
                 self.socket.close()
+                self.socket = None
 
 
 def _param_log(param: TavernRefreshParam) -> dict[str, object]:

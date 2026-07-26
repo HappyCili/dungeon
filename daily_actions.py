@@ -17,6 +17,7 @@ from daily_quest import (
     DailyQuestStatus,
     load_daily_catalog,
 )
+from game_session import GameSession, GameSessionManager
 from harvest_fief import GameEndpoint, HarvestError
 
 
@@ -86,7 +87,11 @@ class DailyAction(Protocol):
 
 
 class DailyQuestGateway:
-    """为每次状态查询创建短生命周期的日常任务会话。"""
+    """日常状态网关。
+
+    注入共享 ``GameSession`` 时复用同一连接；否则每次查询使用短生命周期会话
+    （CLI / 测试兼容）。
+    """
 
     def __init__(self, client_factory: Callable[[], DailyQuestClient]) -> None:
         self._client_factory = client_factory
@@ -278,6 +283,24 @@ def _guild_stop_label(stop_reason: str) -> str:
     return stop_reason
 
 
+def _make_feature_client(
+    factory: Callable[..., object],
+    endpoint: GameEndpoint,
+    timeout: float,
+    *,
+    session: GameSession | None = None,
+    **kwargs: object,
+) -> object:
+    """Construct a feature client, tolerating fakes without ``session=``."""
+
+    if session is not None:
+        try:
+            return factory(endpoint, timeout, session=session, **kwargs)
+        except TypeError:
+            pass
+    return factory(endpoint, timeout, **kwargs)
+
+
 def run_adventurer_guild_action(
     endpoint: GameEndpoint,
     timeout: float,
@@ -285,6 +308,7 @@ def run_adventurer_guild_action(
     *,
     client_factory: Callable[..., object] | None = None,
     catalog: object | None = None,
+    session: GameSession | None = None,
 ) -> ActionExecution:
     """按日常剩余次数刷新，发现 SS 时由现有策略立即停止。
 
@@ -309,7 +333,9 @@ def run_adventurer_guild_action(
             DEFAULT_REFRESH_FEE_TABLE,
         )
     factory = client_factory or AdventurerGuildClient
-    result = factory(endpoint, timeout).run_daily(
+    result = _make_feature_client(
+        factory, endpoint, timeout, session=session
+    ).run_daily(
         catalog,
         max_refreshes=remaining,
         target_refreshes=remaining,
@@ -337,13 +363,16 @@ def run_arcane_tower_action(
     remaining: int,
     *,
     client_factory: Callable[..., object] | None = None,
+    session: GameSession | None = None,
 ) -> ActionExecution:
     if remaining <= 0:
         return ActionExecution(0, 0, "无需执行秘法塔探索")
     from explore_arcane_tower_daily_free import ArcaneTowerClient, RESULT_SUCCESS
 
     factory = client_factory or ArcaneTowerClient
-    result = factory(endpoint, timeout).explore_daily_free(max_attempts=remaining)
+    result = _make_feature_client(
+        factory, endpoint, timeout, session=session
+    ).explore_daily_free(max_attempts=remaining)
     attempts = len(result.attempts)
     succeeded = sum(attempt.response.result == RESULT_SUCCESS for attempt in result.attempts)
     if attempts == 0:
@@ -359,6 +388,7 @@ def run_smithy_forge_action(
     remaining: int,
     *,
     client_factory: Callable[..., object] | None = None,
+    session: GameSession | None = None,
 ) -> ActionExecution:
     """日常 103：铁匠铺普通锻造，按服务端剩余次数补足。"""
 
@@ -374,7 +404,9 @@ def run_smithy_forge_action(
     )
 
     factory = client_factory or SmithyForgeClient
-    result = factory(endpoint, timeout).forge_for_daily(max_times=remaining)
+    result = _make_feature_client(
+        factory, endpoint, timeout, session=session
+    ).forge_for_daily(max_times=remaining)
     forged = forged_count(result)
     stop_reason = getattr(result, "stop_reason", "") or ""
     stop_label = stop_reason_label(stop_reason) if stop_reason else ""
@@ -395,6 +427,7 @@ def run_fief_harvest_action(
     remaining: int,
     *,
     client_factory: Callable[..., object] | None = None,
+    session: GameSession | None = None,
 ) -> ActionExecution:
     """普通庄园收取只接受日常所需的 0..2 次。"""
 
@@ -412,9 +445,17 @@ def run_fief_harvest_action(
     factory = client_factory or FiefClient
     results: list[object] = []
     requested_count = min(remaining, FIEF_NORMAL_HARVESTS_PER_RUN)
+
+    def _make_client() -> object:
+        try:
+            return factory(endpoint, timeout, session=session)
+        except TypeError:
+            # Test fakes may not accept session=.
+            return factory(endpoint, timeout)
+
     for attempt_number in range(1, requested_count + 1):
         try:
-            results.append(factory(endpoint, timeout).harvest(HARVEST_NORMAL))
+            results.append(_make_client().harvest(HARVEST_NORMAL))
         except FiefHarvestRejected as exc:
             return ActionExecution(
                 requested_count,
@@ -441,6 +482,7 @@ def run_fief_quick_harvest_action(
     *,
     client_factory: Callable[..., object] | None = None,
     allow_pay: bool = False,
+    session: GameSession | None = None,
 ) -> ActionExecution:
     """日常 106：庄园快速收取。
 
@@ -463,9 +505,16 @@ def run_fief_quick_harvest_action(
     factory = client_factory or FiefClient
     requested_count = min(remaining, FIEF_QUICK_HARVESTS_PER_RUN)
     attempted = 0
+
+    def _make_client() -> object:
+        try:
+            return factory(endpoint, timeout, session=session)
+        except TypeError:
+            return factory(endpoint, timeout)
+
     for attempt_number in range(1, requested_count + 1):
         try:
-            factory(endpoint, timeout).harvest(HARVEST_FREE)
+            _make_client().harvest(HARVEST_FREE)
             attempted += 1
         except FiefHarvestRejected as free_exc:
             if free_exc.ret != 1 or not allow_pay:
@@ -476,7 +525,7 @@ def run_fief_quick_harvest_action(
                     f"{describe_fief_harvest_rejection(free_exc.ret)}",
                 )
             try:
-                factory(endpoint, timeout).harvest(HARVEST_PAY)
+                _make_client().harvest(HARVEST_PAY)
                 attempted += 1
             except FiefHarvestRejected as pay_exc:
                 return ActionExecution(
@@ -511,6 +560,7 @@ def run_knight_arena_action(
     *,
     client_factory: Callable[..., object] | None = None,
     refresh_on_exhaustion: bool = True,
+    session: GameSession | None = None,
 ) -> ActionExecution:
     """执行日常任务 109：在骑士比武完成 ``remaining`` 次挑战。
 
@@ -522,14 +572,19 @@ def run_knight_arena_action(
     from knight_arena import KnightArenaClient
 
     factory = client_factory or KnightArenaClient
-    client = factory(
-        endpoint,
-        timeout,
-        log=lambda _message: None,
-        log_server_messages=False,
-        business_log=None,
-        task="knight_arena",
-    )
+    client_kwargs: dict = {
+        "log": lambda _message: None,
+        "log_server_messages": False,
+        "business_log": None,
+        "task": "knight_arena",
+    }
+    if session is not None:
+        client_kwargs["session"] = session
+    try:
+        client = factory(endpoint, timeout, **client_kwargs)
+    except TypeError:
+        client_kwargs.pop("session", None)
+        client = factory(endpoint, timeout, **client_kwargs)
     try:
         enter = getattr(client, "__enter__", None)
         if callable(enter):
@@ -567,6 +622,7 @@ def run_dragon_arena_action(
     mercy_choice_id: int | None = None,
     outcome: str = "mercy",
     refresh_on_exhaustion: bool = True,
+    session: GameSession | None = None,
 ) -> ActionExecution:
     """执行日常任务 112：在龙痕竞技场取得 ``remaining`` 场胜利。
 
@@ -585,14 +641,19 @@ def run_dragon_arena_action(
         outcome=None if (win_choice_id is not None or mercy_choice_id is not None) else outcome,
     )
     # 不向页面回显服务端报文；原始 WebSocket 帧默认写入 logs/websocket_raw/。
-    client = factory(
-        endpoint,
-        timeout,
-        log=lambda _message: None,
-        log_server_messages=False,
-        business_log=None,
-        task="dragon_arena",
-    )
+    client_kwargs: dict = {
+        "log": lambda _message: None,
+        "log_server_messages": False,
+        "business_log": None,
+        "task": "dragon_arena",
+    }
+    if session is not None:
+        client_kwargs["session"] = session
+    try:
+        client = factory(endpoint, timeout, **client_kwargs)
+    except TypeError:
+        client_kwargs.pop("session", None)
+        client = factory(endpoint, timeout, **client_kwargs)
     try:
         enter = getattr(client, "__enter__", None)
         if callable(enter):
@@ -626,6 +687,7 @@ def run_ancient_law_court_action(
     remaining: int,
     *,
     client_factory: Callable[..., object] | None = None,
+    session: GameSession | None = None,
 ) -> ActionExecution:
     if remaining <= 0:
         return ActionExecution(0, 0, "无需执行古律院铭刻")
@@ -640,7 +702,9 @@ def run_ancient_law_court_action(
     )
 
     factory = client_factory or AncientLawCourtClient
-    result = factory(endpoint, timeout).engrave_daily_free(max_attempts=remaining)
+    result = _make_feature_client(
+        factory, endpoint, timeout, session=session
+    ).engrave_daily_free(max_attempts=remaining)
     attempts = len(result.attempts)
     verified = sum(
         attempt.response.result == RESULT_SUCCESS and attempt.safety_verified
@@ -668,37 +732,63 @@ def build_live_daily_action_runner(
     *,
     catalog: DailyCatalog | None = None,
     status_client_factory: Callable[[], DailyQuestClient] | None = None,
+    session: GameSession | None = None,
+    session_manager: GameSessionManager | None = None,
 ) -> DailyActionRunner:
-    """构造真实客户端编排器；调用者显式提供已解析的游戏服入口。"""
+    """构造真实客户端编排器；调用者显式提供已解析的游戏服入口。
+
+    传入 ``session`` 或 ``session_manager`` 时，状态查询与已支持 session 的
+    日常动作复用同一条游戏服 WebSocket（对齐原生 SocketManager）。
+    """
 
     daily_catalog = catalog or load_daily_catalog()
+    shared: GameSession | None = session
+    if shared is None and session_manager is not None:
+        shared = session_manager.session_for(endpoint)
+
     status_factory = status_client_factory or (
-        lambda: DailyQuestClient(endpoint, timeout)
+        lambda: DailyQuestClient(endpoint, timeout, session=shared)
     )
     actions: dict[int, DailyAction] = {
         101: CallableDailyAction(
-            lambda remaining: run_adventurer_guild_action(endpoint, timeout, remaining)
+            lambda remaining: run_adventurer_guild_action(
+                endpoint, timeout, remaining, session=shared
+            )
         ),
         103: CallableDailyAction(
-            lambda remaining: run_smithy_forge_action(endpoint, timeout, remaining)
+            lambda remaining: run_smithy_forge_action(
+                endpoint, timeout, remaining, session=shared
+            )
         ),
         104: CallableDailyAction(
-            lambda remaining: run_arcane_tower_action(endpoint, timeout, remaining)
+            lambda remaining: run_arcane_tower_action(
+                endpoint, timeout, remaining, session=shared
+            )
         ),
         105: CallableDailyAction(
-            lambda remaining: run_fief_harvest_action(endpoint, timeout, remaining)
+            lambda remaining: run_fief_harvest_action(
+                endpoint, timeout, remaining, session=shared
+            )
         ),
         106: CallableDailyAction(
-            lambda remaining: run_fief_quick_harvest_action(endpoint, timeout, remaining)
+            lambda remaining: run_fief_quick_harvest_action(
+                endpoint, timeout, remaining, session=shared
+            )
         ),
         109: CallableDailyAction(
-            lambda remaining: run_knight_arena_action(endpoint, timeout, remaining)
+            lambda remaining: run_knight_arena_action(
+                endpoint, timeout, remaining, session=shared
+            )
         ),
         112: CallableDailyAction(
-            lambda remaining: run_dragon_arena_action(endpoint, timeout, remaining)
+            lambda remaining: run_dragon_arena_action(
+                endpoint, timeout, remaining, session=shared
+            )
         ),
         119: CallableDailyAction(
-            lambda remaining: run_ancient_law_court_action(endpoint, timeout, remaining)
+            lambda remaining: run_ancient_law_court_action(
+                endpoint, timeout, remaining, session=shared
+            )
         ),
     }
     return DailyActionRunner(DailyQuestGateway(status_factory), daily_catalog, actions)

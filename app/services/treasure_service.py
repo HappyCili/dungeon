@@ -3,6 +3,7 @@ from __future__ import annotations
 import uuid
 from typing import Any, Callable
 
+from game_session import GameSessionManager
 from harvest_fief import GameEndpoint, HarvestError, ItemChange
 from id_descriptions import item_name, treasure_area_name
 from logging_store import MANAGED_DESTINATION, LogPersistenceError, write_standard_log
@@ -154,6 +155,8 @@ def format_farm_summary(progress: FarmProgress, *, cancelled: bool = False) -> s
         f"普通宝箱 {progress.small_chests_opened} · "
         f"大宝箱 {progress.big_chests_opened} · "
         f"{progress.key_item_name} {progress.keys_total} · "
+        f"已结算怪物 {progress.settled_monsters}（无钥匙 {progress.no_key_monsters}）· "
+        f"缺炉温宝箱 {progress.missing_hearth_chests} · "
         f"阶段 {progress.phase_label if hasattr(progress, 'phase_label') else progress.phase}"
     )
 
@@ -168,12 +171,30 @@ class TreasureService:
         farm_client_builder: FarmClientBuilder | None = None,
         game_timeout: float = 15.0,
         result_log_destination: object = MANAGED_DESTINATION,
+        session_manager: GameSessionManager | None = None,
     ) -> None:
+        self._session_manager = session_manager
         self._live_client_builder = live_client_builder or (
-            lambda endpoint: TreasureAreaClient(endpoint, game_timeout)
+            lambda endpoint: TreasureAreaClient(
+                endpoint,
+                game_timeout,
+                session=(
+                    self._session_manager.session_for(endpoint)
+                    if self._session_manager is not None
+                    else None
+                ),
+            )
         )
         self._farm_client_builder = farm_client_builder or (
-            lambda endpoint: TreasureFarmClient(endpoint, game_timeout)
+            lambda endpoint: TreasureFarmClient(
+                endpoint,
+                game_timeout,
+                session=(
+                    self._session_manager.session_for(endpoint)
+                    if self._session_manager is not None
+                    else None
+                ),
+            )
         )
         self._result_log_destination = result_log_destination
 
@@ -324,6 +345,9 @@ class TreasureService:
             "key_item_name": farm.get("key_item_name"),
             "keys_total": farm.get("keys_total"),
             "monsters_killed": farm.get("monsters_killed"),
+            "settled_monsters": farm.get("settled_monsters"),
+            "no_key_monsters": farm.get("no_key_monsters"),
+            "missing_hearth_chests": farm.get("missing_hearth_chests"),
             "small_chests_opened": farm.get("small_chests_opened"),
             "big_chests_opened": farm.get("big_chests_opened"),
             "phase": farm.get("phase"),
@@ -333,7 +357,8 @@ class TreasureService:
             "current_node_kind": farm.get("current_node_kind"),
             "last_reward_item_name": farm.get("last_reward_item_name"),
             "last_reward_delta": farm.get("last_reward_delta"),
-            "resets": farm.get("resets"),
+            "last_transition": farm.get("last_transition"),
+            "last_reset_reason": farm.get("last_reset_reason"),
             "completed": farm.get("completed"),
             "cancelled": cancelled,
             "failed": failed,
@@ -359,7 +384,45 @@ class TreasureService:
             status = client.get_status()
         finally:
             client.close()
-        return self.payload(status, selected_area_id)
+        payload = self.payload(status, selected_area_id)
+        if status.cleared_sweep_loot is not None:
+            self._persist_cleared_sweep_result(
+                zone=_zone_from_endpoint(endpoint),
+                loot=status.cleared_sweep_loot,
+            )
+        return payload
+
+    def _persist_cleared_sweep_result(
+        self,
+        *,
+        zone: dict[str, str],
+        loot: TreasureSweepLoot,
+    ) -> None:
+        """Record an automatic sweep-result acknowledgement without credentials."""
+
+        if self._result_log_destination is None:
+            return
+        rewards = self.reward_payload(loot)
+        area_id = loot.area_id if loot.area_id > 0 else None
+        details = {
+            "area_id": area_id,
+            "area_name": treasure_area_name(area_id) if area_id else "",
+            "rewards": rewards,
+            "summary": format_loot_summary(rewards),
+            "acknowledged_while_refreshing_status": True,
+        }
+        try:
+            write_standard_log(
+                event="treasure_area",
+                operation="clear_result",
+                zone=zone,
+                details=details,
+                destination=self._result_log_destination,
+                outcome="success",
+                level="info",
+            )
+        except LogPersistenceError:
+            pass
 
     def run(
         self,
@@ -580,6 +643,17 @@ class TreasureService:
     @staticmethod
     def payload(status: TreasureAreaStatus, selected_area_id: int) -> dict[str, Any]:
         remaining = status.sweep_remaining
+        cleared_loot = status.cleared_sweep_loot
+        cleared_area_id = (
+            cleared_loot.area_id
+            if cleared_loot is not None and cleared_loot.area_id > 0
+            else None
+        )
+        cleared_rewards = (
+            TreasureService.reward_payload(cleared_loot)
+            if cleared_loot is not None
+            else []
+        )
         return {
             "areas": [
                 {
@@ -594,6 +668,21 @@ class TreasureService:
                 "limit": status.daily_sweep_limit,
                 "available": remaining,
                 "request_limit": min(remaining, MAX_SWEEP_TIMES_PER_REQUEST),
+            },
+            "cleared_result": {
+                "acknowledged": cleared_loot is not None,
+                "area_id": cleared_area_id,
+                "area_name": (
+                    treasure_area_name(cleared_area_id)
+                    if cleared_area_id is not None
+                    else ""
+                ),
+                "rewards": cleared_rewards,
+                "summary": (
+                    format_loot_summary(cleared_rewards)
+                    if cleared_loot is not None
+                    else ""
+                ),
             },
         }
 

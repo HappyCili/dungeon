@@ -1219,6 +1219,11 @@ class DragonArenaClient:
     def close(self) -> None:
         if not self._owns_connection:
             # Shared GameSession is closed by GameSessionManager / account lifecycle.
+            pending = tuple(self._queued_headers)
+            self._queued_headers.clear()
+            push_headers = getattr(self._session, "push_headers", None)
+            if pending and callable(push_headers):
+                push_headers(pending)
             return
         self.websocket.close()
 
@@ -1594,7 +1599,9 @@ class DragonArenaClient:
 
     def login(self) -> None:
         if self._session is not None:
-            self._session.ensure_ready(self.endpoint)
+            from game_session import try_session_ensure_ready
+
+            try_session_ensure_ready(self, self.endpoint)
             game_data = getattr(self._session, "game_data", None)
             if game_data:
                 self._remember_header(

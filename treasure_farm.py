@@ -171,6 +171,8 @@ HEARTH_ITEM_ID = 25
 TREASURE_TICKET_ITEM_ID = 1800
 SMALL_CHEST_KEY_COST = 1
 BIG_CHEST_KEY_COST = 5
+# Keep spending accumulated map keys before collecting more from monsters.
+CHEST_ONLY_KEY_THRESHOLD = 20
 
 
 def chest_key_cost(node_kind: str) -> int:
@@ -1764,6 +1766,8 @@ def choose_next_action(
     - 普通宝箱需 ``keys >= 1``，大宝箱需 ``keys >= 5``；
     - 钥匙不足时 **绝不** 返回宝箱节点，只返回可击杀小怪/Boss；
     - 钥匙够时优先开箱（可 ``prefer_big_chest``），再打怪。
+    - 钥匙严格大于 ``CHEST_ONLY_KEY_THRESHOLD`` 时，只返回可开启的宝箱；
+      当前没有可开启宝箱则返回 ``None``，由刷取循环回主城后重新进图。
 
     仅选择服务端 ``locs`` 中明确为 ACTIVE/OPEN 的节点，避免对未激活
     地标发 ``Map_processloc``（会触发 ret=2「已有地标激活」或空结算）。
@@ -1792,6 +1796,7 @@ def choose_next_action(
         and bool(big)
     )
     can_small = key_count >= SMALL_CHEST_KEY_COST and bool(small)
+    chest_only_mode = key_count > CHEST_ONLY_KEY_THRESHOLD
 
     # 钥匙足够：优先开箱拿炉温
     if prefer_big_chest and can_big:
@@ -1800,6 +1805,8 @@ def choose_next_action(
         return small[0]
     if can_big:
         return big[0]
+    if chest_only_mode:
+        return None
     # 钥匙不足或无可开宝箱：只能先击杀小怪/Boss 拿钥匙
     if monsters:
         return monsters[0]
@@ -1913,6 +1920,11 @@ class TreasureFarmClient:
         self._last_confirmed_key_option: EventOptionEntry | None = None
         # Only a currently selected farm node may auto-confirm a title/cost option.
         self._active_event_context: dict[str, object] | None = None
+        # Set only by the shared-session recovery coordinator.  A previous
+        # process can leave a post-battle map event without its local node
+        # context, so this mode accepts only the same no-cost continuation
+        # buttons the normal monster flow already recognizes.
+        self._login_recovery_mode = False
         self._preferred_event_item_ids: frozenset[int] = frozenset(
             entry.key_item_id
             for entry in list_treasure_map_catalog()
@@ -2029,6 +2041,12 @@ class TreasureFarmClient:
                         min_keys=chest_key_cost(node_kind),
                     )
                 elif node_kind == NODE_KIND_MONSTER:
+                    chosen = (
+                        start.choose_take_key_option()
+                        or start.choose_touch_magic_circle_option()
+                        or start.choose_battle_continue_option()
+                    )
+                elif self._login_recovery_mode and self._curarea > 0:
                     chosen = (
                         start.choose_take_key_option()
                         or start.choose_touch_magic_circle_option()
@@ -3652,6 +3670,41 @@ class TreasureFarmClient:
                 saw_activity = True
         return saw_activity
 
+    def resume_login_recovery(self, *, timeout: float = 45.0) -> bool:
+        """Resume a map-owned login residue before another feature starts.
+
+        This intentionally does not probe a new landmark.  It only consumes
+        packets already restored by the server, sends the native stage-ready
+        sequence when needed, and advances known no-choice event continuations.
+        A remaining dialog is left visible to the shared recovery coordinator.
+        """
+
+        self._login_recovery_mode = True
+        try:
+            self.login()
+            phase = self.classify_phase()
+            progressed = False
+            if phase in (
+                PHASE_BATTLE_RECOVERY,
+                PHASE_BATTLE_PREPARE,
+                PHASE_BATTLE_RUNNING,
+                PHASE_LANDMARK_LOCKED,
+            ):
+                progressed = self.recover_from_landmark_lock(timeout=timeout)
+            if self._event_chain_active or self._pending_event_start or self._pending_event_action:
+                progressed = (
+                    self.clear_pending_map_activity(timeout=min(12.0, timeout))
+                    or progressed
+                )
+            return progressed
+        finally:
+            self._login_recovery_mode = False
+
+    def has_pending_login_event(self) -> bool:
+        """Whether an event still requires a non-automatic player choice."""
+
+        return bool(self._pending_event_start or self._pending_event_action)
+
     def _move_trigger_ready(self) -> bool:
         trigger = self._move_trigger
         return bool(trigger is not None and trigger.active and trigger.remain == 0)
@@ -5119,6 +5172,7 @@ def run_treasure_farm(
         tracked_totals[entry.key_item_id] = live_keys
         last_actual_totals[entry.key_item_id] = live_keys
         keys = live_keys
+        chest_only_mode = keys > CHEST_ONLY_KEY_THRESHOLD
         action = choose_next_action(
             session,
             nodes,
@@ -5166,7 +5220,22 @@ def run_treasure_farm(
                     and int(nodeid) not in known_ids
                 )
             )
-            if leftover_server_ids:
+            if chest_only_mode:
+                reset_reason = "钥匙超过20且无可开宝箱，返回主城重进"
+                emit(
+                    "info",
+                    (
+                        f"{entry.name} 钥匙 {keys} 超过 "
+                        f"{CHEST_ONLY_KEY_THRESHOLD}，当前无可开宝箱，"
+                        "返回主城重新进入地图"
+                    ),
+                    {
+                        "farm": progress_payload(progress),
+                        "keys": keys,
+                        "chest_only_mode": True,
+                    },
+                )
+            elif leftover_server_ids:
                 emit(
                     "warning",
                     (
@@ -5193,7 +5262,9 @@ def run_treasure_farm(
                     f"{entry.name} 当前节点已耗尽，重置地图继续刷取",
                     {"farm": progress_payload(progress)},
                 )
-            session = reset_session("节点耗尽后重置")
+            session = reset_session(
+                reset_reason if chest_only_mode else "节点耗尽后重置"
+            )
             bind_key_inventory()
             stalled_rounds = 0
             continue

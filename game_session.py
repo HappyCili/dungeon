@@ -12,11 +12,12 @@ features.  This module provides the same lifecycle for the local console:
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import socket
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Iterable, Protocol
+from typing import Any, Callable, Iterable, Iterator, Protocol
 
 from harvest_fief import (
     HEARTBEAT_MESSAGE_ID,
@@ -43,9 +44,47 @@ from harvest_fief import (
 # Same id as daily_quest / dragon_arena; defined here to avoid import cycles.
 GAME_DATA_MESSAGE_ID = 10490
 KICKOUT_MESSAGE_ID = 10030
+LOGIN_OK_MESSAGE_ID = 10012
+
+# Login-time pushes that represent an unfinished server-side interaction.  These
+# are deliberately kept in the session layer instead of being owned by the
+# feature that happens to connect next.
+BATTLE_INFO_MESSAGE_ID = 18002
+BATTLE_UNIT_INFO_MESSAGE_ID = 18004
+BATTLE_OFFLINE_MESSAGE_ID = 18006
+BATTLE_S2C_START_MESSAGE_ID = 18012
+BATTLE_S2C_END_MESSAGE_ID = 18090
+BATTLE_S2C_FRAME_BROADCAST_MESSAGE_ID = 18500
+BATTLE_S2C_FRAME_HASH_VERIFY_MESSAGE_ID = 18502
+EVENT_START_MESSAGE_ID = 13300
+EVENT_OPTION_FAILED_MESSAGE_ID = 13310
+EVENT_END_MESSAGE_ID = 13315
+EVENT_FUNC_ACTION_MESSAGE_ID = 13320
+
+BATTLE_RECOVERY_OPEN_MESSAGE_IDS = frozenset(
+    {
+        BATTLE_INFO_MESSAGE_ID,
+        BATTLE_UNIT_INFO_MESSAGE_ID,
+        BATTLE_OFFLINE_MESSAGE_ID,
+        BATTLE_S2C_START_MESSAGE_ID,
+        BATTLE_S2C_FRAME_BROADCAST_MESSAGE_ID,
+        BATTLE_S2C_FRAME_HASH_VERIFY_MESSAGE_ID,
+    }
+)
+EVENT_RECOVERY_OPEN_MESSAGE_IDS = frozenset(
+    {
+        EVENT_START_MESSAGE_ID,
+        EVENT_OPTION_FAILED_MESSAGE_ID,
+        EVENT_FUNC_ACTION_MESSAGE_ID,
+    }
+)
 
 # Delay after Login_reunique before business traffic (native throwCachedMsg).
 POST_LOGIN_BUSINESS_DELAY_SECONDS = 0.1
+# Drain packets that the server already pushed during the native delay.  This is
+# intentionally short: feature-specific recovery may still issue its own probe
+# and wait for additional packets.
+POST_LOGIN_RECOVERY_DRAIN_SECONDS = 0.05
 
 SocketFactory = Callable[[str, float], "WebSocketTransport"]
 
@@ -74,6 +113,74 @@ class GameSessionKickout(GameSessionError):
         super().__init__(f"游戏服终止会话：ret={ret}{detail}")
 
 
+@dataclass(frozen=True)
+class SessionRecoveryIssue:
+    """One unfinished server-side state observed while establishing a session."""
+
+    kind: str
+    message_ids: tuple[int, ...] = ()
+    battle_state: int = 0
+    battle_type: int = 0
+
+    @property
+    def label(self) -> str:
+        if self.kind == "battle":
+            return "遗留战斗"
+        if self.kind == "event":
+            return "遗留地图事件/对话"
+        return self.kind
+
+
+@dataclass(frozen=True)
+class SessionRecoverySnapshot:
+    """Server-authoritative residual state retained from the login epoch."""
+
+    generation: int
+    game_data_present: bool
+    issues: tuple[SessionRecoveryIssue, ...]
+    observed_message_ids: tuple[int, ...] = ()
+
+    @property
+    def pending(self) -> bool:
+        return bool(self.issues)
+
+    @property
+    def message_ids(self) -> tuple[int, ...]:
+        seen: list[int] = []
+        for issue in self.issues:
+            for message_id in issue.message_ids:
+                if message_id not in seen:
+                    seen.append(message_id)
+        return tuple(seen)
+
+    def describe(self) -> str:
+        if not self.issues:
+            return "空闲"
+        parts: list[str] = []
+        for issue in self.issues:
+            suffix = ""
+            if issue.kind == "battle" and issue.battle_state:
+                suffix = (
+                    f"（battleState={issue.battle_state}，"
+                    f"battleType={issue.battle_type}）"
+                )
+            elif issue.message_ids:
+                suffix = "（消息=" + "、".join(str(mid) for mid in issue.message_ids) + "）"
+            parts.append(issue.label + suffix)
+        return "；".join(parts)
+
+
+class GameSessionRecoveryRequired(GameSessionError):
+    """A new task attempted to use a session before residual state was settled."""
+
+    def __init__(self, snapshot: SessionRecoverySnapshot) -> None:
+        self.snapshot = snapshot
+        super().__init__(
+            "游戏服存在未恢复状态："
+            f"{snapshot.describe()}；请先完成会话恢复后再执行新任务"
+        )
+
+
 def _decode_kickout(data: bytes) -> tuple[int, str]:
     ret = 0
     message = ""
@@ -83,6 +190,36 @@ def _decode_kickout(data: bytes) -> tuple[int, str]:
         elif field_number == 2 and wire_type == 2:
             message = bytes(value).decode("utf-8", errors="replace")
     return ret, message
+
+
+def _decode_login_battle_marker(data: bytes) -> tuple[int, int]:
+    """Return ``Game_data.field35.{battleState,battleType}`` when present.
+
+    This compact decode belongs in the shared layer because it is only a login
+    recovery marker.  Feature clients remain responsible for interpreting a
+    concrete battle type and sending any game-specific follow-up requests.
+    """
+
+    try:
+        battle_state = 0
+        battle_type = 0
+        for field_number, wire_type, value in ProtoReader(data).fields():
+            if field_number != 35 or wire_type != 2:
+                continue
+            for battle_field, battle_wire, battle_value in ProtoReader(bytes(value)).fields():
+                if battle_wire != 0:
+                    continue
+                if battle_field == 3:
+                    battle_state = decode_int32(int(battle_value))
+                elif battle_field == 4:
+                    battle_type = decode_int32(int(battle_value))
+            break
+        return battle_state, battle_type
+    except HarvestError:
+        # The snapshot contains many independently evolving tables.  A malformed
+        # or newer optional field must not make the shared transport unusable;
+        # feature handlers can still recover from concrete pushed packets.
+        return 0, 0
 
 
 def _endpoint_key(endpoint: GameEndpoint) -> tuple[str, str, str]:
@@ -113,6 +250,14 @@ class GameSession:
         self._queued: list[MessageHeader] = []
         self._traffic_logger: Any = None
         self._ws_session_id = str(time.time_ns())
+        self._recovery_generation = 0
+        self._recovery_battle_state = 0
+        self._recovery_battle_type = 0
+        self._recovery_battle_message_ids: list[int] = []
+        self._recovery_event_message_ids: list[int] = []
+        self._recovery_observed_message_ids: list[int] = []
+        self._recovery_scope_depth = 0
+        self._recovery_checked_generation = -1
 
     @property
     def ready(self) -> bool:
@@ -134,6 +279,153 @@ class GameSession:
     def transport(self) -> WebSocketTransport | None:
         return self._transport
 
+    @property
+    def recovery_snapshot(self) -> SessionRecoverySnapshot:
+        """Return the residual state observed for the current login epoch."""
+
+        with self._lock:
+            return self._recovery_snapshot_unlocked()
+
+    @property
+    def recovery_pending(self) -> bool:
+        return self.recovery_snapshot.pending
+
+    @property
+    def recovery_checked(self) -> bool:
+        with self._lock:
+            return self._recovery_checked_generation == self._recovery_generation
+
+    @contextmanager
+    def recovery_scope(self) -> Iterator["GameSession"]:
+        """Allow a registered recovery handler to send its continuation packets.
+
+        Normal feature requests are held while the login snapshot contains an
+        unfinished battle or event.  A recovery handler enters this scope after
+        it has been selected by the coordinator; heartbeats remain handled by
+        the session itself.
+        """
+
+        with self._lock:
+            self._recovery_scope_depth += 1
+        try:
+            yield self
+        finally:
+            with self._lock:
+                self._recovery_scope_depth -= 1
+
+    def resolve_recovery_issue(self, kind: str) -> None:
+        """Mark a handler-verified recovery branch complete.
+
+        This is only for states whose terminal acknowledgement is represented
+        outside the common battle/event message set.  Handlers normally rely on
+        ``Battle_S2C_end`` or ``Event_end`` to clear the state automatically.
+        """
+
+        with self._lock:
+            if self._recovery_scope_depth <= 0:
+                raise GameSessionError("只能在会话恢复处理器中确认恢复状态")
+            if kind == "battle":
+                self._clear_battle_recovery_unlocked()
+            elif kind == "event":
+                self._recovery_event_message_ids.clear()
+            else:
+                raise ValueError(f"未知恢复状态类型：{kind}")
+
+    def collect_recovery_messages(self) -> SessionRecoverySnapshot:
+        """Drain packets already available after login into the recovery snapshot.
+
+        A server may emit recovery packets just after ``Login_reunique``.  The
+        coordinator calls this inside ``recovery_scope`` before choosing a
+        handler; ordinary task code should never need to poll the transport as
+        a state probe.
+        """
+
+        with self._lock:
+            if not self._ready:
+                raise GameSessionError("游戏服会话尚未就绪（msgReady=false）")
+            self._drain_login_pushes_unlocked()
+            return self._recovery_snapshot_unlocked()
+
+    def mark_recovery_checked(self) -> None:
+        """Record that the coordinator settled this login generation."""
+
+        with self._lock:
+            snapshot = self._recovery_snapshot_unlocked()
+            if snapshot.pending:
+                raise GameSessionRecoveryRequired(snapshot)
+            self._recovery_checked_generation = self._recovery_generation
+
+    def _reset_recovery_state_unlocked(self) -> None:
+        self._recovery_generation += 1
+        self._recovery_checked_generation = -1
+        self._recovery_battle_state = 0
+        self._recovery_battle_type = 0
+        self._recovery_battle_message_ids.clear()
+        self._recovery_event_message_ids.clear()
+        self._recovery_observed_message_ids.clear()
+
+    @staticmethod
+    def _remember_message_id(target: list[int], message_id: int) -> None:
+        if message_id not in target:
+            target.append(message_id)
+
+    def _remember_game_data_unlocked(self, data: bytes) -> None:
+        self._game_data = data
+        battle_state, battle_type = _decode_login_battle_marker(data)
+        self._recovery_battle_state = battle_state
+        self._recovery_battle_type = battle_type
+
+    def _clear_battle_recovery_unlocked(self) -> None:
+        self._recovery_battle_state = 0
+        self._recovery_battle_type = 0
+        self._recovery_battle_message_ids.clear()
+
+    def _observe_recovery_header_unlocked(self, header: MessageHeader) -> None:
+        """Reduce one login/recovery packet into the shared residual snapshot."""
+
+        message_id = header.message_id
+        self._remember_message_id(self._recovery_observed_message_ids, message_id)
+        if message_id in BATTLE_RECOVERY_OPEN_MESSAGE_IDS:
+            self._remember_message_id(self._recovery_battle_message_ids, message_id)
+        elif message_id == BATTLE_S2C_END_MESSAGE_ID:
+            self._clear_battle_recovery_unlocked()
+
+        if message_id in EVENT_RECOVERY_OPEN_MESSAGE_IDS:
+            self._remember_message_id(self._recovery_event_message_ids, message_id)
+        elif message_id == EVENT_END_MESSAGE_ID:
+            self._recovery_event_message_ids.clear()
+
+    def _recovery_snapshot_unlocked(self) -> SessionRecoverySnapshot:
+        issues: list[SessionRecoveryIssue] = []
+        if self._recovery_battle_message_ids or self._recovery_battle_state:
+            issues.append(
+                SessionRecoveryIssue(
+                    kind="battle",
+                    message_ids=tuple(self._recovery_battle_message_ids),
+                    battle_state=self._recovery_battle_state,
+                    battle_type=self._recovery_battle_type,
+                )
+            )
+        if self._recovery_event_message_ids:
+            issues.append(
+                SessionRecoveryIssue(
+                    kind="event",
+                    message_ids=tuple(self._recovery_event_message_ids),
+                )
+            )
+        return SessionRecoverySnapshot(
+            generation=self._recovery_generation,
+            game_data_present=self._game_data is not None,
+            issues=tuple(issues),
+            observed_message_ids=tuple(self._recovery_observed_message_ids),
+        )
+
+    def _queue_login_header_unlocked(self, header: MessageHeader) -> None:
+        """Preserve all business pushes until a recovery handler consumes them."""
+
+        self._queued.append(header)
+        self._observe_recovery_header_unlocked(header)
+
     def ensure_ready(self, endpoint: GameEndpoint) -> None:
         """Connect and login if needed; reuse when endpoint identity matches."""
 
@@ -142,6 +434,33 @@ class GameSession:
             if self._ready and self._transport is not None and self._endpoint_key == key:
                 return
             self._connect_and_login(endpoint)
+
+    def ensure_recovered(self, endpoint: GameEndpoint, *, coordinator: Any | None = None) -> None:
+        """Connect, then settle the current login epoch before feature work.
+
+        ``GameSessionManager`` is the normal entry point, but some command-line
+        callers bind a shared session directly to a feature client.  Keeping the
+        recovery hook on the session makes both paths obey the same barrier.
+        Nested feature clients created by a recovery handler only need the
+        connection to remain ready, so they do not recursively start another
+        coordinator pass.
+        """
+
+        self.ensure_ready(endpoint)
+        with self._lock:
+            if (
+                self._recovery_checked_generation == self._recovery_generation
+                or self._recovery_scope_depth > 0
+            ):
+                return
+
+        if coordinator is None:
+            # Keep the transport layer importable without feature clients until
+            # a direct shared-session caller actually needs recovery.
+            from session_recovery import build_default_recovery_coordinator
+
+            coordinator = build_default_recovery_coordinator()
+        coordinator.recover(self, endpoint)
 
     def _ensure_traffic_logger(self) -> None:
         """Open shared-session raw WS log (separate from per-client CLI logs)."""
@@ -192,6 +511,7 @@ class GameSession:
         self._ready = False
         self._game_data = None
         self._queued.clear()
+        self._reset_recovery_state_unlocked()
         self._endpoint = endpoint
         self._endpoint_key = _endpoint_key(endpoint)
         self._ensure_traffic_logger()
@@ -204,6 +524,7 @@ class GameSession:
                 encrypted=False,
             )
             login_complete = False
+            deferred_login_headers: list[MessageHeader] = []
             deadline = time.monotonic() + self.timeout
             while not (login_complete and self._password is not None):
                 header = self._receive_header_unlocked(
@@ -219,12 +540,18 @@ class GameSession:
                         raise GameSessionError("游戏服会话密码不是 UTF-8 文本") from exc
                     continue
                 if header.message_id == GAME_DATA_MESSAGE_ID:
-                    self._game_data = header.data
+                    self._remember_game_data_unlocked(header.data)
                     continue
                 if header.message_id == LOGIN_REUNIQUE_MESSAGE_ID:
                     login_complete = True
                     continue
-                # Other login-phase pushes are ignored (mail counts, etc.).
+                if header.message_id == LOGIN_OK_MESSAGE_ID:
+                    continue
+                # The native client dispatches these after Login_reunique.  Do
+                # not discard them: a prior process can have left a battle,
+                # dialog, reward confirmation, or another feature state here.
+                deferred_login_headers.append(header)
+                self._observe_recovery_header_unlocked(header)
 
             # Game_data often arrives before reunique; if late, drain briefly.
             if self._game_data is None:
@@ -237,10 +564,12 @@ class GameSession:
                     except GameSessionError:
                         break
                     if header.message_id == GAME_DATA_MESSAGE_ID:
-                        self._game_data = header.data
+                        self._remember_game_data_unlocked(header.data)
                     else:
-                        self._queued.append(header)
+                        deferred_login_headers.append(header)
+                        self._observe_recovery_header_unlocked(header)
 
+            self._queued.extend(deferred_login_headers)
             self._ready = True
             # Native throwCachedMsg dispatches after 100 ms.
             time.sleep(POST_LOGIN_BUSINESS_DELAY_SECONDS)
@@ -251,12 +580,51 @@ class GameSession:
             self._game_data = None
             raise
 
+    def _drain_login_pushes_unlocked(self) -> None:
+        """Capture messages already waiting after ``Login_reunique``.
+
+        The drain never consumes the pre-existing queue; it only performs a
+        short receive window against the transport after the native client's
+        normal cached-message delay.
+        """
+
+        if self._transport is None or POST_LOGIN_RECOVERY_DRAIN_SECONDS <= 0:
+            return
+        queued = self._queued
+        self._queued = []
+        try:
+            deadline = time.monotonic() + POST_LOGIN_RECOVERY_DRAIN_SECONDS
+            while time.monotonic() < deadline:
+                try:
+                    header = self._receive_header_unlocked(
+                        deadline,
+                        "登录后恢复消息",
+                    )
+                except GameSessionError as exc:
+                    if "超时" in str(exc):
+                        break
+                    raise
+                if header.message_id == GAME_DATA_MESSAGE_ID:
+                    self._remember_game_data_unlocked(header.data)
+                elif header.message_id not in {
+                    LOGIN_OK_MESSAGE_ID,
+                    LOGIN_REUNIQUE_MESSAGE_ID,
+                }:
+                    self._queue_login_header_unlocked(header)
+        finally:
+            # Existing packets always precede packets received in this drain.
+            self._queued[0:0] = queued
+
     def send_message(
         self, message_id: int, data: bytes = b"", *, encrypted: bool = True
     ) -> None:
         with self._lock:
             if encrypted and not self._ready:
                 raise GameSessionError("游戏服会话尚未就绪（msgReady=false）")
+            if encrypted and self._recovery_scope_depth == 0:
+                snapshot = self._recovery_snapshot_unlocked()
+                if snapshot.pending:
+                    raise GameSessionRecoveryRequired(snapshot)
             self._send_message_unlocked(message_id, data, encrypted=encrypted)
 
     def _send_message_unlocked(
@@ -379,6 +747,11 @@ class GameSession:
                 ret, message = _decode_kickout(header.data)
                 self.invalidate()
                 raise GameSessionKickout(ret, message)
+            if self._recovery_scope_depth > 0:
+                if header.message_id == GAME_DATA_MESSAGE_ID:
+                    self._remember_game_data_unlocked(header.data)
+                else:
+                    self._observe_recovery_header_unlocked(header)
             return header
 
     def _decode_frame(self, opcode: int, payload: bytes) -> MessageHeader:
@@ -400,6 +773,8 @@ class GameSession:
 
         with self._lock:
             self._queued.append(header)
+            if self._recovery_scope_depth > 0:
+                self._observe_recovery_header_unlocked(header)
 
     def push_headers(self, headers: Iterable[MessageHeader]) -> None:
         """Restore a batch ahead of later queued traffic, preserving its order."""
@@ -409,6 +784,9 @@ class GameSession:
             return
         with self._lock:
             self._queued[0:0] = pending
+            if self._recovery_scope_depth > 0:
+                for header in pending:
+                    self._observe_recovery_header_unlocked(header)
 
     def close(self) -> None:
         """Destroy the transport (SocketManager.destroy / logout)."""
@@ -421,6 +799,7 @@ class GameSession:
             self._endpoint = None
             self._endpoint_key = None
             self._queued.clear()
+            self._reset_recovery_state_unlocked()
             self._close_traffic_logger()
 
     def invalidate(self) -> None:
@@ -433,6 +812,7 @@ class GameSession:
             # Keep endpoint_key cleared so ensure_ready reconnects.
             self._endpoint_key = None
             self._queued.clear()
+            self._reset_recovery_state_unlocked()
 
     def _close_traffic_logger(self) -> None:
         traffic = self._traffic_logger
@@ -464,10 +844,12 @@ class GameSessionManager:
         timeout: float = 15.0,
         socket_factory: SocketFactory = NativeWebSocket.connect,
         websocket_log: Any = True,
+        recovery_coordinator: Any | None = None,
     ) -> None:
         self._timeout = timeout
         self._socket_factory = socket_factory
         self._websocket_log = websocket_log
+        self._recovery_coordinator = recovery_coordinator
         self._lock = threading.RLock()
         self._session: GameSession | None = None
 
@@ -487,7 +869,24 @@ class GameSessionManager:
                     websocket_log=self._websocket_log,
                 )
             self._session.ensure_ready(endpoint)
+            if not self._session.recovery_checked:
+                self._recover_session_unlocked(self._session, endpoint)
             return self._session
+
+    def _recover_session_unlocked(
+        self,
+        session: GameSession,
+        endpoint: GameEndpoint,
+    ) -> None:
+        coordinator = self._recovery_coordinator
+        if coordinator is None:
+            # Import lazily so the low-level transport remains usable by CLI
+            # scripts and tests without feature modules at import time.
+            from session_recovery import build_default_recovery_coordinator
+
+            coordinator = build_default_recovery_coordinator()
+            self._recovery_coordinator = coordinator
+        coordinator.recover(session, endpoint)
 
     def get_if_ready(self) -> GameSession | None:
         with self._lock:
@@ -601,7 +1000,13 @@ def try_session_ensure_ready(client: Any, endpoint: GameEndpoint) -> bool:
         return False
     error_cls = getattr(client, "_session_error_cls", HarvestError)
     try:
-        session.ensure_ready(endpoint)
+        ensure_recovered = getattr(session, "ensure_recovered", None)
+        if callable(ensure_recovered):
+            ensure_recovered(endpoint)
+        else:
+            # Preserve compatibility with test doubles and older session-like
+            # integrations while real GameSession instances use the barrier.
+            session.ensure_ready(endpoint)
     except GameSessionKickout:
         raise
     except Exception as exc:

@@ -12,6 +12,7 @@ from app.services.treasure_service import TreasureService, format_farm_summary
 from harvest_fief import GameEndpoint, ItemChange, encode_bytes_field, encode_int_field
 from treasure_farm import (
     BIG_CHEST_KEY_COST,
+    CHEST_ONLY_KEY_THRESHOLD,
     HEARTH_ITEM_ID,
     LOC_STATUS_ACTIVE,
     LOC_STATUS_PASSED,
@@ -950,6 +951,56 @@ class ProtocolCodecTestCase(unittest.TestCase):
         self.assertIsNone(client._pending_event_start)
         self.assertIn("触碰法阵已确认", client.drain_event_progress_notes()[0])
 
+    def test_login_recovery_confirms_touch_magic_circle_without_lost_node_context(
+        self,
+    ) -> None:
+        """异常退出后只剩服务端 Event_start，也能恢复无消耗法阵分支。"""
+
+        from dragon_arena_business_map import EVENT_OPTION_MESSAGE_ID, EVENT_START_MESSAGE_ID
+        from treasure_farm import TreasureFarmClient, encode_event_option, encode_string_field
+
+        touch_option_blob = (
+            encode_string_field(1, "触碰法阵")
+            + encode_int_field(2, 1)
+        )
+        leave_option_blob = (
+            encode_string_field(1, "暂时离开")
+            + encode_int_field(2, 2)
+        )
+        event_info = encode_int_field(1, 530101) + encode_int_field(4, 4)
+        payload = (
+            encode_bytes_field(1, event_info)
+            + encode_bytes_field(3, touch_option_blob)
+            + encode_bytes_field(3, leave_option_blob)
+        )
+
+        client = object.__new__(TreasureFarmClient)
+        client._auto_event_progress = True
+        client._login_recovery_mode = True
+        client._curarea = 530101
+        client._pending_event_action = None
+        client._pending_event_start = None
+        client._event_progress_notes = []
+        client._preferred_event_item_ids = frozenset()
+        client._item_totals = {}
+        client._last_confirmed_key_option = None
+        client._active_event_context = None
+        sent: list[tuple[int, bytes, bool]] = []
+        client._send_message = lambda mid, data=b"", *, encrypted: sent.append(
+            (mid, data, encrypted)
+        )
+
+        self.assertTrue(
+            client._handle_common_message(
+                SimpleNamespace(message_id=EVENT_START_MESSAGE_ID, data=payload)
+            )
+        )
+        self.assertEqual(
+            sent,
+            [(EVENT_OPTION_MESSAGE_ID, encode_event_option(1, 4, 530101), True)],
+        )
+        self.assertIsNone(client._pending_event_start)
+
     def test_event_start_confirms_key_cost_open_chest_option(self) -> None:
         """宝箱交互后：Event_start 带 use/useNum 钥匙消耗时自动 Event_option。"""
 
@@ -1668,6 +1719,29 @@ class ChooseActionTestCase(unittest.TestCase):
         assert action is not None
         self.assertEqual(action.kind, NODE_KIND_MONSTER)
 
+    def test_keys_above_threshold_only_select_chests(self) -> None:
+        """钥匙超过 20 时，没有可开宝箱也不得转去打怪。"""
+
+        monster_only = AreaSession(
+            area_id=230101,
+            loc_status={1: LOC_STATUS_ACTIVE},
+            open_times=0,
+        )
+        self.assertIsNone(
+            choose_next_action(
+                monster_only,
+                self.nodes,
+                keys=CHEST_ONLY_KEY_THRESHOLD + 1,
+            )
+        )
+        action = choose_next_action(
+            monster_only,
+            self.nodes,
+            keys=CHEST_ONLY_KEY_THRESHOLD,
+        )
+        assert action is not None
+        self.assertEqual(action.kind, NODE_KIND_MONSTER)
+
     def test_never_opens_chest_when_keys_zero(self) -> None:
         """无钥匙时只能打怪，不能返回任何宝箱节点。"""
         for keys in (0, -1):
@@ -1934,6 +2008,61 @@ class FarmLoopTestCase(unittest.TestCase):
         self.assertFalse(progress.completed)
         self.assertEqual(client.reset_calls, 21)
         self.assertEqual(progress.last_transition, "已请求停止")
+
+    def test_high_key_mode_reenters_before_fighting_when_no_chest_is_open(self) -> None:
+        """高钥匙模式先回主城重进，绝不击杀当前地图仅剩的怪物。"""
+
+        class HighKeyChestOnlyClient(FakeFarmClient):
+            def __init__(self) -> None:
+                super().__init__()
+                self.reset_calls = 0
+                self._items[1801] = CHEST_ONLY_KEY_THRESHOLD + 1
+                monster = next(
+                    node
+                    for node in self._nodes.values()
+                    if node.kind == NODE_KIND_MONSTER
+                )
+                self._next_chest = next(
+                    node
+                    for node in self._nodes.values()
+                    if node.kind == NODE_KIND_SMALL_CHEST
+                )
+                self._initial_locs = {monster.nodeid: LOC_STATUS_ACTIVE}
+                self.session = AreaSession(
+                    area_id=230101,
+                    loc_status=dict(self._initial_locs),
+                    open_times=0,
+                )
+
+            def reset_area(self, area_id: int | None = None) -> AreaSession:
+                self.reset_calls += 1
+                self._curarea = int(area_id or 230101)
+                self._initial_locs = {self._next_chest.nodeid: LOC_STATUS_ACTIVE}
+                self.session = AreaSession(
+                    area_id=self._curarea,
+                    loc_status=dict(self._initial_locs),
+                    open_times=0,
+                )
+                return self.session
+
+        client = HighKeyChestOnlyClient()
+        events: list[str] = []
+        progress = run_treasure_farm(
+            client,  # type: ignore[arg-type]
+            230101,
+            30,
+            emit=lambda _level, message, _data: events.append(message),
+        )
+
+        self.assertTrue(progress.completed)
+        self.assertEqual(client.reset_calls, 1)
+        self.assertEqual(progress.monsters_killed, 0)
+        self.assertEqual(len(client.processed_nodes), 1)
+        self.assertEqual(
+            client._nodes[client.processed_nodes[0]].kind,
+            NODE_KIND_SMALL_CHEST,
+        )
+        self.assertTrue(any("无可开宝箱" in message for message in events))
 
     def test_hearth_target_can_require_more_than_legacy_action_budget(self) -> None:
         """Successful nodes continue until the requested hearth target is reached."""

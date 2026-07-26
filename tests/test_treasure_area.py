@@ -19,6 +19,8 @@ from harvest_fief import (
     pack1_encode,
 )
 from harvest_fief import ItemChange
+from game_session import BATTLE_INFO_MESSAGE_ID, GameSession, GameSessionManager
+from session_recovery import RecoveryResult, SessionRecoveryCoordinator
 from treasure_area import (
     MAP_TREASURE_CLEAR_RESULT_MESSAGE_ID,
     MAP_TREASURE_INFO_MESSAGE_ID,
@@ -206,6 +208,104 @@ class TreasureAreaProtocolTestCase(unittest.TestCase):
         self.assertEqual(status.sweep_remaining, 8)
         self.assertEqual(session.sent, [MAP_TREASURE_INFO_MESSAGE_ID])
         self.assertEqual(session.receive_header(0), unrelated)
+
+    def test_shared_status_query_uses_the_recovery_barrier(self) -> None:
+        class SharedSession:
+            def __init__(self) -> None:
+                self.password = "shared-password"
+                self.recovered_for: GameEndpoint | None = None
+                self.sent: list[int] = []
+
+            def ensure_recovered(self, endpoint: GameEndpoint) -> None:
+                self.recovered_for = endpoint
+
+            def send_message(
+                self, message_id: int, _data: bytes = b"", *, encrypted: bool
+            ) -> None:
+                assert encrypted
+                self.sent.append(message_id)
+
+            def receive_header(self, _timeout: float) -> MessageHeader:
+                return MessageHeader(
+                    message_id=MAP_TREASURE_INFO_MESSAGE_ID,
+                    sid=0,
+                    data=_treasure_status_payload(
+                        swept_today=2,
+                        daily_sweep_limit=10,
+                        area_ids=(1001,),
+                    ),
+                )
+
+        session = SharedSession()
+        client = TreasureAreaClient(self.endpoint, 1.0, session=session)
+
+        client.get_status()
+
+        self.assertIs(session.recovered_for, self.endpoint)
+        self.assertEqual(session.sent, [MAP_TREASURE_INFO_MESSAGE_ID])
+
+    def test_manager_recovers_login_battle_before_returning_shared_session(self) -> None:
+        class ClearBattleHandler:
+            name = "test_battle"
+
+            def __init__(self) -> None:
+                self.seen_message_id: int | None = None
+
+            def can_handle(self, snapshot: object) -> bool:
+                return bool(getattr(snapshot, "pending", False))
+
+            def recover(
+                self,
+                session: GameSession,
+                _endpoint: GameEndpoint,
+                _snapshot: object,
+            ) -> RecoveryResult:
+                self.seen_message_id = session.receive_header(0).message_id
+                session.resolve_recovery_issue("battle")
+                return RecoveryResult(self.name, "battle cleared")
+
+        session_password = "87654321"
+        password_payload = encode_bytes_field(
+            1,
+            pack1_encode(session_password.encode("utf-8"), SOCKET_PACK_KEY).encode(
+                "utf-8"
+            ),
+        )
+
+        def encrypted(message_id: int, data: bytes = b"") -> tuple[int, bytes]:
+            return (
+                0x2,
+                pack1_encode(
+                    encode_message_header(message_id, data), session_password
+                ).encode("utf-8"),
+            )
+
+        fake_socket = FakeSocket(
+            [
+                (0x2, encode_message_header(PACK_PASSWORD_MESSAGE_ID, password_payload)),
+                encrypted(BATTLE_INFO_MESSAGE_ID, b"battle"),
+                encrypted(LOGIN_REUNIQUE_MESSAGE_ID),
+            ]
+        )
+        handler = ClearBattleHandler()
+        import game_session as gs
+
+        original = gs.POST_LOGIN_BUSINESS_DELAY_SECONDS
+        gs.POST_LOGIN_BUSINESS_DELAY_SECONDS = 0
+        try:
+            manager = GameSessionManager(
+                timeout=1.0,
+                socket_factory=lambda _url, _timeout: fake_socket,
+                websocket_log=False,
+                recovery_coordinator=SessionRecoveryCoordinator((handler,)),
+            )
+            session = manager.session_for(self.endpoint)
+        finally:
+            gs.POST_LOGIN_BUSINESS_DELAY_SECONDS = original
+
+        self.assertEqual(handler.seen_message_id, BATTLE_INFO_MESSAGE_ID)
+        self.assertFalse(session.recovery_pending)
+        self.assertTrue(session.recovery_checked)
 
     def test_sweep_request_uses_native_area_useitem_and_times_fields(self) -> None:
         request = encode_treasure_sweep_request(1001, MAX_SWEEP_TIMES_PER_REQUEST)

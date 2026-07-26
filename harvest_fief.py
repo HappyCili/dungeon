@@ -1437,10 +1437,10 @@ class FiefClient:
             times=times,
         )
         if self._session is not None:
-            from game_session import GameSessionError
+            from game_session import GameSessionError, try_session_ensure_ready
 
             try:
-                self._session.ensure_ready(self.endpoint)
+                try_session_ensure_ready(self, self.endpoint)
             except GameSessionError as exc:
                 raise HarvestError(str(exc)) from exc
             self.password = self._session.password

@@ -583,8 +583,10 @@ class DailyQuestClient:
 
     def login(self) -> DailyQuestStatus:
         if self._session is not None:
+            from game_session import try_session_ensure_ready
+
             try:
-                self._session.ensure_ready(self.endpoint)
+                try_session_ensure_ready(self, self.endpoint)
             except SharedKickout as exc:
                 raise GameSessionKickout(exc.ret, exc.message) from exc
             except GameSessionError as exc:

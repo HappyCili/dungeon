@@ -382,8 +382,10 @@ class TreasureAreaClient:
 
     def login(self) -> None:
         if self._session is not None:
+            from game_session import try_session_ensure_ready
+
             try:
-                self._session.ensure_ready(self.endpoint)
+                try_session_ensure_ready(self, self.endpoint)
             except Exception as exc:
                 raise TreasureAreaError(str(exc)) from exc
             self.password = getattr(self._session, "password", None)

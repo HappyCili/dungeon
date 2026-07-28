@@ -14,6 +14,7 @@ from app.services.daily_service import DailyService
 from app.services.dungeon_service import DungeonService, _load_item_details
 from app.services.treasure_service import TreasureService
 from dungeon_sweep import DungeonDrawResponse, DungeonStatus, DungeonSweepRejected
+from game_session import SessionRecoveryIssue, SessionRecoverySnapshot
 from harvest_fief import AccountZone, GameEndpoint, HarvestError, ItemChange, RewardProp
 from login import GameTokens, IdentityTokens, LoginError, LoginResult
 from tests.daily_fixtures import build_test_daily_action_runner
@@ -215,6 +216,46 @@ class InMemoryArenaService:
         return {"cancelled": False, "arena": stats}
 
 
+class InMemoryRecoverySession:
+    def __init__(self) -> None:
+        self.snapshot = SessionRecoverySnapshot(
+            generation=1,
+            game_data_present=True,
+            issues=(
+                SessionRecoveryIssue(
+                    kind="battle",
+                    message_ids=(18002,),
+                    battle_state=1,
+                    battle_type=7,
+                ),
+            ),
+        )
+
+    @property
+    def recovery_snapshot(self) -> SessionRecoverySnapshot:
+        return self.snapshot
+
+
+class InMemoryRecoveryManager:
+    def __init__(self) -> None:
+        self.session = InMemoryRecoverySession()
+        self.snapshot_endpoints: list[GameEndpoint] = []
+        self.recovery_endpoints: list[GameEndpoint] = []
+
+    def session_for_snapshot(self, endpoint: GameEndpoint) -> InMemoryRecoverySession:
+        self.snapshot_endpoints.append(endpoint)
+        return self.session
+
+    def session_for(self, endpoint: GameEndpoint) -> InMemoryRecoverySession:
+        self.recovery_endpoints.append(endpoint)
+        self.session.snapshot = SessionRecoverySnapshot(
+            generation=1,
+            game_data_present=True,
+            issues=(),
+        )
+        return self.session
+
+
 class UiAppTestCase(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary_directory = TemporaryDirectory()
@@ -372,6 +413,19 @@ class UiAppTestCase(unittest.TestCase):
         self.assertIn("item.append(name);", script)
         self.assertNotIn("ID ${reward.id}", script)
         self.assertNotIn("reward.description", script)
+
+    def test_index_includes_monopoly_auto_roll_entry(self) -> None:
+        response = self.client.get("/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(b'id="monopoly-tab"', response.data)
+        self.assertIn(b'id="run-monopoly"', response.data)
+        self.assertIn("选择第二个按钮".encode(), response.data)
+        script = (Path(__file__).resolve().parents[1] / "app" / "static" / "app.js").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('"/api/jobs/monopoly"', script)
+        self.assertIn("renderMonopolyStats", script)
 
     def test_index_includes_treasure_settlement_and_farm_transition_fields(self) -> None:
         response = self.client.get("/")
@@ -963,6 +1017,41 @@ class UiAppTestCase(unittest.TestCase):
                     "zone_id": "4101",
                 }
             ],
+        )
+
+    def test_recovery_job_settles_server_state_and_refreshes_daily(self) -> None:
+        recovery_manager = InMemoryRecoveryManager()
+        self.app.extensions["daily_console"]["game_session"] = recovery_manager
+        self.assertEqual(self.login().status_code, 200)
+        self.assertEqual(
+            self.put_json(
+                "/api/config/zone", {"id": "4101", "name": "真实一区"}
+            ).status_code,
+            200,
+        )
+
+        response = self.post_json("/api/jobs/recovery", {})
+
+        self.assertEqual(response.status_code, 200)
+        terminal = self.wait_for_terminal_job(response.get_json()["job"]["id"])
+        self.assertEqual(terminal["status"], "succeeded")
+        self.assertEqual(len(recovery_manager.snapshot_endpoints), 1)
+        self.assertEqual(len(recovery_manager.recovery_endpoints), 1)
+        self.assertEqual(
+            terminal["result"]["recovery"],
+            {
+                "stage": "已完成",
+                "pending": False,
+                "description": "空闲",
+                "issues": [],
+            },
+        )
+        self.assertFalse(terminal["result"]["daily"]["actions_blocked"])
+        self.assertTrue(
+            any(
+                event["message"] == "遗留状态已处理，日常任务可继续执行"
+                for event in terminal["events"]
+            )
         )
 
     def test_daily_job_requires_current_login_and_selected_zone(self) -> None:

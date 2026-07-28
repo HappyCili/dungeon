@@ -152,17 +152,25 @@ def format_run_summary(stats: dict[str, Any], *, cancelled: bool = False) -> str
     coin_total = stats.get("dragon_coin_total")
     score = int(stats.get("score") or 0)
     score_delta = int(stats.get("score_delta") or 0)
+    stop_reason = str(stats.get("stop_reason") or "")
 
     coin_part = f"{DRAGON_COIN_NAME} 本局 {_signed(coin_delta)}"
     if isinstance(coin_total, int):
         coin_part = f"{DRAGON_COIN_NAME} {coin_total}（本局 {_signed(coin_delta)}）"
 
-    header = "已停止" if cancelled else "全部完成"
+    if cancelled:
+        header = "已停止"
+    elif stop_reason:
+        header = "未完成"
+    else:
+        header = "全部完成"
+    reason_part = f" · {stop_reason}" if stop_reason else ""
     return (
         f"{header} · {coin_part} · "
         f"积分 {score}（本局 {_signed(score_delta)}） · "
         f"挑战 {wins} 胜 / {losses} 负 / 共 {completed} 场"
         + (f"（目标 {requested} 轮）" if requested > 0 else "")
+        + reason_part
     )
 
 
@@ -314,10 +322,12 @@ class ArenaService:
                             continue
                         stats["stage"] = "寻找对手失败"
                         stats["last_result"] = "服务端未返回可挑战对手"
+                        stats["stop_reason"] = stats["last_result"]
                         progress("warning", stats["last_result"])
                     else:
                         stats["stage"] = "对手已耗尽"
                         stats["last_result"] = "当前没有可挑战对手"
+                        stats["stop_reason"] = stats["last_result"]
                         progress("info", f"{stats['last_result']} · {format_status_line(stats)}")
                     break
 
@@ -341,6 +351,18 @@ class ArenaService:
                     count_round=True,
                     title=f"第 {round_no}/{rounds} 轮",
                 )
+                if result.battle is None:
+                    # 未收到结算时不能继续发送下一次竞技场请求，避免把未完成
+                    # 的战斗误计入轮数并污染后续状态。
+                    stats["stop_reason"] = "未收到服务端战斗结算"
+                    progress(
+                        "warning",
+                        (
+                            f"停止竞技场循环：{stats['stop_reason']} · "
+                            f"已完成 {stats['completed_rounds']}/{rounds} 轮"
+                        ),
+                    )
+                    break
                 attempted.add(index)
                 if result.battle is not None and result.battle.win:
                     attempted.clear()
@@ -384,15 +406,16 @@ class ArenaService:
         *,
         count_round: bool,
         title: str,
-    ) -> None:
+    ) -> bool:
         self._apply_round_result(stats, result, count_round=count_round)
         battle = result.battle
         choice = result.mercy
 
         if battle is None:
+            stats["stop_reason"] = "未收到服务端战斗结算"
             progress("warning", f"{title} · 未收到战斗结算")
-            progress("info", format_status_line(stats))
-            return
+            progress("info", f"状态未更新 · {format_status_line(stats)}")
+            return False
 
         if battle.win:
             progress("success", f"{title} · 战斗完成：胜利")
@@ -421,6 +444,7 @@ class ArenaService:
                 "info",
                 f"第 {stats['completed_rounds']} 轮已完成",
             )
+        return True
 
     def _finish(
         self,
@@ -430,9 +454,12 @@ class ArenaService:
         progress: Callable[[str, str], None],
     ) -> dict[str, Any]:
         summary = format_run_summary(stats, cancelled=cancelled)
-        stats["stage"] = "已停止" if cancelled else "已完成"
+        incomplete = bool(stats.get("stop_reason"))
+        stats["stage"] = (
+            "已停止" if cancelled else "未完成" if incomplete else "已完成"
+        )
         stats["last_result"] = summary
-        progress("warning" if cancelled else "success", summary)
+        progress("warning" if cancelled or incomplete else "success", summary)
         return {"cancelled": cancelled, "arena": stats}
 
     def _persist_run_result(
@@ -490,6 +517,7 @@ class ArenaService:
             "refresh_on_exhaustion": arena.get("refresh_on_exhaustion"),
             "stage": arena.get("stage"),
             "last_result": arena.get("last_result"),
+            "stop_reason": arena.get("stop_reason"),
             "opponents": arena.get("opponents"),
             "daily_reward": arena.get("daily_reward"),
             "rewards": redacted_rewards,
@@ -604,6 +632,7 @@ class ArenaService:
             "dragon_coin_total": None,
             "stage": "准备中",
             "last_result": "等待开始",
+            "stop_reason": "",
             "outcome": outcome,
             "outcome_label": OUTCOME_LABELS[outcome],
             "refresh_on_exhaustion": refresh_on_exhaustion,
@@ -628,14 +657,15 @@ class ArenaService:
         *,
         count_round: bool = True,
     ) -> None:
-        if count_round:
-            stats["completed_rounds"] += 1
         battle: DragonArenaChallengeResult | None = result.battle
         choice: DragonArenaChoiceResult | None = result.mercy
         if battle is None:
             stats["stage"] = "本轮未完成"
             stats["last_result"] = "未收到服务端战斗结算"
             return
+
+        if count_round:
+            stats["completed_rounds"] += 1
 
         round_score_delta = battle.score_delta
         stats["score"] = battle.score

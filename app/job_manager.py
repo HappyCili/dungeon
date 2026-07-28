@@ -6,14 +6,16 @@ import uuid
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any, Callable
+from zoneinfo import ZoneInfo
 
 from .models import JobEvent, JobStatus, TERMINAL_JOB_STATUSES
 
 
 Runner = Callable[[Callable[[str, str, dict[str, Any]], None], Callable[[], bool]], dict[str, Any]]
 LOGGER = logging.getLogger(__name__)
+BEIJING_TIMEZONE = ZoneInfo("Asia/Shanghai")
 
 
 class JobConflictError(RuntimeError):
@@ -46,7 +48,7 @@ class ManagedJob:
 
 
 def _timestamp() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+    return datetime.now(BEIJING_TIMEZONE).isoformat(timespec="seconds")
 
 
 class JobManager:

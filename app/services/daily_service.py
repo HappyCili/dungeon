@@ -8,7 +8,12 @@ from daily_actions import (
     DailyActionRunner,
     build_live_daily_action_runner,
 )
-from daily_quest import DailyQuestStatus
+from daily_quest import (
+    DailyCatalog,
+    DailyQuestStatus,
+    decode_game_data_daily_status,
+    load_daily_catalog,
+)
 from game_session import GameSessionManager
 from harvest_fief import GameEndpoint
 from id_descriptions import activity_reward_name
@@ -71,12 +76,65 @@ class DailyService:
             self._runner = runner
             self._results = {task.task_id: "等待" for task in DAILY_TASKS}
 
+    def refresh(
+        self, endpoint: GameEndpoint, selected_task_ids: list[int]
+    ) -> dict[str, Any]:
+        """读取日常状态，不让遗留战斗阻塞只读刷新。
+
+        空闲会话继续查询 ``Dailyquest_info``，获得最新状态。若登录阶段已
+        明确报告遗留战斗或事件，则直接展示同一服务端刚下发的 ``Game_data``
+        快照；执行任务仍会走完整恢复屏障，不会由刷新按钮自动续战。
+        """
+
+        if self._session_manager is None:
+            # 保持注入测试运行器及不复用会话的调用方原有行为。
+            self.use_game_server(endpoint)
+            return self.snapshot(selected_task_ids)
+
+        session = self._session_manager.session_for_snapshot(endpoint)
+        if session.recovery_pending:
+            game_data = session.game_data
+            if game_data is None:
+                raise DailyServiceError("游戏服登录快照缺少日常状态")
+            status = decode_game_data_daily_status(game_data)
+            catalog = load_daily_catalog()
+            return self._snapshot_from_status(
+                selected_task_ids,
+                status,
+                catalog,
+                status_source="login_snapshot",
+                status_notice=(
+                    "检测到遗留战斗或事件，已从服务端登录快照刷新；"
+                    "请点击“处理遗留状态”继续结算后再刷新实时状态"
+                ),
+                actions_blocked=True,
+            )
+
+        self.use_game_server(endpoint)
+        return self.snapshot(selected_task_ids)
+
     def snapshot(self, selected_task_ids: list[int]) -> dict[str, Any]:
         runner = self.runner
         status = runner.status()
+        return self._snapshot_from_status(
+            selected_task_ids,
+            status,
+            runner.catalog,
+        )
+
+    def _snapshot_from_status(
+        self,
+        selected_task_ids: list[int],
+        status: DailyQuestStatus,
+        catalog: DailyCatalog,
+        *,
+        status_source: str = "dailyquest_info",
+        status_notice: str | None = None,
+        actions_blocked: bool = False,
+    ) -> dict[str, Any]:
         with self._lock:
             tasks = [
-                self._task_payload(task, selected_task_ids, status, runner)
+                self._task_payload(task, selected_task_ids, status, catalog)
                 for task in DAILY_TASKS
             ]
         completed = sum(
@@ -94,6 +152,9 @@ class DailyService:
         )
         return {
             "tasks": tasks,
+            "status_source": status_source,
+            "status_notice": status_notice,
+            "actions_blocked": actions_blocked,
             "summary": {
                 "activity_score": score,
                 "next_reward": next_reward,
@@ -126,10 +187,10 @@ class DailyService:
         task: DailyTaskDefinition,
         selected_task_ids: list[int],
         status: DailyQuestStatus,
-        runner: DailyActionRunner,
+        catalog: DailyCatalog,
     ) -> dict[str, Any]:
         state = status.task(task.task_id)
-        progress = self._progress_for(task, status, runner)
+        progress = self._progress_for(task, status, catalog)
         return {
             "id": task.task_id,
             "name": task.name,
@@ -149,9 +210,9 @@ class DailyService:
         self,
         task: DailyTaskDefinition,
         status: DailyQuestStatus,
-        runner: DailyActionRunner,
+        catalog: DailyCatalog,
     ) -> int:
-        config = runner.catalog.tasks.get(task.task_id)
+        config = catalog.tasks.get(task.task_id)
         state = status.task(task.task_id)
         if config is None:
             return task.target if state is not None and state.finished else 0

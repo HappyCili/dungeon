@@ -13,14 +13,16 @@ from .config_store import (
     VALID_OUTCOMES,
 )
 from .credentials import CredentialStorageError
-from .job_manager import JobConflictError, JobNotFoundError
+from .job_manager import JobConflictError, JobExecutionError, JobNotFoundError
 from .models import AVAILABLE_TASK_IDS
 from .services.account_service import AccountLoginError
 from .services.abyss_service import AbyssServiceError
 from .services.arena_service import ArenaServiceError
 from .services.daily_service import DailyServiceError
+from .services.twin_spiral_service import TwinSpiralServiceError
 from dungeon_sweep import DungeonSweepError
 from daily_quest import DailyQuestError
+from game_session import GameSessionError, SessionRecoverySnapshot
 from harvest_fief import HarvestError
 from id_descriptions import treasure_area_name
 from treasure_area import TreasureAreaError
@@ -146,6 +148,17 @@ def _require_abyss_max_rounds(payload: Mapping[str, Any]) -> int:
     return value
 
 
+def _require_twin_spiral_node_id(payload: Mapping[str, Any]) -> int:
+    value = payload.get("node_id", 0)
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or not 0 <= value <= 0x7FFFFFFF
+    ):
+        raise ApiError("node_id 必须是非负整数（0=当前节点）")
+    return value
+
+
 def _require_task_ids(payload: Mapping[str, Any]) -> list[int]:
     values = payload.get("task_ids")
     if not isinstance(values, list):
@@ -207,6 +220,7 @@ def _public_config() -> dict[str, Any]:
             "max_rounds": settings.abyss.max_rounds,
             "auto_buff": settings.abyss.auto_buff,
         },
+        "twin_spiral": {"node_id": settings.twin_spiral.node_id},
         "connection": account.connection_snapshot(),
         "zones": account.zones(),
         "active_job_id": jobs.active_job_id(),
@@ -222,6 +236,98 @@ def _daily_snapshot() -> dict[str, Any]:
 def _use_current_game_server_for_daily(services: Mapping[str, Any]) -> None:
     endpoint = services["account"].resolve_selected_game_endpoint()
     services["daily"].use_game_server(endpoint)
+
+
+def _recovery_payload(
+    snapshot: SessionRecoverySnapshot,
+    stage: str,
+) -> dict[str, Any]:
+    return {
+        "stage": stage,
+        "pending": snapshot.pending,
+        "description": snapshot.describe(),
+        "issues": [
+            {
+                "kind": issue.kind,
+                "label": issue.label,
+                "battle_state": issue.battle_state,
+                "battle_type": issue.battle_type,
+            }
+            for issue in snapshot.issues
+        ],
+    }
+
+
+def _run_session_recovery(
+    services: Mapping[str, Any],
+    endpoint: Any,
+    selected_task_ids: list[int],
+    emit: Any,
+    stop_requested: Any,
+) -> dict[str, Any]:
+    """Settle the current login residue, then return a fresh daily snapshot."""
+
+    manager = services["game_session"]
+    try:
+        emit("info", "正在读取服务端遗留状态", {"recovery": {"stage": "读取状态"}})
+        session = manager.session_for_snapshot(endpoint)
+        initial = session.recovery_snapshot
+        if stop_requested():
+            return {
+                "cancelled": True,
+                "recovery": _recovery_payload(initial, "已停止"),
+            }
+
+        if initial.pending:
+            emit(
+                "info",
+                f"检测到{initial.describe()}，正在确认并处理服务端状态",
+                {"recovery": _recovery_payload(initial, "结算中")},
+            )
+            session = manager.session_for(endpoint)
+        else:
+            emit(
+                "info",
+                "服务端当前没有需要处理的遗留战斗或事件",
+                {"recovery": _recovery_payload(initial, "无需处理")},
+            )
+
+        settled = session.recovery_snapshot
+        if settled.pending:
+            raise JobExecutionError(
+                f"遗留状态尚未结算：{settled.describe()}"
+            )
+        if stop_requested():
+            return {
+                "cancelled": True,
+                "recovery": _recovery_payload(settled, "已停止"),
+            }
+
+        emit(
+            "info",
+            "遗留状态已结算，正在刷新日常任务",
+            {"recovery": _recovery_payload(settled, "刷新任务状态")},
+        )
+        daily = services["daily"].refresh(endpoint, selected_task_ids)
+        emit(
+            "success",
+            "遗留状态已处理，日常任务可继续执行",
+            {
+                "daily": daily,
+                "recovery": _recovery_payload(settled, "已完成"),
+            },
+        )
+        return {
+            "cancelled": False,
+            "daily": daily,
+            "recovery": _recovery_payload(settled, "已完成"),
+        }
+    except JobExecutionError:
+        raise
+    except GameSessionError as exc:
+        raise JobExecutionError("处理服务端遗留状态失败，请刷新后重试") from exc
+    except (DailyServiceError, DailyQuestError, HarvestError, OSError, ValueError) as exc:
+        raise JobExecutionError("刷新结算后的日常任务状态失败") from exc
 
 
 def _treasure_snapshot(endpoint: Any, selected_area_id: int) -> dict[str, Any]:
@@ -322,13 +428,18 @@ def register_routes(app: Flask) -> None:
         if services["jobs"].active_job_id() is not None:
             raise ApiError("已有任务正在运行", 409)
         try:
-            _use_current_game_server_for_daily(services)
+            endpoint = services["account"].resolve_selected_game_endpoint()
+            settings = services["config_store"].snapshot()
+            return jsonify(
+                services["daily"].refresh(
+                    endpoint,
+                    settings.daily.enabled_task_ids,
+                )
+            )
         except AccountLoginError as exc:
             raise ApiError(str(exc)) from exc
         except DailyServiceError as exc:
             raise ApiError(str(exc), 502) from exc
-        try:
-            return jsonify(_daily_snapshot())
         except (DailyQuestError, HarvestError, OSError, ValueError) as exc:
             raise ApiError(
                 "游戏服日常状态查询失败，请检查网络和区服状态", 502
@@ -481,6 +592,33 @@ def register_routes(app: Flask) -> None:
         _services()["config_store"].set_abyss(max_rounds, auto_buff)
         return jsonify({"config": _public_config()})
 
+    @app.get("/api/twin-spiral")
+    def get_twin_spiral_status():
+        services = _services()
+        if services["jobs"].active_job_id() is not None:
+            raise ApiError("已有任务正在运行", 409)
+        try:
+            endpoint = services["account"].resolve_selected_game_endpoint()
+            snapshot = services["twin_spiral"].snapshot(
+                endpoint,
+                refresh_endpoint=services["account"].resolve_selected_game_endpoint,
+            )
+        except AccountLoginError as exc:
+            raise ApiError(str(exc)) from exc
+        except TwinSpiralServiceError as exc:
+            raise ApiError(str(exc), 502) from exc
+        except (HarvestError, OSError, ValueError) as exc:
+            raise ApiError(
+                "双生螺旋状态查询失败，请检查网络和区服状态", 502
+            ) from exc
+        return jsonify({"config": _public_config(), **snapshot})
+
+    @app.put("/api/config/twin-spiral")
+    def update_twin_spiral_config():
+        node_id = _require_twin_spiral_node_id(_require_json_body())
+        _services()["config_store"].set_twin_spiral(node_id)
+        return jsonify({"config": _public_config()})
+
     @app.post("/api/jobs/daily")
     def start_daily_job():
         _require_json_body()
@@ -520,6 +658,32 @@ def register_routes(app: Flask) -> None:
         except JobConflictError as exc:
             raise ApiError(str(exc), 409) from exc
         return jsonify({"job": job, "daily": daily})
+
+    @app.post("/api/jobs/recovery")
+    def start_recovery_job():
+        _require_json_body()
+        services = _services()
+        if services["jobs"].active_job_id() is not None:
+            raise ApiError("已有任务正在运行", 409)
+        try:
+            endpoint = services["account"].resolve_selected_game_endpoint()
+        except AccountLoginError as exc:
+            raise ApiError(str(exc)) from exc
+        selected_task_ids = services["config_store"].snapshot().daily.enabled_task_ids
+        try:
+            job = services["jobs"].start(
+                "recovery",
+                lambda emit, stop_requested: _run_session_recovery(
+                    services,
+                    endpoint,
+                    selected_task_ids,
+                    emit,
+                    stop_requested,
+                ),
+            )
+        except JobConflictError as exc:
+            raise ApiError(str(exc), 409) from exc
+        return jsonify({"job": job})
 
     @app.post("/api/jobs/arena")
     def start_arena_job():
@@ -690,6 +854,55 @@ def register_routes(app: Flask) -> None:
         except JobConflictError as exc:
             raise ApiError(str(exc), 409) from exc
         return jsonify({"job": job, "config": _public_config()})
+
+    @app.post("/api/jobs/twin-spiral")
+    def start_twin_spiral_job():
+        node_id = _require_twin_spiral_node_id(_require_json_body())
+        services = _services()
+        if services["jobs"].active_job_id() is not None:
+            raise ApiError("已有任务正在运行", 409)
+        try:
+            endpoint = services["account"].resolve_selected_game_endpoint()
+        except AccountLoginError as exc:
+            raise ApiError(str(exc)) from exc
+        services["config_store"].set_twin_spiral(node_id)
+        try:
+            job = services["jobs"].start(
+                "twin_spiral",
+                lambda emit, stop_requested: services["twin_spiral"].run(
+                    endpoint,
+                    node_id,
+                    emit,
+                    stop_requested,
+                    refresh_endpoint=services["account"].resolve_selected_game_endpoint,
+                ),
+            )
+        except JobConflictError as exc:
+            raise ApiError(str(exc), 409) from exc
+        return jsonify({"job": job, "config": _public_config()})
+
+    @app.post("/api/jobs/monopoly")
+    def start_monopoly_job():
+        _require_json_body()
+        services = _services()
+        if services["jobs"].active_job_id() is not None:
+            raise ApiError("已有任务正在运行", 409)
+        try:
+            endpoint = services["account"].resolve_selected_game_endpoint()
+        except AccountLoginError as exc:
+            raise ApiError(str(exc)) from exc
+        try:
+            job = services["jobs"].start(
+                "monopoly",
+                lambda emit, stop_requested: services["monopoly"].run(
+                    endpoint,
+                    emit,
+                    stop_requested,
+                ),
+            )
+        except JobConflictError as exc:
+            raise ApiError(str(exc), 409) from exc
+        return jsonify({"job": job})
 
     @app.get("/api/jobs/<job_id>")
     def get_job(job_id: str):

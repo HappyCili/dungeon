@@ -28,6 +28,7 @@ EVENT_SPECS = frozenset({
     "adventurer_guild_daily_auto_refresh",
     "websocket_business",
     "dragon_arena",
+    "monopoly",
     "treasure_area",
     "smithy_forge",
 })

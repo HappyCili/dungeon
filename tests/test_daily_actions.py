@@ -15,6 +15,7 @@ from daily_actions import (
     run_fief_harvest_action,
     run_fief_quick_harvest_action,
     run_knight_arena_action,
+    run_legion_war_action,
     run_smithy_forge_action,
 )
 from daily_quest import load_daily_catalog
@@ -26,6 +27,8 @@ from harvest_fief import (
     GameEndpoint,
     HarvestError,
     describe_fief_harvest_rejection,
+    encode_bytes_field,
+    encode_int_field,
 )
 from app.services.daily_service import DailyService, DailyServiceError
 from tests.daily_fixtures import (
@@ -211,10 +214,64 @@ class DailyActionRunnerTestCase(unittest.TestCase):
         with self.assertRaises(DailyServiceError):
             service.snapshot([])
 
+    def test_daily_service_refresh_uses_login_snapshot_when_recovery_is_pending(self) -> None:
+        def task_state(task_id: int) -> bytes:
+            return encode_int_field(1, task_id)
+
+        daily_status = encode_int_field(1, 3600) + encode_bytes_field(
+            7, task_state(109)
+        )
+        game_data = encode_bytes_field(19, daily_status)
+
+        class PendingSession:
+            recovery_pending = True
+
+            def __init__(self, payload: bytes) -> None:
+                self.game_data = payload
+
+        class SessionManager:
+            def __init__(self) -> None:
+                self.snapshot_calls = 0
+
+            def session_for_snapshot(self, _endpoint: GameEndpoint) -> PendingSession:
+                self.snapshot_calls += 1
+                return PendingSession(game_data)
+
+        manager = SessionManager()
+        service = DailyService(session_manager=manager)  # type: ignore[arg-type]
+
+        snapshot = service.refresh(
+            GameEndpoint("ws://test.invalid", "game-token", "1", "test"),
+            [109],
+        )
+
+        task = next(item for item in snapshot["tasks"] if item["id"] == 109)
+        self.assertEqual(manager.snapshot_calls, 1)
+        self.assertEqual(snapshot["status_source"], "login_snapshot")
+        self.assertTrue(snapshot["actions_blocked"])
+        self.assertEqual(task["progress"], 0)
+        self.assertFalse(task["finished"])
+
 
 class ExistingActionWrapperTestCase(unittest.TestCase):
     def setUp(self) -> None:
         self.endpoint = GameEndpoint("ws://test.invalid", "game-token", "1", "test")
+
+    def test_legion_war_wrapper_runs_once_for_daily_task(self) -> None:
+        class LegionClient:
+            def run_daily(self):
+                return SimpleNamespace(summary=lambda: "军团战流程已完成")
+
+        execution = run_legion_war_action(
+            self.endpoint,
+            1.0,
+            1,
+            client_factory=lambda *_args: LegionClient(),
+        )
+
+        self.assertEqual(execution.requested_count, 1)
+        self.assertEqual(execution.attempted_count, 1)
+        self.assertEqual(execution.message, "军团战流程已完成")
 
     def test_guild_wrapper_passes_remaining_count_to_existing_client(self) -> None:
         captured: dict[str, object] = {}

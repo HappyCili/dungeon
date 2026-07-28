@@ -69,6 +69,8 @@
         <button id="treasure-tab" class="tab-button" type="button" role="tab" aria-selected="false" aria-controls="treasure-panel" data-tab="treasure">聚宝之地</button>
         <button id="dungeon-tab" class="tab-button" type="button" role="tab" aria-selected="false" aria-controls="dungeon-panel" data-tab="dungeon">地下城扫荡</button>
         <button id="abyss-tab" class="tab-button" type="button" role="tab" aria-selected="false" aria-controls="abyss-panel" data-tab="abyss">罪者深渊</button>
+        <button id="twin-spiral-tab" class="tab-button" type="button" role="tab" aria-selected="false" aria-controls="twin-spiral-panel" data-tab="twin-spiral">双生螺旋</button>
+        <button id="monopoly-tab" class="tab-button" type="button" role="tab" aria-selected="false" aria-controls="monopoly-panel" data-tab="monopoly">宫廷棋</button>
       </nav>
 
       <section id="daily-panel" class="feature-panel" role="tabpanel" aria-labelledby="daily-tab">
@@ -90,6 +92,7 @@
             <button id="select-available" class="button button--secondary" type="button">选择可执行项</button>
             <button id="clear-selection" class="button button--secondary" type="button">清空选择</button>
             <button id="refresh-daily" class="button button--secondary" type="button">刷新状态</button>
+            <button id="resolve-recovery" class="button button--secondary" type="button">处理遗留状态</button>
           </div>
           <div class="command-bar__group">
             <button id="run-daily" class="button button--primary" type="button">执行已选</button>
@@ -317,6 +320,67 @@
             <div><dt>已挑战</dt><dd id="abyss-completed">0</dd></div>
             <div><dt>当前阶段</dt><dd id="abyss-stage">空闲</dd></div>
             <div class="arena-stats__last"><dt>最后结果</dt><dd id="abyss-last-result">等待开始</dd></div>
+          </dl>
+        </div>
+      </section>
+
+      <section id="twin-spiral-panel" class="feature-panel" role="tabpanel" aria-labelledby="twin-spiral-tab" hidden>
+        <div class="section-heading section-heading--compact">
+          <div>
+            <p class="eyebrow">连续挑战</p>
+            <h2>秽肉之塔</h2>
+          </div>
+        </div>
+        <div class="arena-layout">
+          <div class="arena-controls">
+            <label class="field-control">
+              <span>挑战节点（0=当前节点）</span>
+              <input id="twin-spiral-node-id" type="number" inputmode="numeric" min="0" max="2147483647" value="{{ initial_state.config.twin_spiral.node_id }}" aria-label="秽肉之塔挑战节点">
+            </label>
+            <div class="command-bar command-bar--arena">
+              <button id="refresh-twin-spiral" class="button button--secondary" type="button">刷新状态</button>
+              <button id="run-twin-spiral" class="button button--primary" type="button">开始首战并自动连战</button>
+              <button id="stop-twin-spiral" class="button button--danger" type="button" disabled>停止</button>
+            </div>
+          </div>
+          <dl class="arena-stats" aria-live="polite">
+            <div><dt>当前区域</dt><dd id="twin-spiral-area">--</dd></div>
+            <div><dt>当前节点</dt><dd id="twin-spiral-current-node">--</dd></div>
+            <div><dt>可见节点</dt><dd id="twin-spiral-available-nodes">--</dd></div>
+            <div><dt>战斗计数</dt><dd id="twin-spiral-battle-count">--</dd></div>
+            <div><dt>本局胜 / 负</dt><dd id="twin-spiral-win-loss">0 / 0</dd></div>
+            <div><dt>已挑战</dt><dd id="twin-spiral-completed">0</dd></div>
+            <div><dt>自动连战</dt><dd id="twin-spiral-auto">未开启</dd></div>
+            <div><dt>当前阶段</dt><dd id="twin-spiral-stage">空闲</dd></div>
+            <div class="arena-stats__last"><dt>最后结果</dt><dd id="twin-spiral-last-result">等待开始</dd></div>
+          </dl>
+        </div>
+      </section>
+
+      <section id="monopoly-panel" class="feature-panel" role="tabpanel" aria-labelledby="monopoly-tab" hidden>
+        <div class="section-heading section-heading--compact">
+          <div>
+            <p class="eyebrow">棋盘活动</p>
+            <h2>宫廷棋</h2>
+          </div>
+        </div>
+        <div class="arena-layout">
+          <div class="arena-controls">
+            <p class="field-hint">持续自动掷骰；出现交互选项时按界面顺序选择第二个按钮。</p>
+            <div class="command-bar command-bar--arena">
+              <button id="run-monopoly" class="button button--primary" type="button">开始自动掷骰</button>
+              <button id="stop-monopoly" class="button button--danger" type="button" disabled>停止</button>
+            </div>
+          </div>
+          <dl class="arena-stats" aria-live="polite">
+            <div><dt>已掷骰</dt><dd id="monopoly-rolls">0</dd></div>
+            <div><dt>交互选择</dt><dd id="monopoly-interactions">0</dd></div>
+            <div><dt>展示确认</dt><dd id="monopoly-confirms">0</dd></div>
+            <div><dt>最后骰子 / 点数</dt><dd id="monopoly-dice-point">-- / --</dd></div>
+            <div><dt>当前格位</dt><dd id="monopoly-cell">--</dd></div>
+            <div><dt>回合</dt><dd id="monopoly-turn">-- / --</dd></div>
+            <div><dt>当前阶段</dt><dd id="monopoly-stage">空闲</dd></div>
+            <div class="arena-stats__last"><dt>最后结果</dt><dd id="monopoly-last-result">等待开始</dd></div>
           </dl>
         </div>
       </section>

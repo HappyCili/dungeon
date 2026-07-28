@@ -873,6 +873,30 @@ class GameSessionManager:
                 self._recover_session_unlocked(self._session, endpoint)
             return self._session
 
+    def session_for_snapshot(self, endpoint: GameEndpoint) -> GameSession:
+        """Return a ready session for a read-only server snapshot.
+
+        Dashboard refreshes need to remain responsive when the login stream
+        reports a residual battle or dialog.  They may inspect the
+        server-provided ``Game_data`` snapshot, but must not start a potentially
+        long feature recovery as a side effect.  Task execution continues to
+        use :meth:`session_for`, which retains the recovery barrier.
+        """
+
+        with self._lock:
+            if self._session is None:
+                self._session = GameSession(
+                    timeout=self._timeout,
+                    socket_factory=self._socket_factory,
+                    owned=True,
+                    websocket_log=self._websocket_log,
+                )
+            self._session.ensure_ready(endpoint)
+            # Capture post-login pushes before deciding whether the snapshot is
+            # safe to supplement with a normal business query.
+            self._session.collect_recovery_messages()
+            return self._session
+
     def _recover_session_unlocked(
         self,
         session: GameSession,

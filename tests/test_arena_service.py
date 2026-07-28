@@ -121,6 +121,24 @@ class InMemoryArenaClient:
         )
 
 
+class UnsettledArenaClient(InMemoryArenaClient):
+    def run_round(
+        self,
+        index: int,
+        *,
+        win_choice_id: int | None = None,
+        mercy_choice_id: int | None = None,
+    ) -> DragonArenaRoundResult:
+        self.rounds += 1
+        self.challenged[index - 1] = True
+        return DragonArenaRoundResult(
+            index=index,
+            challenge=DragonArenaChallengeResponse(0, index, 0, True, 0),
+            battle=None,
+            mercy=None,
+        )
+
+
 class ArenaServiceTestCase(unittest.TestCase):
     def setUp(self) -> None:
         self.clients: list[InMemoryArenaClient] = []
@@ -204,6 +222,37 @@ class ArenaServiceTestCase(unittest.TestCase):
         )
 
         self.assertEqual(self.clients[0].choice_ids, [1])
+
+    def test_unsettled_round_is_not_counted_or_reported_complete(self) -> None:
+        client = UnsettledArenaClient()
+        service = ArenaService(
+            live_client_builder=lambda _endpoint, _log: client,
+            kickout_retry_delay=0,
+            result_log_destination=None,
+        )
+        events: list[tuple[str, str, dict[str, object]]] = []
+
+        result = service.run(
+            self.endpoint,
+            2,
+            "mercy",
+            True,
+            lambda level, message, data: events.append((level, message, data)),
+            lambda: False,
+        )
+
+        stats = result["arena"]
+        self.assertEqual(stats["completed_rounds"], 0)
+        self.assertEqual(stats["wins"], 0)
+        self.assertEqual(stats["losses"], 0)
+        self.assertEqual(stats["stop_reason"], "未收到服务端战斗结算")
+        self.assertEqual(stats["stage"], "未完成")
+        messages = [message for _, message, _ in events]
+        self.assertTrue(any("未收到战斗结算" in message for message in messages))
+        self.assertTrue(any(message.startswith("状态未更新") for message in messages))
+        self.assertTrue(any("进度 0/2" in message for message in messages))
+        self.assertFalse(any("第 1 轮已完成" in message for message in messages))
+        self.assertTrue(any(message.startswith("未完成") for message in messages))
 
     def test_kickout_ret2_refreshes_endpoint_and_retries_login(self) -> None:
         refreshed = GameEndpoint("ws://retry.invalid", "token-2", "4101", "真实一区")

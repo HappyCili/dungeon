@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 
-CONFIG_VERSION = 6
+CONFIG_VERSION = 7
 DEFAULT_ENABLED_TASK_IDS = [104, 112, 119]
 VALID_OUTCOMES = frozenset({"mercy", "execute"})
 MAX_TREASURE_SWEEP_TIMES = 30
@@ -66,6 +66,13 @@ class AbyssSettings:
 
 
 @dataclass
+class TwinSpiralSettings:
+    """秽肉之塔目标节点；0 表示使用服务端当前节点。"""
+
+    node_id: int = 0
+
+
+@dataclass
 class UiSettings:
     version: int = CONFIG_VERSION
     account: AccountSettings = field(default_factory=AccountSettings)
@@ -75,6 +82,7 @@ class UiSettings:
     treasure: TreasureSettings = field(default_factory=TreasureSettings)
     dungeon: DungeonSettings = field(default_factory=DungeonSettings)
     abyss: AbyssSettings = field(default_factory=AbyssSettings)
+    twin_spiral: TwinSpiralSettings = field(default_factory=TwinSpiralSettings)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -98,6 +106,7 @@ def settings_from_mapping(value: Mapping[str, object]) -> UiSettings:
     treasure = _mapping(value.get("treasure"))
     dungeon = _mapping(value.get("dungeon"))
     abyss = _mapping(value.get("abyss"))
+    twin_spiral = _mapping(value.get("twin_spiral"))
 
     selected = daily.get("enabled_task_ids")
     enabled_task_ids = (
@@ -163,6 +172,14 @@ def settings_from_mapping(value: Mapping[str, object]) -> UiSettings:
     if not isinstance(abyss_auto_buff, bool):
         abyss_auto_buff = True
 
+    twin_spiral_node_id = twin_spiral.get("node_id")
+    if (
+        not isinstance(twin_spiral_node_id, int)
+        or isinstance(twin_spiral_node_id, bool)
+        or not 0 <= twin_spiral_node_id <= 0x7FFFFFFF
+    ):
+        twin_spiral_node_id = 0
+
     zone_id = _bounded_string(zone.get("id"), 64)
     zone_name = _bounded_string(zone.get("name"), 128)
     if zone_name.startswith("演示"):
@@ -195,6 +212,7 @@ def settings_from_mapping(value: Mapping[str, object]) -> UiSettings:
             max_rounds=abyss_max_rounds,
             auto_buff=abyss_auto_buff,
         ),
+        twin_spiral=TwinSpiralSettings(node_id=twin_spiral_node_id),
     )
 
 
@@ -311,4 +329,9 @@ class ConfigStore:
                 setattr(settings.abyss, "max_rounds", max_rounds),
                 setattr(settings.abyss, "auto_buff", auto_buff),
             )
+        )
+
+    def set_twin_spiral(self, node_id: int) -> UiSettings:
+        return self.update(
+            lambda settings: setattr(settings.twin_spiral, "node_id", node_id)
         )

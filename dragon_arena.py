@@ -2119,6 +2119,11 @@ class DragonArenaClient:
             result = self.run_round(index, win_choice_id=choice_id)
             results.append(result)
             attempted.add(index)
+            if result.battle is None:
+                # 未收到结算时保留已完成结果，但停止发送后续请求，避免把
+                # 未完成战斗误算为挑战次数并让会话进入不一致状态。
+                self.log("[龙痕竞技场] 本轮无结算，停止循环以等待状态恢复。")
+                break
             if result.battle is not None and result.battle.win:
                 wins += 1
                 # 服务端可能在匹配/获胜后替换候选列表；下一轮会以最新 info 决定序号。

@@ -160,3 +160,26 @@ MsgHdr：`field1` varint = message_id（与 `encode_message_header` 一致）。
 `18002` = Battle_info。自动化侧已对齐客户端进图序列：`Client_talog(enter_map/scene_change)` + `Evt_script_trigger` + 加长监听（见 `treasure_farm._signal_stage_ready`）。
 
 **注意**：手机会话与自动化会话互斥（Kickout）。Frida 抓到的 18002 **不能**直接注入另一 WebSocket；只能用来对照协议与完善自动化就绪序列。挂起战仍建议客户端打完再刷，或依赖就绪序列让服务端向自动化会话补发 18002。
+
+---
+
+## 军团战流程校验
+
+`tools/frida_hook_legion_war.js` 只读截获 `TJ.TJWebSocket` 的军团战 `MsgHdr`，并保存以下协议：`20050`、`20054`、`20055`、`20057`、`20061`、`20064`、`20074`、`20075`、`20080`、`19532`。不会改写收发参数或客户端状态。
+
+```bash
+cd /Users/max/Downloads/dungeon4_M521957/ui_app
+ANDROID_SERIAL=emulator-5554 ./tools/start_frida_server.sh
+./tools/run_frida_legion_war_capture.sh
+# 在模拟器游戏内完成一次军团战日常，然后按 Ctrl+C
+```
+
+默认日志为 `/tmp/dungeon4_legion_war_frida.jsonl`，停止捕获后会自动执行：
+
+```bash
+../.venv/bin/python tools/validate_legion_war_capture.py /tmp/dungeon4_legion_war_frida.jsonl
+```
+
+校验器会确认围攻状态后再出击、城堡 ID 与响应匹配、出击军官按品质/等级/ID 排序、战术来自当前候选且为最高品质、失败围攻后不继续收税/招募/升级，以及各消息的服务端成功字段。
+
+捕获器固定使用 `ANDROID_SERIAL`（默认 `emulator-5554`）并经 `adb forward` 连接，避免在同时连接真机时误附加到 USB 设备。实际客户端必须已登录；若启动页提示登录超时，则不会有可校验的军团战报文。

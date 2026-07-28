@@ -1009,11 +1009,12 @@ select:hover {
   }
 
   .tabs {
+    flex-wrap: wrap;
     padding: 0 14px;
   }
 
   .tab-button {
-    flex: 1 1 0;
+    flex: 1 1 76px;
     padding: 0 8px;
   }
 

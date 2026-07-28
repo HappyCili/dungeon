@@ -12,12 +12,15 @@
     dungeonRewards: [],
     dungeonDraw: null,
     abyss: null,
+    twinSpiral: null,
+    monopoly: null,
     activeJobId: initialState.config.active_job_id,
     lastSequence: 0,
     pollTimer: null,
     toastTimer: null,
     activeTab: "daily",
     tabRefreshGeneration: 0,
+    dailyRefreshPending: false,
   };
 
   const elements = {
@@ -38,6 +41,7 @@
     selectAvailable: document.getElementById("select-available"),
     clearSelection: document.getElementById("clear-selection"),
     refreshDaily: document.getElementById("refresh-daily"),
+    resolveRecovery: document.getElementById("resolve-recovery"),
     runDaily: document.getElementById("run-daily"),
     stopDaily: document.getElementById("stop-daily"),
     rounds: document.getElementById("arena-rounds"),
@@ -106,6 +110,29 @@
     abyssCompleted: document.getElementById("abyss-completed"),
     abyssStage: document.getElementById("abyss-stage"),
     abyssLastResult: document.getElementById("abyss-last-result"),
+    twinSpiralNodeId: document.getElementById("twin-spiral-node-id"),
+    refreshTwinSpiral: document.getElementById("refresh-twin-spiral"),
+    runTwinSpiral: document.getElementById("run-twin-spiral"),
+    stopTwinSpiral: document.getElementById("stop-twin-spiral"),
+    twinSpiralArea: document.getElementById("twin-spiral-area"),
+    twinSpiralCurrentNode: document.getElementById("twin-spiral-current-node"),
+    twinSpiralAvailableNodes: document.getElementById("twin-spiral-available-nodes"),
+    twinSpiralBattleCount: document.getElementById("twin-spiral-battle-count"),
+    twinSpiralWinLoss: document.getElementById("twin-spiral-win-loss"),
+    twinSpiralCompleted: document.getElementById("twin-spiral-completed"),
+    twinSpiralAuto: document.getElementById("twin-spiral-auto"),
+    twinSpiralStage: document.getElementById("twin-spiral-stage"),
+    twinSpiralLastResult: document.getElementById("twin-spiral-last-result"),
+    runMonopoly: document.getElementById("run-monopoly"),
+    stopMonopoly: document.getElementById("stop-monopoly"),
+    monopolyRolls: document.getElementById("monopoly-rolls"),
+    monopolyInteractions: document.getElementById("monopoly-interactions"),
+    monopolyConfirms: document.getElementById("monopoly-confirms"),
+    monopolyDicePoint: document.getElementById("monopoly-dice-point"),
+    monopolyCell: document.getElementById("monopoly-cell"),
+    monopolyTurn: document.getElementById("monopoly-turn"),
+    monopolyStage: document.getElementById("monopoly-stage"),
+    monopolyLastResult: document.getElementById("monopoly-last-result"),
     jobStatus: document.getElementById("job-status"),
     jobProgress: document.getElementById("job-progress"),
     logList: document.getElementById("log-list"),
@@ -192,6 +219,9 @@
     }
     if (elements.abyssAutoBuff && config.abyss) {
       elements.abyssAutoBuff.checked = Boolean(config.abyss.auto_buff);
+    }
+    if (elements.twinSpiralNodeId && config.twin_spiral) {
+      elements.twinSpiralNodeId.value = String(config.twin_spiral.node_id ?? 0);
     }
     elements.treasureTimes.value = String(config.treasure.times);
     if (elements.treasureFarmHearth) {
@@ -564,6 +594,85 @@
     });
   }
 
+  function renderTwinSpiralStats(stats) {
+    if (!elements.twinSpiralArea) {
+      return;
+    }
+    if (!stats) {
+      elements.twinSpiralArea.textContent = "--";
+      elements.twinSpiralCurrentNode.textContent = "--";
+      elements.twinSpiralAvailableNodes.textContent = "--";
+      elements.twinSpiralBattleCount.textContent = "--";
+      elements.twinSpiralWinLoss.textContent = "0 / 0";
+      elements.twinSpiralCompleted.textContent = "0";
+      elements.twinSpiralAuto.textContent = "未开启";
+      elements.twinSpiralStage.textContent = "空闲";
+      elements.twinSpiralLastResult.textContent = "等待开始";
+      return;
+    }
+    elements.twinSpiralArea.textContent = stats.current_area_id || "--";
+    elements.twinSpiralCurrentNode.textContent = stats.current_node_id || "--";
+    const nodes = stats.available_node_ids || [];
+    elements.twinSpiralAvailableNodes.textContent = nodes.length ? nodes.join("、") : "--";
+    elements.twinSpiralBattleCount.textContent = String(stats.battle_count ?? "--");
+    elements.twinSpiralWinLoss.textContent = `${stats.wins || 0} / ${stats.losses || 0}`;
+    elements.twinSpiralCompleted.textContent = String(stats.completed_rounds || 0);
+    elements.twinSpiralAuto.textContent = stats.auto_enabled ? "已开启" : "未开启";
+    if (stats.stage) {
+      elements.twinSpiralStage.textContent = stats.stage;
+    }
+    if (stats.last_result) {
+      elements.twinSpiralLastResult.textContent = stats.last_result;
+    }
+  }
+
+  function renderTwinSpiralStatus(twinSpiral) {
+    state.twinSpiral = twinSpiral;
+    if (!twinSpiral) {
+      renderTwinSpiralStats(null);
+      return;
+    }
+    renderTwinSpiralStats({
+      ...twinSpiral,
+      wins: 0,
+      losses: 0,
+      completed_rounds: 0,
+      auto_enabled: false,
+      stage: "空闲",
+      last_result: "等待开始",
+    });
+  }
+
+  function renderMonopolyStats(stats) {
+    if (!elements.monopolyRolls) {
+      return;
+    }
+    state.monopoly = stats;
+    if (!stats) {
+      elements.monopolyRolls.textContent = "0";
+      elements.monopolyInteractions.textContent = "0";
+      elements.monopolyConfirms.textContent = "0";
+      elements.monopolyDicePoint.textContent = "-- / --";
+      elements.monopolyCell.textContent = "--";
+      elements.monopolyTurn.textContent = "-- / --";
+      elements.monopolyStage.textContent = "空闲";
+      elements.monopolyLastResult.textContent = "等待开始";
+      return;
+    }
+    elements.monopolyRolls.textContent = String(stats.rolls || 0);
+    elements.monopolyInteractions.textContent = String(stats.interactions || 0);
+    elements.monopolyConfirms.textContent = String(stats.display_confirms || 0);
+    elements.monopolyDicePoint.textContent = `${stats.last_dice_id || "--"} / ${stats.last_point ?? "--"}`;
+    elements.monopolyCell.textContent = String(stats.cell_no ?? "--");
+    elements.monopolyTurn.textContent = `${stats.current_turn ?? "--"} / ${stats.total_turn ?? "--"}`;
+    if (stats.stage) {
+      elements.monopolyStage.textContent = stats.stage;
+    }
+    if (stats.last_result) {
+      elements.monopolyLastResult.textContent = stats.last_result;
+    }
+  }
+
   function renderDungeon(dungeon) {
     state.dungeon = dungeon;
     const fragment = document.createDocumentFragment();
@@ -643,6 +752,16 @@
     if (!timestamp) {
       return "--:--:--";
     }
+    const date = new Date(timestamp);
+    if (!Number.isNaN(date.getTime())) {
+      return new Intl.DateTimeFormat("zh-CN", {
+        timeZone: "Asia/Shanghai",
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+        hourCycle: "h23",
+      }).format(date);
+    }
     const match = timestamp.match(/T(\d{2}:\d{2}:\d{2})/);
     return match ? match[1] : timestamp.slice(-8);
   }
@@ -660,6 +779,9 @@
       treasure_farm: "聚宝刷取",
       dungeon: "地下城",
       abyss: "罪者深渊",
+      twin_spiral: "双生螺旋",
+      monopoly: "宫廷棋",
+      recovery: "状态恢复",
     };
     feature.textContent = featureLabels[event.feature] || "系统";
     const message = document.createElement("p");
@@ -693,7 +815,10 @@
       && Number(elements.treasureFarmHearth?.value || 0) > 0;
     const dungeonReady = dungeonLoaded
       && state.dungeon.dungeons.some((dungeon) => dungeon.id === selectedDungeonId);
-    elements.runDaily.disabled = active || !dailyLoaded;
+    elements.runDaily.disabled = active || !dailyLoaded || Boolean(state.daily?.actions_blocked);
+    elements.runDaily.title = state.daily?.actions_blocked
+      ? (state.daily.status_notice || "当前服务端状态暂不允许执行任务")
+      : "";
     elements.runArena.disabled = active || !sessionReady;
     elements.runTreasure.disabled = active || !treasureReady;
     if (elements.runTreasureFarm) {
@@ -702,6 +827,12 @@
     elements.runDungeon.disabled = active || !dungeonReady;
     if (elements.runAbyss) {
       elements.runAbyss.disabled = active || !sessionReady;
+    }
+    if (elements.runTwinSpiral) {
+      elements.runTwinSpiral.disabled = active || !sessionReady;
+    }
+    if (elements.runMonopoly) {
+      elements.runMonopoly.disabled = active || !sessionReady;
     }
     elements.stopDaily.disabled = !active;
     elements.stopArena.disabled = !active;
@@ -713,9 +844,19 @@
     if (elements.stopAbyss) {
       elements.stopAbyss.disabled = !active;
     }
+    if (elements.stopTwinSpiral) {
+      elements.stopTwinSpiral.disabled = !active;
+    }
+    if (elements.stopMonopoly) {
+      elements.stopMonopoly.disabled = !active;
+    }
     elements.selectAvailable.disabled = active || !dailyLoaded;
     elements.clearSelection.disabled = active || !dailyLoaded;
-    elements.refreshDaily.disabled = active || !sessionReady;
+    elements.refreshDaily.disabled = active || !sessionReady || state.dailyRefreshPending;
+    elements.resolveRecovery.disabled = active || !sessionReady || !Boolean(state.daily?.actions_blocked);
+    elements.resolveRecovery.title = state.daily?.actions_blocked
+      ? (state.daily.status_notice || "处理服务端遗留战斗或事件")
+      : "当前没有需要处理的遗留状态";
     elements.refreshArena.disabled = active || !sessionReady;
     elements.refreshTreasure.disabled = active || !sessionReady;
     if (elements.refreshTreasureFarm) {
@@ -724,6 +865,12 @@
     elements.refreshDungeon.disabled = active || !sessionReady;
     if (elements.refreshAbyss) {
       elements.refreshAbyss.disabled = active || !sessionReady;
+    }
+    if (elements.refreshTwinSpiral) {
+      elements.refreshTwinSpiral.disabled = active || !sessionReady;
+    }
+    if (elements.twinSpiralNodeId) {
+      elements.twinSpiralNodeId.disabled = active;
     }
     if (elements.abyssMaxRounds) {
       elements.abyssMaxRounds.disabled = active;
@@ -781,6 +928,12 @@
       if (event.data.abyss) {
         renderAbyssStats(event.data.abyss);
       }
+      if (event.data.twin_spiral) {
+        renderTwinSpiralStats(event.data.twin_spiral);
+      }
+      if (event.data.monopoly) {
+        renderMonopolyStats(event.data.monopoly);
+      }
       if (event.feature === "dungeon" && Object.prototype.hasOwnProperty.call(event.data, "rewards")) {
         renderDungeonRewards(event.data.rewards, event.data.draw || null);
       }
@@ -802,6 +955,12 @@
     }
     if (job.result?.abyss) {
       renderAbyssStats(job.result.abyss);
+    }
+    if (job.result?.twin_spiral) {
+      renderTwinSpiralStats(job.result.twin_spiral);
+    }
+    if (job.result?.monopoly) {
+      renderMonopolyStats(job.result.monopoly);
     }
     if (job.feature === "dungeon" && job.result && Object.prototype.hasOwnProperty.call(job.result, "rewards")) {
       renderDungeonRewards(job.result.rewards, job.result.draw || null);
@@ -849,6 +1008,21 @@
         + ` · ${abyss.wins || 0} 胜 / ${abyss.losses || 0} 负`
         + ` · ${abyss.stage || ""}`
       );
+    } else if (progress.twin_spiral) {
+      const twinSpiral = progress.twin_spiral;
+      elements.jobProgress.textContent = (
+        `秽肉之塔 · ${twinSpiral.wins || 0} 胜 / ${twinSpiral.losses || 0} 负`
+        + ` · ${twinSpiral.stage || ""}`
+      );
+    } else if (progress.monopoly) {
+      const monopoly = progress.monopoly;
+      elements.jobProgress.textContent = (
+        `宫廷棋 · 已掷骰 ${monopoly.rolls || 0} 次`
+        + ` · 交互 ${monopoly.interactions || 0} 次`
+        + ` · ${monopoly.stage || ""}`
+      );
+    } else if (progress.recovery) {
+      elements.jobProgress.textContent = `遗留状态 · ${progress.recovery.stage || "处理中"}`;
     } else {
       elements.jobProgress.textContent = jobStatusLabels[status] || status;
     }
@@ -1028,10 +1202,52 @@
     setJobControls();
   }
 
-  async function refreshDaily() {
-    const daily = await api("/api/daily-tasks", { method: "GET" });
-    renderDaily(daily);
+  function normalizedTwinSpiralNodeId() {
+    const raw = Number(elements.twinSpiralNodeId?.value || 0);
+    if (!Number.isInteger(raw) || raw < 0) {
+      return 0;
+    }
+    return Math.min(2147483647, raw);
+  }
+
+  async function saveTwinSpiralConfig() {
+    if (!elements.twinSpiralNodeId) {
+      return;
+    }
+    const nodeId = normalizedTwinSpiralNodeId();
+    elements.twinSpiralNodeId.value = String(nodeId);
+    const data = await api("/api/config/twin-spiral", {
+      method: "PUT",
+      body: JSON.stringify({ node_id: nodeId }),
+    });
+    applyConfig(data.config);
+  }
+
+  async function refreshTwinSpiral() {
+    const data = await api("/api/twin-spiral", { method: "GET" });
+    applyConfig(data.config);
+    renderTwinSpiralStatus(data.twin_spiral);
     setJobControls();
+  }
+
+  async function refreshDaily() {
+    if (state.dailyRefreshPending) {
+      return null;
+    }
+    state.dailyRefreshPending = true;
+    elements.refreshDaily.textContent = "刷新中";
+    elements.refreshDaily.setAttribute("aria-busy", "true");
+    setJobControls();
+    try {
+      const daily = await api("/api/daily-tasks", { method: "GET" });
+      renderDaily(daily);
+      return daily;
+    } finally {
+      state.dailyRefreshPending = false;
+      elements.refreshDaily.textContent = "刷新状态";
+      elements.refreshDaily.removeAttribute("aria-busy");
+      setJobControls();
+    }
   }
 
   async function refreshTab(name, { notify = false } = {}) {
@@ -1041,9 +1257,9 @@
     const generation = ++state.tabRefreshGeneration;
     try {
       if (name === "daily") {
-        await refreshDaily();
+        const daily = await refreshDaily();
         if (notify && generation === state.tabRefreshGeneration) {
-          showToast("日常状态已刷新");
+          showToast(daily?.status_notice || "日常状态已刷新");
         }
       } else if (name === "arena") {
         await refreshArena();
@@ -1065,6 +1281,13 @@
         if (notify && generation === state.tabRefreshGeneration) {
           showToast("罪者深渊状态已刷新");
         }
+      } else if (name === "twin-spiral") {
+        await refreshTwinSpiral();
+        if (notify && generation === state.tabRefreshGeneration) {
+          showToast("双生螺旋状态已刷新");
+        }
+      } else if (name === "monopoly" && notify && generation === state.tabRefreshGeneration) {
+        showToast("宫廷棋已就绪");
       }
     } catch (error) {
       if (generation === state.tabRefreshGeneration) {
@@ -1113,6 +1336,7 @@
     renderDungeon(null);
     renderDungeonRewards();
     renderAbyssStatus(null);
+    renderMonopolyStats(null);
     setJobControls();
     try {
       const data = await api("/api/account/login", {
@@ -1162,14 +1386,17 @@
       renderDungeon(null);
       renderDungeonRewards();
       renderAbyssStatus(null);
+      renderTwinSpiralStatus(null);
+      renderMonopolyStats(null);
       setJobControls();
-      const [daily, arena, treasure, dungeon, farm, abyss] = await Promise.all([
+      const [daily, arena, treasure, dungeon, farm, abyss, twinSpiral] = await Promise.all([
         api("/api/daily-tasks", { method: "GET" }),
         api("/api/arena", { method: "GET" }),
         api("/api/treasure", { method: "GET" }),
         api("/api/dungeon", { method: "GET" }),
         api("/api/treasure/farm-catalog", { method: "GET" }),
         api("/api/abyss", { method: "GET" }),
+        api("/api/twin-spiral", { method: "GET" }),
       ]);
       renderDaily(daily);
       applyConfig(arena.config);
@@ -1181,6 +1408,8 @@
       renderDungeon(dungeon);
       applyConfig(abyss.config);
       renderAbyssStatus(abyss.abyss);
+      applyConfig(twinSpiral.config);
+      renderTwinSpiralStatus(twinSpiral.twin_spiral);
       setJobControls();
     } catch (error) {
       showToast(error.message, true);
@@ -1201,6 +1430,29 @@
 
   elements.refreshDaily.addEventListener("click", () => {
     refreshTab("daily", { notify: true }).catch(() => {});
+  });
+
+  elements.resolveRecovery.addEventListener("click", async () => {
+    let started = false;
+    elements.resolveRecovery.disabled = true;
+    elements.jobStatus.textContent = "处理遗留状态";
+    elements.jobProgress.textContent = "正在读取服务端遗留战斗或事件";
+    try {
+      const data = await api("/api/jobs/recovery", {
+        method: "POST",
+        body: JSON.stringify({}),
+      });
+      beginPolling(data.job);
+      started = true;
+    } catch (error) {
+      showToast(error.message, true);
+      elements.jobStatus.textContent = "空闲";
+      elements.jobProgress.textContent = "等待操作";
+    } finally {
+      if (!started) {
+        setJobControls();
+      }
+    }
   });
 
   elements.runDaily.addEventListener("click", async () => {
@@ -1531,6 +1783,82 @@
     });
   }
 
+  if (elements.refreshTwinSpiral) {
+    elements.refreshTwinSpiral.addEventListener("click", () => {
+      refreshTwinSpiral()
+        .then(() => showToast("双生螺旋状态已刷新"))
+        .catch((error) => showToast(error.message, true));
+    });
+  }
+
+  if (elements.twinSpiralNodeId) {
+    elements.twinSpiralNodeId.addEventListener("change", () => {
+      elements.twinSpiralNodeId.value = String(normalizedTwinSpiralNodeId());
+      saveTwinSpiralConfig().catch((error) => showToast(error.message, true));
+    });
+  }
+
+  if (elements.runTwinSpiral) {
+    elements.runTwinSpiral.addEventListener("click", async () => {
+      const nodeId = normalizedTwinSpiralNodeId();
+      try {
+        const data = await api("/api/jobs/twin-spiral", {
+          method: "POST",
+          body: JSON.stringify({ node_id: nodeId }),
+        });
+        applyConfig(data.config);
+        renderTwinSpiralStats({
+          ...(state.twinSpiral || {}),
+          node_id: nodeId,
+          wins: 0,
+          losses: 0,
+          completed_rounds: 0,
+          auto_enabled: false,
+          stage: "连接中",
+          last_result: "正在连接双生螺旋",
+        });
+        beginPolling(data.job);
+      } catch (error) {
+        showToast(error.message, true);
+        setJobControls();
+      }
+    });
+  }
+
+  if (elements.stopTwinSpiral) {
+    elements.stopTwinSpiral.addEventListener("click", () => {
+      cancelActiveJob().catch(() => {});
+    });
+  }
+
+  if (elements.runMonopoly) {
+    elements.runMonopoly.addEventListener("click", async () => {
+      try {
+        const data = await api("/api/jobs/monopoly", {
+          method: "POST",
+          body: JSON.stringify({}),
+        });
+        renderMonopolyStats({
+          rolls: 0,
+          interactions: 0,
+          display_confirms: 0,
+          stage: "连接中",
+          last_result: "正在连接宫廷棋",
+        });
+        beginPolling(data.job);
+      } catch (error) {
+        showToast(error.message, true);
+        setJobControls();
+      }
+    });
+  }
+
+  if (elements.stopMonopoly) {
+    elements.stopMonopoly.addEventListener("click", () => {
+      cancelActiveJob().catch(() => {});
+    });
+  }
+
   document.querySelectorAll("[data-tab]").forEach((button) => {
     button.addEventListener("click", () => activateTab(button.dataset.tab));
   });
@@ -1544,6 +1872,8 @@
   renderDungeon(null);
   renderDungeonRewards();
   renderAbyssStatus(null);
+  renderTwinSpiralStatus(null);
+  renderMonopolyStats(null);
   setJobControls();
   refreshTreasureFarm().catch(() => {});
   if (state.config.connection.status === "available" && state.config.zones.length > 0) {

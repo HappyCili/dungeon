@@ -1,5 +1,5 @@
 {
-  "version": 6,
+  "version": 7,
   "account": {
     "username": "17767051461",
     "remember_password": true
@@ -10,32 +10,28 @@
   },
   "daily": {
     "enabled_task_ids": [
-      101,
-      103,
-      104,
-      105,
-      106,
-      109,
-      112,
-      119
+      116
     ]
   },
   "arena": {
-    "rounds": 10,
+    "rounds": 100,
     "outcome": "mercy",
     "refresh_on_exhaustion": true
   },
   "treasure": {
     "area_id": 530101,
     "times": 10,
-    "farm_area_id": 530101,
+    "farm_area_id": 730101,
     "farm_target_hearth": 5000
   },
   "dungeon": {
-    "dungeon_id": 3
+    "dungeon_id": 2
   },
   "abyss": {
     "max_rounds": 0,
     "auto_buff": true
+  },
+  "twin_spiral": {
+    "node_id": 0
   }
 }

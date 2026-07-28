@@ -16,7 +16,9 @@ from .services.abyss_service import AbyssService
 from .services.arena_service import ArenaService
 from .services.daily_service import DailyService
 from .services.dungeon_service import DungeonService
+from .services.monopoly_service import MonopolyService
 from .services.treasure_service import TreasureService
+from .services.twin_spiral_service import TwinSpiralService
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -35,6 +37,8 @@ def create_app(
     treasure_service: TreasureService | None = None,
     dungeon_service: DungeonService | None = None,
     abyss_service: AbyssService | None = None,
+    twin_spiral_service: TwinSpiralService | None = None,
+    monopoly_service: MonopolyService | None = None,
     game_session_manager: GameSessionManager | None = None,
 ) -> Flask:
     app = Flask(__name__)
@@ -72,9 +76,12 @@ def create_app(
         "dungeon": dungeon_service
         or DungeonService(session_manager=session_manager),
         "abyss": abyss_service or AbyssService(session_manager=session_manager),
+        "twin_spiral": twin_spiral_service
+        or TwinSpiralService(session_manager=session_manager),
+        "monopoly": monopoly_service or MonopolyService(session_manager=session_manager),
         "jobs": job_manager or JobManager(),
     }
     app.extensions["daily_console"] = services
-    app.jinja_env.globals["asset_version"] = "dungeon-abyss-v1"
+    app.jinja_env.globals["asset_version"] = "daily-recovery-monopoly-twin-spiral-v1"
     register_routes(app)
     return app

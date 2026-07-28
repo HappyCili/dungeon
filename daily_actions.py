@@ -36,6 +36,7 @@ DAILY_ACTION_SPECS: tuple[DailyActionSpec, ...] = (
     DailyActionSpec(106, 1, "庄园快速收取"),
     DailyActionSpec(109, 3, "骑士比武挑战"),
     DailyActionSpec(112, 1, "龙痕竞技场胜利"),
+    DailyActionSpec(116, 1, "军团税收领取"),
     DailyActionSpec(119, 1, "古律院铭刻"),
 )
 DAILY_ACTION_BY_ID = {spec.task_id: spec for spec in DAILY_ACTION_SPECS}
@@ -681,6 +682,34 @@ def run_dragon_arena_action(
     )
 
 
+def run_legion_war_action(
+    endpoint: GameEndpoint,
+    timeout: float,
+    remaining: int,
+    *,
+    client_factory: Callable[..., object] | None = None,
+    session: GameSession | None = None,
+) -> ActionExecution:
+    """执行日常任务 116：围攻、税收、招募和募兵升级。"""
+
+    if not 0 <= remaining <= DAILY_ACTION_BY_ID[116].target:
+        raise ValueError("军团税收领取剩余次数必须在 0 到 1 之间")
+    if remaining == 0:
+        return ActionExecution(0, 0, "无需执行军团税收领取")
+
+    from legion_war import LegionWarClient
+
+    factory = client_factory or LegionWarClient
+    client = _make_feature_client(factory, endpoint, timeout, session=session)
+    try:
+        result = client.run_daily()
+    finally:
+        close = getattr(client, "close", None)
+        if callable(close):
+            close()
+    return ActionExecution(1, 1, result.summary())
+
+
 def run_ancient_law_court_action(
     endpoint: GameEndpoint,
     timeout: float,
@@ -782,6 +811,11 @@ def build_live_daily_action_runner(
         ),
         112: CallableDailyAction(
             lambda remaining: run_dragon_arena_action(
+                endpoint, timeout, remaining, session=shared
+            )
+        ),
+        116: CallableDailyAction(
+            lambda remaining: run_legion_war_action(
                 endpoint, timeout, remaining, session=shared
             )
         ),

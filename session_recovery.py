@@ -365,6 +365,46 @@ class GraveAbyssRecoveryHandler:
             client.close()
 
 
+class KnightArenaPreparationRecoveryHandler:
+    """Release a Knight Arena screen restored before an actual battle starts.
+
+    ``battleType=5`` is the ordinary Arena PVP flow.  The native client keeps
+    ``battleState=1`` while its team preparation screen is open, even before
+    the server has emitted ``Battle_info``.  There is no battle handshake to
+    continue in that case, so routing it to the generic handler only leaves a
+    shared session waiting for packets that will never arrive.
+    """
+
+    name = "knight_arena_preparation"
+    _KNIGHT_ARENA_BATTLE_TYPE = 5
+
+    def can_handle(self, snapshot: SessionRecoverySnapshot) -> bool:
+        battle_issue = next(
+            (issue for issue in snapshot.issues if issue.kind == "battle"), None
+        )
+        return bool(
+            battle_issue
+            and battle_issue.battle_type == self._KNIGHT_ARENA_BATTLE_TYPE
+            and battle_issue.battle_state == 1
+            and not battle_issue.message_ids
+        )
+
+    def recover(
+        self,
+        session: GameSession,
+        _endpoint: GameEndpoint,
+        _snapshot: SessionRecoverySnapshot,
+    ) -> RecoveryResult:
+        # A marker-only preparation screen has no server-side result to settle.
+        # Clear the local login barrier so a subsequent explicit Arena action
+        # can issue its own challenge request.
+        session.resolve_recovery_issue("battle")
+        return RecoveryResult(
+            self.name,
+            "骑士比武停在备战界面，未收到 Battle_info，已解除本地等待",
+        )
+
+
 class GenericBattleRecoveryHandler:
     """Continue a standard Battle_info handshake without feature-local state.
 
@@ -529,6 +569,7 @@ def build_default_recovery_coordinator() -> SessionRecoveryCoordinator:
             MapActivityRecoveryHandler(),
             DragonArenaRecoveryHandler(),
             GraveAbyssRecoveryHandler(),
+            KnightArenaPreparationRecoveryHandler(),
             GenericBattleRecoveryHandler(),
         )
     )

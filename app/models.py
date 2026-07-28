@@ -32,7 +32,7 @@ DAILY_TASKS: tuple[DailyTaskDefinition, ...] = (
     DailyTaskDefinition(113, "裂境角逐挑战", 1, 10, False, "尚未接入", "缺少挑战和结算适配器"),
     DailyTaskDefinition(114, "审判庭人物送礼", 1, 10, False, "尚未接入", "缺少礼物选择与库存检查适配器"),
     DailyTaskDefinition(115, "铁匠铺精炼", 1, 10, False, "尚未接入", "缺少精炼适配器"),
-    DailyTaskDefinition(116, "军团税收领取", 1, 10, False, "尚未接入", "缺少税收状态与领取适配器"),
+    DailyTaskDefinition(116, "军团税收领取", 1, 10, True, "可执行", "优先处理被围攻城堡，再领取税收并执行军官招募与募兵升级"),
     DailyTaskDefinition(117, "进入阴魂大厅", 1, 10, False, "尚未接入", "缺少大厅进入适配器"),
     DailyTaskDefinition(118, "无序迷境挑战", 1, 10, False, "尚未接入", "缺少队伍、战斗和结算适配器"),
     DailyTaskDefinition(119, "古律院铭刻", 1, 10, True, "可执行", "登录并选择区服后通过游戏服会话执行"),

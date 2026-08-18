@@ -1,5 +1,5 @@
 {
-  "version": 7,
+  "version": 9,
   "account": {
     "username": "17767051461",
     "remember_password": true
@@ -10,7 +10,16 @@
   },
   "daily": {
     "enabled_task_ids": [
-      116
+      101,
+      103,
+      104,
+      105,
+      106,
+      107,
+      109,
+      112,
+      116,
+      119
     ]
   },
   "arena": {
@@ -19,7 +28,7 @@
     "refresh_on_exhaustion": true
   },
   "treasure": {
-    "area_id": 530101,
+    "area_id": 730101,
     "times": 10,
     "farm_area_id": 730101,
     "farm_target_hearth": 5000
@@ -33,5 +42,26 @@
   },
   "twin_spiral": {
     "node_id": 0
+  },
+  "auto_tasks": {
+    "enabled_task_keys": [
+      "signin",
+      "fief",
+      "monthly_vip",
+      "furnace",
+      "dragon_reward_like",
+      "treasure_sweep",
+      "knight_arena",
+      "legion_war",
+      "dragon_arena",
+      "dungeon_sweep",
+      "monopoly",
+      "daily_rewards"
+    ],
+    "scheduler_enabled": true,
+    "interval_minutes": 60,
+    "dragon_target_mode": "inventory",
+    "dragon_target_value": 10000,
+    "furnace_target_value": 3000
   }
 }

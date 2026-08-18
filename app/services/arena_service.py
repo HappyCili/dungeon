@@ -30,6 +30,8 @@ from ..job_manager import JobExecutionError
 
 DRAGON_COIN_ITEM_ID = 440
 DRAGON_COIN_NAME = item_name(DRAGON_COIN_ITEM_ID)
+MATCH_RETRY_DELAY_SECONDS = 10.0
+CHALLENGE_RETRY_DELAY_SECONDS = 0.75
 EndpointRefresher = Callable[[], GameEndpoint]
 # 从可挑战序号列表中选一个（默认随机，贴近客户端列表展示的“乱序”体验）。
 OpponentPicker = Callable[[Sequence[int]], int]
@@ -183,6 +185,8 @@ class ArenaService:
         live_client_builder: LiveClientBuilder | None = None,
         game_timeout: float = 15.0,
         kickout_retry_delay: float = LOGIN_KICKOUT_RETRY_DELAY,
+        match_retry_delay: float = MATCH_RETRY_DELAY_SECONDS,
+        challenge_retry_delay: float = CHALLENGE_RETRY_DELAY_SECONDS,
         result_log_destination: object = MANAGED_DESTINATION,
         opponent_picker: OpponentPicker | None = None,
         session_manager: GameSessionManager | None = None,
@@ -204,6 +208,8 @@ class ArenaService:
             )
         )
         self._kickout_retry_delay = kickout_retry_delay
+        self._match_retry_delay = max(0.0, match_retry_delay)
+        self._challenge_retry_delay = max(0.0, challenge_retry_delay)
         self._result_log_destination = result_log_destination
         self._opponent_picker = opponent_picker or pick_random_opponent
 
@@ -220,7 +226,10 @@ class ArenaService:
                 lambda _message: None,
                 refresh_endpoint=refresh_endpoint,
             )
-            return self.payload(client.get_info())
+            info = client.get_info()
+            item_total = getattr(client, "item_total", None)
+            dragon_coin_total = item_total(DRAGON_COIN_ITEM_ID) if callable(item_total) else None
+            return self.payload(info, dragon_coin_total=dragon_coin_total)
         except GameLoginKickout as exc:
             raise ArenaServiceError(describe_login_kickout(exc)) from exc
         except (HarvestError, OSError, ValueError) as exc:
@@ -252,8 +261,13 @@ class ArenaService:
         def progress(level: str, message: str) -> None:
             emit(level, message, {"arena": dict(stats)})
 
-        # 底层协议细节不刷屏；界面只展示精简进度。
-        quiet_log = lambda _message: None
+        # 仅投影能解释当前作业状态的协议消息，避免将每个战斗帧刷到界面。
+        def protocol_progress(message: str) -> None:
+            if message.startswith("[挑战] 序号=") and "模式=" in message:
+                candidate = message.removeprefix("[挑战] ").split("，", 1)[0]
+                progress("info", f"服务端已接受挑战（{candidate}），准备进入战斗…")
+            elif message.startswith("[战斗] Battle_info："):
+                progress("info", "已收到战斗信息，正在进入战斗…")
 
         client: ArenaClient | None = None
         result_payload: dict[str, Any] | None = None
@@ -263,7 +277,7 @@ class ArenaService:
             progress("info", "连接龙痕竞技场…")
             client = self._open_client(
                 endpoint,
-                quiet_log,
+                protocol_progress,
                 refresh_endpoint=refresh_endpoint,
                 on_kickout_retry=lambda: progress(
                     "warning",
@@ -288,42 +302,96 @@ class ArenaService:
                     title="恢复遗留战斗",
                 )
 
-            attempted: set[int] = set()
+            attempted_robot_ids: set[int] = set()
+            cached_info: DragonArenaInfo | None = None
+            consecutive_challenge_rejections = 0
             refreshed_without_progress = False
             while stats["completed_rounds"] < rounds:
                 if stop_requested():
                     result_payload = self._finish(stats, cancelled=True, progress=progress)
                     return result_payload
-
                 stats["stage"] = "读取状态"
-                info = client.get_info()
+                if cached_info is None:
+                    info = client.get_info()
+                else:
+                    info = cached_info
+                    cached_info = None
                 self._apply_info(stats, info)
                 candidates = [
-                    index
+                    (index, opponent.robot_id)
                     for index, opponent in enumerate(info.opponents, start=1)
-                    if not opponent.challenged and index not in attempted
+                    if not opponent.challenged
+                    and opponent.robot_id not in attempted_robot_ids
                 ]
                 if not candidates:
+                    server_candidates = [
+                        opponent.robot_id
+                        for opponent in info.opponents
+                        if not opponent.challenged
+                    ]
+                    if server_candidates:
+                        if consecutive_challenge_rejections >= len(server_candidates):
+                            stats["stage"] = "等待重新挑战"
+                            stats["last_result"] = "当前候选均被服务端暂拒"
+                            stats["stop_reason"] = ""
+                            progress(
+                                "warning",
+                                "当前候选均被服务端暂拒，"
+                                f"{self._challenge_retry_delay:g} 秒后重新读取竞技场状态",
+                            )
+                            if not self._wait_for_challenge_retry(stop_requested):
+                                result_payload = self._finish(
+                                    stats, cancelled=True, progress=progress
+                                )
+                                return result_payload
+                            consecutive_challenge_rejections = 0
+                        # 按 robot_id 去重而非列表序号。21100 刷新可能重排候选，
+                        # 同一序号在刷新后不一定还是刚被拒绝的机器人。
+                        attempted_robot_ids.clear()
+                        stats["stage"] = "重新尝试候选"
+                        stats["last_result"] = "服务端仍有未挑战对手"
+                        stats["stop_reason"] = ""
+                        progress(
+                            "info",
+                            "服务端仍有 "
+                            f"{len(server_candidates)} 名未挑战对手，"
+                            "重新尝试当前候选集…",
+                        )
+                        continue
                     if refresh_on_exhaustion and not refreshed_without_progress:
                         stats["stage"] = "刷新对手"
                         progress("info", "对手已耗尽，正在寻找新对手…")
                         matched = client.match()
                         if getattr(matched, "ret", 0) == 0:
-                            attempted.clear()
+                            attempted_robot_ids.clear()
+                            consecutive_challenge_rejections = 0
                             refreshed_without_progress = True
                             candidate_count = len(getattr(matched, "opponents", ()))
                             # match 后立刻读一次状态，保证对手计数准确
-                            info = client.get_info()
-                            self._apply_info(stats, info)
+                            cached_info = client.get_info()
+                            self._apply_info(stats, cached_info)
                             progress(
                                 "info",
                                 f"已刷新对手 {candidate_count} 人 · {format_status_line(stats)}",
                             )
                             continue
-                        stats["stage"] = "寻找对手失败"
-                        stats["last_result"] = "服务端未返回可挑战对手"
-                        stats["stop_reason"] = stats["last_result"]
-                        progress("warning", stats["last_result"])
+                        match_ret = int(getattr(matched, "ret", 0))
+                        stats["stage"] = "等待重新匹配"
+                        stats["last_result"] = (
+                            f"寻找新对手被服务端拒绝（ret={match_ret}）"
+                        )
+                        stats["stop_reason"] = ""
+                        progress(
+                            "warning",
+                            stats["last_result"]
+                            + f"，{self._match_retry_delay:g} 秒后重试",
+                        )
+                        if not self._wait_for_match_retry(stop_requested):
+                            result_payload = self._finish(
+                                stats, cancelled=True, progress=progress
+                            )
+                            return result_payload
+                        continue
                     else:
                         stats["stage"] = "对手已耗尽"
                         stats["last_result"] = "当前没有可挑战对手"
@@ -331,18 +399,25 @@ class ArenaService:
                         progress("info", f"{stats['last_result']} · {format_status_line(stats)}")
                     break
 
-                index = self._opponent_picker(candidates)
+                candidate_indexes = [index for index, _robot_id in candidates]
+                index = self._opponent_picker(candidate_indexes)
+                robot_id = next(
+                    robot_id
+                    for candidate_index, robot_id in candidates
+                    if candidate_index == index
+                )
                 round_no = int(stats["completed_rounds"]) + 1
                 stats["stage"] = f"第 {round_no}/{rounds} 轮"
                 progress(
                     "info",
                     (
                         f"第 {round_no}/{rounds} 轮 · "
-                        f"随机挑战第 {index} 位对手"
-                        f"（候选 {len(candidates)} 人）· 开始战斗"
+                        f"请求服务端候选第 {index} 位"
+                        f"（robot_id={robot_id}，候选 {len(candidates)} 人）· "
+                        "发送挑战请求"
                     ),
                 )
-                progress("info", "战斗进行中…")
+                progress("info", "等待服务端挑战响应…")
                 result = client.run_round(index, win_choice_id=choice_id)
                 self._emit_round(
                     stats,
@@ -352,9 +427,22 @@ class ArenaService:
                     title=f"第 {round_no}/{rounds} 轮",
                 )
                 if result.battle is None:
-                    # 未收到结算时不能继续发送下一次竞技场请求，避免把未完成
-                    # 的战斗误计入轮数并污染后续状态。
-                    stats["stop_reason"] = "未收到服务端战斗结算"
+                    if result.challenge.ret != 0:
+                        # ret!=0 只拒绝当前候选；原生流程刷新 21100 后会继续
+                        # 从未尝试的候选中选择，直到收到可进入战斗的响应。
+                        attempted_robot_ids.add(robot_id)
+                        consecutive_challenge_rejections += 1
+                        stats["stop_reason"] = ""
+                        stats["stage"] = "刷新挑战状态"
+                        cached_info = client.get_info()
+                        self._apply_info(stats, cached_info)
+                        progress(
+                            "info",
+                            "已按原生客户端行为刷新竞技场状态 · "
+                            + format_status_line(stats)
+                            + " · 继续尝试其他候选",
+                        )
+                        continue
                     progress(
                         "warning",
                         (
@@ -363,9 +451,8 @@ class ArenaService:
                         ),
                     )
                     break
-                attempted.add(index)
-                if result.battle is not None and result.battle.win:
-                    attempted.clear()
+                attempted_robot_ids.add(robot_id)
+                consecutive_challenge_rejections = 0
                 refreshed_without_progress = False
 
             if stop_requested():
@@ -412,16 +499,29 @@ class ArenaService:
         choice = result.mercy
 
         if battle is None:
+            if result.challenge.ret != 0:
+                index = result.challenge.index or result.index
+                reason = (
+                    "挑战请求被服务端拒绝"
+                    f"（ret={result.challenge.ret}，序号={index}），当前请求未进入战斗"
+                )
+                stats["stage"] = "挑战被拒绝"
+                stats["last_result"] = reason
+                stats["stop_reason"] = reason
+                progress("warning", f"{title} · {reason}")
+                progress("info", f"状态未更新 · {format_status_line(stats)}")
+                return False
             stats["stop_reason"] = "未收到服务端战斗结算"
             progress("warning", f"{title} · 未收到战斗结算")
             progress("info", f"状态未更新 · {format_status_line(stats)}")
             return False
 
+        battle_index = battle.index or result.challenge.index or result.index
         if battle.win:
-            progress("success", f"{title} · 战斗完成：胜利")
+            progress("success", f"{title} · 对手第 {battle_index} 位 · 战斗完成：胜利")
             level = "success"
         else:
-            progress("warning", f"{title} · 战斗完成：失败")
+            progress("warning", f"{title} · 对手第 {battle_index} 位 · 战斗完成：失败")
             level = "warning"
 
         if choice is not None:
@@ -579,7 +679,9 @@ class ArenaService:
         raise last_kickout
 
     @staticmethod
-    def payload(info: DragonArenaInfo) -> dict[str, Any]:
+    def payload(
+        info: DragonArenaInfo, *, dragon_coin_total: int | None = None
+    ) -> dict[str, Any]:
         challenged = sum(opponent.challenged for opponent in info.opponents)
         return {
             "level": info.level,
@@ -599,9 +701,10 @@ class ArenaService:
                 "name": win_choice_name(info.choice_id),
             },
             "daily_reward": {
-                "received": info.daily_reward_received,
+                "available": info.daily_reward_available,
                 "count": info.daily_reward_num,
             },
+            "dragon_coin_total": dragon_coin_total,
         }
 
     @staticmethod
@@ -616,6 +719,28 @@ class ArenaService:
             client.close()
         except OSError:
             pass
+
+    def _wait_for_match_retry(self, stop_requested: Callable[[], bool]) -> bool:
+        """在匹配被拒后等待，同时保留 UI 停止按钮的响应性。"""
+
+        deadline = time.monotonic() + self._match_retry_delay
+        return self._wait_until(deadline, stop_requested)
+
+    def _wait_for_challenge_retry(self, stop_requested: Callable[[], bool]) -> bool:
+        """在整轮候选均被拒绝后等待，同时保留 UI 停止按钮的响应性。"""
+
+        deadline = time.monotonic() + self._challenge_retry_delay
+        return self._wait_until(deadline, stop_requested)
+
+    @staticmethod
+    def _wait_until(deadline: float, stop_requested: Callable[[], bool]) -> bool:
+        while True:
+            if stop_requested():
+                return False
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return True
+            time.sleep(min(0.5, remaining))
 
     @staticmethod
     def _initial_stats(
@@ -637,7 +762,7 @@ class ArenaService:
             "outcome_label": OUTCOME_LABELS[outcome],
             "refresh_on_exhaustion": refresh_on_exhaustion,
             "opponents": {"total": 0, "available": 0, "challenged": 0},
-            "daily_reward": {"received": False, "count": 0},
+            "daily_reward": {"available": False, "count": 0},
             "rewards": [],
         }
 

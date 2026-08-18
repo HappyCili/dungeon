@@ -165,7 +165,7 @@ MsgHdr：`field1` varint = message_id（与 `encode_message_header` 一致）。
 
 ## 军团战流程校验
 
-`tools/frida_hook_legion_war.js` 只读截获 `TJ.TJWebSocket` 的军团战 `MsgHdr`，并保存以下协议：`20050`、`20054`、`20055`、`20057`、`20061`、`20064`、`20074`、`20075`、`20080`、`19532`。不会改写收发参数或客户端状态。
+`tools/frida_hook_legion_war.js` 只读截获 `TJ.TJWebSocket` 的军团战 `MsgHdr`，并保存以下协议：`20050`、`20054`、`20055`、`20057`、`20058`、`20059`、`20060`、`20061`、`20062`、`20064`、`20074`、`20075`、`20080`、`19532`。不会改写收发参数或客户端状态。
 
 ```bash
 cd /Users/max/Downloads/dungeon4_M521957/ui_app

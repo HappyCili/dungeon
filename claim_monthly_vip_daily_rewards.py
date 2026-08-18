@@ -20,7 +20,7 @@ import socket
 import sys
 import time
 from dataclasses import dataclass
-from typing import Callable, Iterable
+from typing import TYPE_CHECKING, Callable, Iterable
 
 from harvest_fief import (
     HEARTBEAT_MESSAGE_ID,
@@ -50,9 +50,11 @@ from harvest_fief import (
     pack1_encode,
     resolve_game_endpoint,
 )
-from ws_traffic_log import bind_traffic_logging
 from harvest_fief import build_parser as build_base_parser
 from id_descriptions import item_change_text, reward_text, unknown_name, zone_name
+
+if TYPE_CHECKING:
+    from game_session import GameSession
 
 
 MONTHLY_VIP_DAILY_REWARDS_MESSAGE_ID = 12416
@@ -121,22 +123,30 @@ class MonthlyVipDailyRewardsClient:
         endpoint: GameEndpoint,
         timeout: float,
         *,
+        session: "GameSession | None" = None,
         socket_factory: Callable[[str, float], NativeWebSocket] = NativeWebSocket.connect,
         websocket_log: Path | bool | None = True,
     ) -> None:
+        from game_session import bind_shared_session
+
         self.endpoint = endpoint
         self.timeout = timeout
         self.socket_factory = socket_factory
         self.socket: NativeWebSocket | None = None
         self.password: str | None = None
-        bind_traffic_logging(
+        bind_shared_session(
             self,
-            task="monthly_vip_daily",
-            path=websocket_log,
+            session,
             error_cls=HarvestError,
+            task="monthly_vip_daily",
+            websocket_log=websocket_log,
         )
 
     def _send_message(self, message_id: int, data: bytes = b"", *, encrypted: bool) -> None:
+        from game_session import session_send_message
+
+        if session_send_message(self, message_id, data, encrypted=encrypted):
+            return
         if self.socket is None:
             raise HarvestError("WebSocket 尚未连接")
         packet = encode_message_header(message_id, data)
@@ -173,7 +183,30 @@ class MonthlyVipDailyRewardsClient:
             raise HarvestError("游戏服 Login 失败")
         return header.message_id == LOGIN_REUNIQUE_MESSAGE_ID
 
+    def _receive_header(self, deadline: float, context: str) -> MessageHeader:
+        from game_session import try_session_receive_header
+
+        handled, header = try_session_receive_header(self, deadline, context)
+        if handled:
+            assert header is not None
+            return header
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise HarvestError(f"等待{context}超时")
+        try:
+            assert self.socket is not None
+            opcode, frame = self.socket.recv_message(remaining)
+        except socket.timeout as exc:
+            raise HarvestError(f"等待{context}超时") from exc
+        except OSError as exc:
+            raise HarvestError(f"读取{context}报文失败：{exc}") from exc
+        return self._decode_frame(opcode, frame)
+
     def _login(self) -> None:
+        from game_session import try_session_ensure_ready
+
+        if try_session_ensure_ready(self, self.endpoint):
+            return
         self.socket = self.socket_factory(self.endpoint.url, self.timeout)
         self._send_message(
             LOGIN_MESSAGE_ID,
@@ -185,13 +218,8 @@ class MonthlyVipDailyRewardsClient:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise HarvestError("等待游戏服登录完成超时")
-            try:
-                opcode, frame = self.socket.recv_message(remaining)
-            except socket.timeout as exc:
-                raise HarvestError("等待游戏服登录完成超时") from exc
-            except OSError as exc:
-                raise HarvestError(f"读取游戏服登录报文失败：{exc}") from exc
-            if self._handle_login_message(self._decode_frame(opcode, frame)):
+            header = self._receive_header(deadline, "游戏服登录完成")
+            if self._handle_login_message(header):
                 break
 
         # 客户端会在 Login_reunique 后延迟发送缓存的业务消息。
@@ -217,16 +245,13 @@ class MonthlyVipDailyRewardsClient:
                     return MonthlyVipDailyRewardResult(response, changes, props)
                 raise HarvestError("等待盈月之仪每日奖励响应超时")
             try:
-                assert self.socket is not None
-                opcode, frame = self.socket.recv_message(current_deadline - now)
-            except socket.timeout as exc:
-                if response is not None:
+                header = self._receive_header(
+                    current_deadline, "盈月之仪每日奖励响应"
+                )
+            except HarvestError as exc:
+                if response is not None and "超时" in str(exc):
                     return MonthlyVipDailyRewardResult(response, changes, props)
-                raise HarvestError("等待盈月之仪每日奖励响应超时") from exc
-            except OSError as exc:
-                raise HarvestError(f"读取盈月之仪每日奖励报文失败：{exc}") from exc
-
-            header = self._decode_frame(opcode, frame)
+                raise
             if header.message_id == HEARTBEAT_MESSAGE_ID:
                 self._send_message(HEARTBEAT_RET_MESSAGE_ID, b"", encrypted=True)
                 continue
@@ -264,7 +289,9 @@ class MonthlyVipDailyRewardsClient:
             self._login()
             return tuple(self._claim_one(vip_id) for vip_id in requested_ids)
         finally:
-            if self.socket is not None:
+            from game_session import shared_close
+
+            if shared_close(self) and self.socket is not None:
                 self.socket.close()
 
 

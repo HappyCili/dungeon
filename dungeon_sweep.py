@@ -35,6 +35,7 @@ from harvest_fief import (
     decode_item_change_notify,
     decode_message_header,
     decode_pack_password,
+    encode_bytes_field,
     encode_int_field,
     encode_login_payload,
     encode_message_header,
@@ -47,10 +48,31 @@ from ws_traffic_log import bind_traffic_logging
 GAME_DATA_MESSAGE_ID = 10490
 DUN_START_DRAW_MESSAGE_ID = 19604
 DUN_SWEEP_MESSAGE_ID = 19642
+SHOP_BUY_MESSAGE_ID = 19517
+DIRECT_SHOP_ID = 999
+DUNGEON_LAMP_ITEM_ID = 901
+PROP_KIND_ITEM = 1
 KICKOUT_MESSAGE_ID = 10030
 # ``ItemChangeSource.DUN_DRAW`` in the generated client protocol.
 DUN_DRAW_ITEM_CHANGE_SOURCE = 71
 REWARD_NOTIFICATION_GRACE_SECONDS = 1.0
+
+# Native zh-Hans resource: dungeon.sweepRet*.  These are business-state
+# responses from Dun_sweep, not transport failures and must not be retried.
+DUNGEON_SWEEP_RET_LABELS = {
+    1: "未通关",
+    2: "无积分记录",
+    3: "无扫荡次数",
+    5: "进地下城次数达到上限",
+    6: "材料不足",
+    999: "背包装备已满，请分解后再试",
+}
+
+
+def sweep_rejection_reason(ret: int) -> str | None:
+    """Return a locally verified rejection reason, when the client defines one."""
+
+    return DUNGEON_SWEEP_RET_LABELS.get(ret)
 
 
 class DungeonSweepError(HarvestError):
@@ -62,7 +84,9 @@ class DungeonSweepRejected(DungeonSweepError):
 
     def __init__(self, ret: int) -> None:
         self.ret = ret
-        super().__init__(f"地下城扫荡失败：ret={ret}")
+        self.reason = sweep_rejection_reason(ret)
+        label = self.reason or "未登记的扫荡拒绝原因"
+        super().__init__(f"地下城扫荡失败：{label}（ret={ret}）")
 
 
 class DungeonDrawRejected(DungeonSweepError):
@@ -71,6 +95,16 @@ class DungeonDrawRejected(DungeonSweepError):
     def __init__(self, ret: int) -> None:
         self.ret = ret
         super().__init__(f"地下城宝库全部抽取失败：ret={ret}")
+
+
+class DungeonLampClaimRejected(DungeonSweepError):
+    """服务端拒绝领取地下城每日永焰之灯。"""
+
+    def __init__(self, ret: int, message: str = "") -> None:
+        self.ret = ret
+        self.message = message
+        detail = f"：{message}" if message else ""
+        super().__init__(f"地下城永焰之灯领取失败{detail}（ret={ret}）")
 
 
 @dataclass(frozen=True)
@@ -121,6 +155,20 @@ class DungeonDrawResponse:
     item_changes: tuple[ItemChange, ...] = ()
     reward_props: tuple[RewardProp, ...] = ()
     reward_notice_received: bool = False
+
+
+@dataclass(frozen=True)
+class DungeonLampClaimResponse:
+    ret: int
+    shop_id: int
+    message: str
+    claimed_qty: int
+
+
+@dataclass(frozen=True)
+class DungeonLampOffer:
+    stock_qty: int
+    goods_data: bytes
 
 
 def _decode_packed_int32(data: bytes) -> tuple[int, ...]:
@@ -315,6 +363,115 @@ def decode_dungeon_draw_response(data: bytes) -> DungeonDrawResponse:
     )
 
 
+def encode_dungeon_lamp_claim_request(quantity: int, goods_data: bytes) -> bytes:
+    """Encode the native ``Shop_buy`` request for direct-shop goods."""
+
+    if (
+        not isinstance(quantity, int)
+        or isinstance(quantity, bool)
+        or quantity <= 0
+    ):
+        raise ValueError("永焰之灯领取数量必须是正整数")
+    if not isinstance(goods_data, bytes) or not goods_data:
+        raise ValueError("直购商品数据不能为空")
+    return (
+        encode_int_field(1, DIRECT_SHOP_ID)
+        + encode_int_field(2, quantity)
+        + encode_bytes_field(3, goods_data)
+    )
+
+
+def _decode_shop_ticket(data: bytes) -> tuple[int, int]:
+    ticket_id = 0
+    status = 0
+    for field_number, wire_type, value in ProtoReader(data).fields():
+        if field_number == 1 and wire_type == 0:
+            ticket_id = decode_int32(int(value))
+        elif field_number == 2 and wire_type == 0:
+            status = decode_int32(int(value))
+    return ticket_id, status
+
+
+def _decode_shop_prop(data: bytes) -> tuple[int, int] | None:
+    kind = 0
+    item_id = 0
+    for field_number, wire_type, value in ProtoReader(data).fields():
+        if field_number == 1 and wire_type == 0:
+            kind = decode_int32(int(value))
+        elif field_number == 2 and wire_type == 0:
+            item_id = decode_int32(int(value))
+    if kind <= 0 or item_id <= 0:
+        return None
+    return kind, item_id
+
+
+def _decode_direct_shop_offer(data: bytes) -> DungeonLampOffer | None:
+    stock_qty = 0
+    prop: tuple[int, int] | None = None
+    purchase_ticket: tuple[int, int] | None = None
+    remove_ticket: tuple[int, int] | None = None
+    for field_number, wire_type, value in ProtoReader(data).fields():
+        if field_number == 2 and wire_type == 0:
+            stock_qty = decode_int32(int(value))
+        elif field_number == 7 and wire_type == 2:
+            prop = _decode_shop_prop(bytes(value))
+        elif field_number == 20 and wire_type == 2:
+            purchase_ticket = _decode_shop_ticket(bytes(value))
+        elif field_number == 21 and wire_type == 2:
+            remove_ticket = _decode_shop_ticket(bytes(value))
+    if prop != (PROP_KIND_ITEM, DUNGEON_LAMP_ITEM_ID) or stock_qty <= 0:
+        return None
+    # Match Storage.getDirectlyGoodsData: ticket-gated offers are not usable.
+    if purchase_ticket is not None:
+        ticket_id, status = purchase_ticket
+        if ticket_id > 0 and status != 1:
+            return None
+    if remove_ticket is not None and remove_ticket[1] == 1:
+        return None
+    return DungeonLampOffer(stock_qty=stock_qty, goods_data=data)
+
+
+def find_dungeon_lamp_offer(game_data: bytes) -> DungeonLampOffer | None:
+    """Find the available daily lamp offer in ``Game_data.shopData``."""
+
+    for field_number, wire_type, value in ProtoReader(game_data).fields():
+        if field_number != 17 or wire_type != 2:
+            continue
+        shop_id = 0
+        goods: list[bytes] = []
+        for shop_field, shop_wire, shop_value in ProtoReader(bytes(value)).fields():
+            if shop_field == 1 and shop_wire == 0:
+                shop_id = decode_int32(int(shop_value))
+            elif shop_field == 9 and shop_wire == 2:
+                goods.append(bytes(shop_value))
+        if shop_id != DIRECT_SHOP_ID:
+            continue
+        for goods_data in goods:
+            offer = _decode_direct_shop_offer(goods_data)
+            if offer is not None:
+                return offer
+    return None
+
+
+def decode_dungeon_lamp_claim_response(data: bytes) -> DungeonLampClaimResponse:
+    shop_id = 0
+    ret = 0
+    message = ""
+    for field_number, wire_type, value in ProtoReader(data).fields():
+        if field_number == 1 and wire_type == 0:
+            shop_id = decode_int32(int(value))
+        elif field_number == 2 and wire_type == 0:
+            ret = decode_int32(int(value))
+        elif field_number == 3 and wire_type == 2:
+            message = bytes(value).decode("utf-8", errors="replace")
+    return DungeonLampClaimResponse(
+        ret=ret,
+        shop_id=shop_id,
+        message=message,
+        claimed_qty=0,
+    )
+
+
 class DungeonSweepClient:
     """地下城查询、扫荡与全部抽取会话；可注入共享 GameSession。"""
 
@@ -342,6 +499,7 @@ class DungeonSweepClient:
             websocket_log=websocket_log,
         )
         self._status: DungeonStatus | None = None
+        self._game_data: bytes | None = None
 
     def __enter__(self) -> "DungeonSweepClient":
         self.login()
@@ -437,7 +595,8 @@ class DungeonSweepClient:
             game_data = getattr(self._session, "game_data", None)
             if not game_data:
                 raise DungeonSweepError("地下城会话缺少 Game_data")
-            self._status = decode_game_data_dungeon_status(bytes(game_data))
+            self._game_data = bytes(game_data)
+            self._status = decode_game_data_dungeon_status(self._game_data)
             return self._status
 
         if self.socket is not None:
@@ -472,7 +631,8 @@ class DungeonSweepClient:
                 if self._handle_common_message(header):
                     continue
                 if header.message_id == GAME_DATA_MESSAGE_ID:
-                    status = decode_game_data_dungeon_status(header.data)
+                    self._game_data = bytes(header.data)
+                    status = decode_game_data_dungeon_status(self._game_data)
                 elif header.message_id == LOGIN_REUNIQUE_MESSAGE_ID:
                     login_complete = True
             self._status = status
@@ -485,6 +645,37 @@ class DungeonSweepClient:
 
     def get_status(self) -> DungeonStatus:
         return self.login()
+
+    def claim_daily_lamp(self) -> DungeonLampClaimResponse | None:
+        """Claim the available direct-shop lamp before entering the dungeon."""
+
+        self.login()
+        game_data = self._game_data
+        if game_data is None:
+            game_data = getattr(self._session, "game_data", None)
+        if not game_data:
+            raise DungeonSweepError("地下城会话缺少直购商店状态")
+        offer = find_dungeon_lamp_offer(bytes(game_data))
+        if offer is None:
+            return None
+
+        self._send_message(
+            SHOP_BUY_MESSAGE_ID,
+            encode_dungeon_lamp_claim_request(offer.stock_qty, offer.goods_data),
+            encrypted=True,
+        )
+        deadline = time.monotonic() + self.timeout
+        while True:
+            header = self._receive_header(deadline, "地下城永焰之灯领取响应")
+            assert header is not None
+            if self._handle_common_message(header):
+                continue
+            if header.message_id != SHOP_BUY_MESSAGE_ID:
+                continue
+            response = decode_dungeon_lamp_claim_response(header.data)
+            if response.ret != 0:
+                raise DungeonLampClaimRejected(response.ret, response.message)
+            return replace(response, claimed_qty=offer.stock_qty)
 
     def sweep(self, dungeon_id: int) -> DungeonSweepResponse:
         self.login()

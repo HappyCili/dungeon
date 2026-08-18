@@ -19,6 +19,7 @@ from harvest_fief import AccountZone, GameEndpoint, HarvestError, ItemChange, Re
 from login import GameTokens, IdentityTokens, LoginError, LoginResult
 from tests.daily_fixtures import build_test_daily_action_runner
 from treasure_area import TreasureAreaStatus, TreasureSweepResponse
+from ui_app import build_parser as build_ui_parser
 
 
 class InMemoryCredentialStore:
@@ -217,18 +218,21 @@ class InMemoryArenaService:
 
 
 class InMemoryRecoverySession:
-    def __init__(self) -> None:
-        self.snapshot = SessionRecoverySnapshot(
-            generation=1,
-            game_data_present=True,
-            issues=(
+    def __init__(self, *, pending: bool = True) -> None:
+        issues = ()
+        if pending:
+            issues = (
                 SessionRecoveryIssue(
                     kind="battle",
                     message_ids=(18002,),
                     battle_state=1,
                     battle_type=7,
                 ),
-            ),
+            )
+        self.snapshot = SessionRecoverySnapshot(
+            generation=1,
+            game_data_present=True,
+            issues=issues,
         )
 
     @property
@@ -237,8 +241,8 @@ class InMemoryRecoverySession:
 
 
 class InMemoryRecoveryManager:
-    def __init__(self) -> None:
-        self.session = InMemoryRecoverySession()
+    def __init__(self, *, pending: bool = True) -> None:
+        self.session = InMemoryRecoverySession(pending=pending)
         self.snapshot_endpoints: list[GameEndpoint] = []
         self.recovery_endpoints: list[GameEndpoint] = []
 
@@ -354,6 +358,9 @@ class UiAppTestCase(unittest.TestCase):
             treasure_service=treasure_service,
             dungeon_service=dungeon_service,
         )
+        self.app.extensions["daily_console"]["game_session"] = (
+            InMemoryRecoveryManager(pending=False)
+        )
         self.client = self.app.test_client()
         self.headers = {"Origin": "http://localhost"}
 
@@ -398,6 +405,88 @@ class UiAppTestCase(unittest.TestCase):
         self.assertIn(b'"daily": null', response.data)
         self.assertNotIn(b"demo-secret", response.data)
 
+    def test_auto_tasks_page_and_config_api(self) -> None:
+        response = self.client.get("/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(b'id="auto-tasks-tab"', response.data)
+        self.assertIn(b'id="run-auto-tasks"', response.data)
+
+        status = self.client.get("/api/auto-tasks")
+        self.assertEqual(status.status_code, 200)
+        initial = status.get_json()
+        self.assertEqual(len(initial["tasks"]), 12)
+        self.assertEqual(
+            [task["key"] for task in initial["tasks"]][-3:],
+            ["dungeon_sweep", "monopoly", "daily_rewards"],
+        )
+        legion_task = next(
+            task for task in initial["tasks"] if task["key"] == "legion_war"
+        )
+        self.assertEqual(legion_task["name"], "军团日常")
+        self.assertEqual(initial["config"]["auto_tasks"]["interval_minutes"], 60)
+
+        update = self.put_json(
+            "/api/config/auto-tasks",
+            {
+                "enabled_task_keys": [
+                    "signin",
+                    "dungeon_sweep",
+                    "monopoly",
+                    "daily_rewards",
+                ],
+                "scheduler_enabled": True,
+                "interval_minutes": 30,
+                "dragon_target_mode": "inventory",
+                "dragon_target_value": 500,
+                "furnace_target_value": 120,
+            },
+        )
+        self.assertEqual(update.status_code, 200)
+        self.assertEqual(
+            update.get_json()["config"]["auto_tasks"],
+            {
+                "enabled_task_keys": [
+                    "signin",
+                    "dungeon_sweep",
+                    "monopoly",
+                    "daily_rewards",
+                ],
+                "scheduler_enabled": True,
+                "interval_minutes": 30,
+                "dragon_target_mode": "inventory",
+                "dragon_target_value": 500,
+                "furnace_target_value": 120,
+            },
+        )
+
+    def test_auto_task_config_rejects_invalid_interval_and_key(self) -> None:
+        invalid_interval = self.put_json(
+            "/api/config/auto-tasks",
+            {
+                "enabled_task_keys": ["signin"],
+                "scheduler_enabled": False,
+                "interval_minutes": 1,
+                "dragon_target_mode": "daily",
+                "dragon_target_value": 0,
+                "furnace_target_value": 0,
+            },
+        )
+        self.assertEqual(invalid_interval.status_code, 400)
+
+        invalid_key = self.put_json(
+            "/api/config/auto-tasks",
+            {
+                "enabled_task_keys": ["unknown"],
+                "scheduler_enabled": False,
+                "interval_minutes": 60,
+                "dragon_target_mode": "daily",
+                "dragon_target_value": 0,
+                "furnace_target_value": 0,
+            },
+        )
+        self.assertEqual(invalid_key.status_code, 400)
+
     def test_index_includes_dungeon_selection_and_reward_output(self) -> None:
         response = self.client.get("/")
 
@@ -420,12 +509,16 @@ class UiAppTestCase(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn(b'id="monopoly-tab"', response.data)
         self.assertIn(b'id="run-monopoly"', response.data)
-        self.assertIn("选择第二个按钮".encode(), response.data)
+        self.assertIn(b'id="monopoly-dice-remaining"', response.data)
+        self.assertIn("事件默认选择最后一个选项".encode(), response.data)
+        self.assertIn("拜访与布局默认选择第二项".encode(), response.data)
         script = (Path(__file__).resolve().parents[1] / "app" / "static" / "app.js").read_text(
             encoding="utf-8"
         )
         self.assertIn('"/api/jobs/monopoly"', script)
         self.assertIn("renderMonopolyStats", script)
+        self.assertIn("monopolyDiceRemaining", script)
+        self.assertIn("monopolyLayoutChoices", script)
 
     def test_index_includes_treasure_settlement_and_farm_transition_fields(self) -> None:
         response = self.client.get("/")
@@ -744,8 +837,10 @@ class UiAppTestCase(unittest.TestCase):
             "/api/jobs/treasure", {"area_id": 1001, "times": 6}
         )
 
-        self.assertEqual(response.status_code, 400)
-        self.assertEqual(response.get_json()["error"], "今日聚宝之地仅剩 5 次可扫荡")
+        self.assertEqual(response.status_code, 200)
+        terminal = self.wait_for_terminal_job(response.get_json()["job"]["id"])
+        self.assertEqual(terminal["status"], "failed")
+        self.assertEqual(terminal["error_message"], "今日聚宝之地仅剩 5 次可扫荡")
         self.assertEqual(self.treasure_state["sweep_calls"], [])
 
     def test_dungeon_status_exposes_names_and_highest_scores(self) -> None:
@@ -873,6 +968,26 @@ class UiAppTestCase(unittest.TestCase):
         )
         self.assertNotEqual(terminal["error_message"], "任务执行失败")
 
+    def test_dungeon_job_reports_native_sweep_rejection_reason(self) -> None:
+        self.assertEqual(self.login().status_code, 200)
+        self.assertEqual(
+            self.put_json(
+                "/api/config/zone", {"id": "4101", "name": "真实一区"}
+            ).status_code,
+            200,
+        )
+        self.dungeon_state["sweep_error"] = DungeonSweepRejected(3)
+
+        response = self.post_json("/api/jobs/dungeon", {"dungeon_id": 2302})
+
+        self.assertEqual(response.status_code, 200)
+        terminal = self.wait_for_terminal_job(response.get_json()["job"]["id"])
+        self.assertEqual(terminal["status"], "failed")
+        self.assertEqual(
+            terminal["error_message"],
+            "风蚀遗迹 扫荡被服务端拒绝：无扫荡次数（ret=3）",
+        )
+
     def test_item_catalog_list_resolves_reward_details(self) -> None:
         item_data_path = Path(self.temporary_directory.name) / "items.json"
         item_data_path.write_text(
@@ -947,8 +1062,10 @@ class UiAppTestCase(unittest.TestCase):
 
         response = self.post_json("/api/jobs/dungeon", {"dungeon_id": 9999})
 
-        self.assertEqual(response.status_code, 400)
-        self.assertEqual(response.get_json()["error"], "所选地下城当前不可扫荡")
+        self.assertEqual(response.status_code, 200)
+        terminal = self.wait_for_terminal_job(response.get_json()["job"]["id"])
+        self.assertEqual(terminal["status"], "failed")
+        self.assertEqual(terminal["error_message"], "所选地下城当前不可扫荡")
         self.assertEqual(self.dungeon_state["operations"], [])
 
     def test_cross_origin_and_non_json_writes_are_rejected(self) -> None:
@@ -974,6 +1091,10 @@ class UiAppTestCase(unittest.TestCase):
         )
         self.assertEqual(arena.status_code, 200)
         job_id = arena.get_json()["job"]["id"]
+        deadline = time.monotonic() + 1
+        while time.monotonic() < deadline and not self.arena_service.run_endpoints:
+            time.sleep(0.005)
+        self.assertEqual(len(self.arena_service.run_endpoints), 1)
 
         concurrent_daily = self.post_json("/api/jobs/daily", {})
         self.assertEqual(concurrent_daily.status_code, 409)
@@ -982,7 +1103,6 @@ class UiAppTestCase(unittest.TestCase):
         self.assertEqual(cancellation.status_code, 200)
         terminal = self.wait_for_terminal_job(job_id)
         self.assertEqual(terminal["status"], "cancelled")
-        self.assertEqual(len(self.arena_service.run_endpoints), 1)
         self.assertTrue(any(event["message"] == "任务已停止" for event in terminal["events"]))
 
     def test_daily_job_emits_progress_and_completes_selected_tasks(self) -> None:
@@ -1043,6 +1163,7 @@ class UiAppTestCase(unittest.TestCase):
                 "stage": "已完成",
                 "pending": False,
                 "description": "空闲",
+                "content_area": {"id": "map_activity", "label": "地图探索"},
                 "issues": [],
             },
         )
@@ -1050,6 +1171,45 @@ class UiAppTestCase(unittest.TestCase):
         self.assertTrue(
             any(
                 event["message"] == "遗留状态已处理，日常任务可继续执行"
+                for event in terminal["events"]
+            )
+        )
+
+    def test_feature_job_recovers_detected_state_before_running_its_service(self) -> None:
+        recovery_manager = InMemoryRecoveryManager()
+        self.app.extensions["daily_console"]["game_session"] = recovery_manager
+        self.assertEqual(self.login().status_code, 200)
+        self.assertEqual(
+            self.put_json(
+                "/api/config/zone", {"id": "4101", "name": "真实一区"}
+            ).status_code,
+            200,
+        )
+
+        response = self.post_json(
+            "/api/jobs/arena",
+            {"rounds": 1, "outcome": "mercy", "refresh_on_exhaustion": False},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        terminal = self.wait_for_terminal_job(response.get_json()["job"]["id"])
+        self.assertEqual(terminal["status"], "succeeded")
+        self.assertEqual(len(recovery_manager.snapshot_endpoints), 1)
+        self.assertEqual(len(recovery_manager.recovery_endpoints), 1)
+        self.assertEqual(
+            terminal["result"]["recovery"],
+            {
+                "stage": "已完成",
+                "pending": False,
+                "description": "空闲",
+                "content_area": {"id": "map_activity", "label": "地图探索"},
+                "issues": [],
+            },
+        )
+        self.assertTrue(
+            any(
+                event["message"]
+                == "检测到遗留战斗（battleState=1，battleType=7），正在交由地图探索内容区处理"
                 for event in terminal["events"]
             )
         )
@@ -1119,6 +1279,12 @@ class ConfigStoreTestCase(unittest.TestCase):
             self.assertNotIn("must-not-survive", persisted)
             self.assertNotIn('"password"', persisted)
             self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+
+
+class UiEntrypointTestCase(unittest.TestCase):
+    def test_reload_flag_is_opt_in(self) -> None:
+        self.assertFalse(build_ui_parser().parse_args([]).reload)
+        self.assertTrue(build_ui_parser().parse_args(["--reload"]).reload)
 
 
 if __name__ == "__main__":

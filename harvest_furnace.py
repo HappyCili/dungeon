@@ -19,7 +19,7 @@ import socket
 import sys
 import time
 from dataclasses import dataclass
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
 from harvest_fief import (
     FIEF_HARVEST_SOURCE,
@@ -48,9 +48,11 @@ from harvest_fief import (
     pack1_encode,
     resolve_game_endpoint,
 )
-from ws_traffic_log import bind_traffic_logging
 from harvest_fief import build_parser as build_base_parser
 from id_descriptions import item_change_text, zone_name
+
+if TYPE_CHECKING:
+    from game_session import GameSession
 
 
 FURNACE_CAPTURE_MESSAGE_ID = 19298
@@ -142,9 +144,12 @@ class FurnaceClient:
         *,
         last_sid: int = 0,
         unique: int = 0,
+        session: "GameSession | None" = None,
         socket_factory: Callable[[str, float], NativeWebSocket] = NativeWebSocket.connect,
         websocket_log: Path | bool | None = True,
     ) -> None:
+        from game_session import bind_shared_session
+
         self.endpoint = endpoint
         self.timeout = timeout
         self.last_sid = last_sid
@@ -152,14 +157,19 @@ class FurnaceClient:
         self.socket_factory = socket_factory
         self.socket: NativeWebSocket | None = None
         self.password: str | None = None
-        bind_traffic_logging(
+        bind_shared_session(
             self,
-            task="furnace_harvest",
-            path=websocket_log,
+            session,
             error_cls=HarvestError,
+            task="furnace_harvest",
+            websocket_log=websocket_log,
         )
 
     def _send_message(self, message_id: int, data: bytes = b"", *, encrypted: bool) -> None:
+        from game_session import session_send_message
+
+        if session_send_message(self, message_id, data, encrypted=encrypted):
+            return
         if self.socket is None:
             raise HarvestError("WebSocket 尚未连接")
         packet = encode_message_header(message_id, data)
@@ -196,32 +206,50 @@ class FurnaceClient:
             raise HarvestError("游戏服 Login 失败")
         return header.message_id == LOGIN_REUNIQUE_MESSAGE_ID
 
-    def harvest(self) -> FurnaceHarvestResult:
-        self.socket = self.socket_factory(self.endpoint.url, self.timeout)
-        try:
-            self._send_message(
-                LOGIN_MESSAGE_ID,
-                encode_login_payload(
-                    self.endpoint.game_token,
-                    last_sid=self.last_sid,
-                    unique=self.unique,
-                ),
-                encrypted=False,
-            )
-            login_deadline = time.monotonic() + self.timeout
-            while True:
-                remaining = login_deadline - time.monotonic()
-                if remaining <= 0:
-                    raise HarvestError("等待游戏服登录完成超时")
-                try:
-                    opcode, frame = self.socket.recv_message(remaining)
-                except socket.timeout as exc:
-                    raise HarvestError("等待游戏服登录完成超时") from exc
-                if self._handle_login_message(self._decode_frame(opcode, frame)):
-                    break
+    def _receive_header(self, deadline: float, context: str):
+        from game_session import try_session_receive_header
 
-            # SocketManager sends business traffic 100 ms after Login_reunique.
-            time.sleep(0.1)
+        handled, header = try_session_receive_header(self, deadline, context)
+        if handled:
+            assert header is not None
+            return header
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise HarvestError(f"等待{context}超时")
+        try:
+            assert self.socket is not None
+            opcode, frame = self.socket.recv_message(remaining)
+        except socket.timeout as exc:
+            raise HarvestError(f"等待{context}超时") from exc
+        except OSError as exc:
+            raise HarvestError(f"读取{context}报文失败：{exc}") from exc
+        return self._decode_frame(opcode, frame)
+
+    def harvest(self) -> FurnaceHarvestResult:
+        try:
+            from game_session import try_session_ensure_ready
+
+            if not try_session_ensure_ready(self, self.endpoint):
+                self.socket = self.socket_factory(self.endpoint.url, self.timeout)
+                self._send_message(
+                    LOGIN_MESSAGE_ID,
+                    encode_login_payload(
+                        self.endpoint.game_token,
+                        last_sid=self.last_sid,
+                        unique=self.unique,
+                    ),
+                    encrypted=False,
+                )
+                login_deadline = time.monotonic() + self.timeout
+                while True:
+                    if login_deadline <= time.monotonic():
+                        raise HarvestError("等待游戏服登录完成超时")
+                    header = self._receive_header(login_deadline, "游戏服登录完成")
+                    if self._handle_login_message(header):
+                        break
+
+                # SocketManager sends business traffic 100 ms after Login_reunique.
+                time.sleep(0.1)
             self._send_message(
                 FURNACE_CAPTURE_MESSAGE_ID,
                 encode_furnace_capture_payload(),
@@ -240,12 +268,13 @@ class FurnaceClient:
                         return FurnaceHarvestResult(response, changes)
                     raise HarvestError("等待 Furnace_capture 响应超时")
                 try:
-                    opcode, frame = self.socket.recv_message(current_deadline - now)
-                except socket.timeout as exc:
-                    if response is not None:
+                    header = self._receive_header(
+                        current_deadline, "Furnace_capture 响应"
+                    )
+                except HarvestError as exc:
+                    if response is not None and "超时" in str(exc):
                         return FurnaceHarvestResult(response, changes)
-                    raise HarvestError("等待 Furnace_capture 响应超时") from exc
-                header = self._decode_frame(opcode, frame)
+                    raise
                 if header.message_id == HEARTBEAT_MESSAGE_ID:
                     self._send_message(HEARTBEAT_RET_MESSAGE_ID, b"", encrypted=True)
                     continue
@@ -262,7 +291,10 @@ class FurnaceClient:
                         if response is not None:
                             return FurnaceHarvestResult(response, changes)
         finally:
-            self.socket.close()
+            from game_session import shared_close
+
+            if shared_close(self) and self.socket is not None:
+                self.socket.close()
 
 
 def _format_item_change(change: ItemChange) -> str:

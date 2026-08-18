@@ -244,8 +244,8 @@ class TreasureService:
                 emit(
                     "info",
                     (
-                        "即将登录游戏服开始刷取：请保持本机仅有一个会话，"
-                        "刷取期间不要打开手机/模拟器游戏客户端（否则会顶号 Kickout）"
+                        "正在复用当前游戏服会话初始化聚宝刷取状态："
+                        "将读取地图、节点与钥匙后开始刷取"
                     ),
                     {},
                 )
@@ -312,6 +312,16 @@ class TreasureService:
                         "summary": failure_message,
                     },
                 )
+
+    def farm_hearth_total(self, endpoint: GameEndpoint) -> int:
+        """Read the authoritative current hearth total through the farm client."""
+
+        client = self._farm_client_builder(endpoint)
+        try:
+            client.login()
+            return max(0, int(client.item_total(HEARTH_ITEM_ID)))
+        finally:
+            client.close()
 
     def _persist_farm_result(
         self,

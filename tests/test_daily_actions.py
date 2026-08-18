@@ -7,11 +7,13 @@ from daily_actions import (
     ActionExecution,
     CallableDailyAction,
     DAILY_GUILD_GOLD_COST_LIMIT,
+    DUNGEON_DAILY_SWEEP_COUNT,
     DailyActionRunner,
     run_adventurer_guild_action,
     run_ancient_law_court_action,
     run_arcane_tower_action,
     run_dragon_arena_action,
+    run_dungeon_sweep_action,
     run_fief_harvest_action,
     run_fief_quick_harvest_action,
     run_knight_arena_action,
@@ -19,6 +21,7 @@ from daily_actions import (
     run_smithy_forge_action,
 )
 from daily_quest import load_daily_catalog
+from dungeon_sweep import DungeonStatus
 from harvest_fief import (
     HARVEST_FREE,
     HARVEST_NORMAL,
@@ -256,6 +259,45 @@ class DailyActionRunnerTestCase(unittest.TestCase):
 class ExistingActionWrapperTestCase(unittest.TestCase):
     def setUp(self) -> None:
         self.endpoint = GameEndpoint("ws://test.invalid", "game-token", "1", "test")
+
+    def test_dungeon_wrapper_selects_highest_score_and_sweeps_three_times(self) -> None:
+        operations: list[tuple[str, int]] = []
+
+        class DungeonClient:
+            closed = False
+
+            def get_status(self) -> DungeonStatus:
+                return DungeonStatus(
+                    unlocked_ids=(2301, 2302, 2303),
+                    visible_ids=(2301, 2302),
+                    best_scores={2301: 88, 2302: 165, 2303: 999},
+                    current_dungeon_id=2301,
+                    draw_times=0,
+                    total_draw_times=0,
+                )
+
+            def sweep(self, dungeon_id: int) -> None:
+                operations.append(("sweep", dungeon_id))
+
+            def close(self) -> None:
+                self.closed = True
+
+        client = DungeonClient()
+        execution = run_dungeon_sweep_action(
+            self.endpoint,
+            1.0,
+            1,
+            client_factory=lambda *_args: client,
+        )
+
+        self.assertEqual(execution.requested_count, DUNGEON_DAILY_SWEEP_COUNT)
+        self.assertEqual(execution.attempted_count, DUNGEON_DAILY_SWEEP_COUNT)
+        self.assertEqual(
+            operations,
+            [("sweep", 2302)] * DUNGEON_DAILY_SWEEP_COUNT,
+        )
+        self.assertTrue(client.closed)
+        self.assertIn("评分 165", execution.message)
 
     def test_legion_war_wrapper_runs_once_for_daily_task(self) -> None:
         class LegionClient:

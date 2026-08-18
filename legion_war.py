@@ -14,7 +14,7 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Deque, Iterable, Mapping
+from typing import Callable, Deque, Iterable, Mapping
 
 from game_session import GAME_DATA_MESSAGE_ID, GameSession
 from harvest_fief import (
@@ -37,7 +37,11 @@ LEGION_INFO_SYNC_MESSAGE_ID = 20050
 LEGION_BATTLE_START_MESSAGE_ID = 20054
 LEGION_BATTLE_SYNC_MESSAGE_ID = 20055
 LEGION_BATTLE_CHOOSE_STRATEGY_MESSAGE_ID = 20057
+LEGION_BATTLE_STRATEGY_EFFECTS_MESSAGE_ID = 20058
+LEGION_BATTLE_PROFICIENCY_MESSAGE_ID = 20059
+LEGION_BATTLE_TURN_FIGHT_MESSAGE_ID = 20060
 LEGION_BATTLE_END_SUMMARY_MESSAGE_ID = 20061
+LEGION_BATTLE_RETREAT_MESSAGE_ID = 20062
 LEGION_UPGRADE_TROOPS_LEVEL_MESSAGE_ID = 20064
 SIEGE_SYNC_MESSAGE_ID = 20074
 SIEGE_RESCUE_TOWN_MESSAGE_ID = 20075
@@ -57,10 +61,16 @@ DEFAULT_STRATEGY_TABLE = (
 DEFAULT_TROOP_TABLE = (
     NATIVE_APP_ROOT / "decrypted-data" / "tables" / "legion_recruit_troop.json"
 )
+DEFAULT_MACROS_TABLE = NATIVE_APP_ROOT / "decrypted-data" / "tables" / "macros.json"
+LEGION_OFFICER_SLOT_MACRO = "ma_legion_officer_slot_num"
 
 
 class LegionWarError(HarvestError):
     """军团战协议或服务端状态不满足当前自动流程。"""
+
+
+class LegionWarCancelled(LegionWarError):
+    """自动任务在军团流程边界收到停止请求。"""
 
 
 @dataclass(frozen=True)
@@ -263,6 +273,18 @@ def _decode_response_result(data: bytes, field_number: int) -> int:
     return 0
 
 
+def _decode_response_message(data: bytes, field_number: int = 11) -> str:
+    """Return an optional server diagnostic message from a response packet."""
+
+    for number, wire_type, value in ProtoReader(data).fields():
+        if number == field_number and wire_type == 2:
+            try:
+                return bytes(value).decode("utf-8")
+            except UnicodeDecodeError:
+                return ""
+    return ""
+
+
 def _decode_rescue_response(data: bytes) -> tuple[int, int]:
     town_id = 0
     result = 0
@@ -339,9 +361,41 @@ def load_troop_upgrade_costs(path: Path = DEFAULT_TROOP_TABLE) -> dict[int, tupl
 
     costs: dict[int, tuple[int, int]] = {}
     for row in rows:
-        item_id, amount = row["cost"].split(",", maxsplit=1)
-        costs[int(row["lv"])] = (int(item_id), int(amount))
+        raw_cost = str(row.get("cost", "")).strip()
+        # The terminal level has an empty cost and therefore no further upgrade.
+        if not raw_cost:
+            continue
+        try:
+            item_id, amount = raw_cost.split(",", maxsplit=1)
+            costs[int(row["lv"])] = (int(item_id), int(amount))
+        except (KeyError, ValueError) as exc:
+            raise LegionWarError(f"募兵配置成本无效：{row!r}") from exc
     return costs
+
+
+def load_legion_officer_slot_count(path: Path = DEFAULT_MACROS_TABLE) -> int:
+    """Load the current battle officer limit from the native macro table."""
+
+    try:
+        rows = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise LegionWarError(f"缺少军团宏配置：{path}") from exc
+    except json.JSONDecodeError as exc:
+        raise LegionWarError(f"军团宏配置不是有效 JSON：{path}") from exc
+
+    if not isinstance(rows, list):
+        raise LegionWarError(f"军团宏配置格式无效：{path}")
+    for row in rows:
+        if not isinstance(row, dict) or row.get("name") != LEGION_OFFICER_SLOT_MACRO:
+            continue
+        try:
+            slot_count = int(row["param"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise LegionWarError(f"军团军官槽位配置无效：{row!r}") from exc
+        if slot_count <= 0:
+            raise LegionWarError(f"军团军官槽位必须为正数：{slot_count}")
+        return slot_count
+    raise LegionWarError(f"军团宏配置缺少 {LEGION_OFFICER_SLOT_MACRO}")
 
 
 def choose_highest_rarity_strategy(
@@ -369,14 +423,28 @@ def choose_highest_rarity_strategy(
     return (rng or random.SystemRandom()).choice(best)
 
 
-def select_battle_officers(officers: Iterable[LegionOfficer]) -> tuple[int, ...]:
-    """Match the native roster ordering and send every unlocked officer."""
+def select_battle_officers(
+    officers: Iterable[LegionOfficer],
+    *,
+    max_officers: int | None = None,
+) -> tuple[int, ...]:
+    """Match native roster ordering and retain only available battle slots."""
+
+    slot_count = (
+        load_legion_officer_slot_count()
+        if max_officers is None
+        else max_officers
+    )
+    if slot_count <= 0:
+        raise LegionWarError(f"军团军官槽位必须为正数：{slot_count}")
 
     ordered = sorted(
         officers,
         key=lambda officer: (-officer.rarity, -officer.level, officer.officer_id),
     )
-    return tuple(officer.officer_id for officer in ordered if officer.officer_id > 0)
+    return tuple(
+        officer.officer_id for officer in ordered if officer.officer_id > 0
+    )[:slot_count]
 
 
 class LegionWarClient:
@@ -388,7 +456,11 @@ class LegionWarClient:
             LEGION_BATTLE_START_MESSAGE_ID,
             LEGION_BATTLE_SYNC_MESSAGE_ID,
             LEGION_BATTLE_CHOOSE_STRATEGY_MESSAGE_ID,
+            LEGION_BATTLE_STRATEGY_EFFECTS_MESSAGE_ID,
+            LEGION_BATTLE_PROFICIENCY_MESSAGE_ID,
+            LEGION_BATTLE_TURN_FIGHT_MESSAGE_ID,
             LEGION_BATTLE_END_SUMMARY_MESSAGE_ID,
+            LEGION_BATTLE_RETREAT_MESSAGE_ID,
             LEGION_UPGRADE_TROOPS_LEVEL_MESSAGE_ID,
             SIEGE_SYNC_MESSAGE_ID,
             SIEGE_RESCUE_TOWN_MESSAGE_ID,
@@ -404,24 +476,44 @@ class LegionWarClient:
         session: object | None = None,
         strategy_rarities: Mapping[int, int] | None = None,
         troop_upgrade_costs: Mapping[int, tuple[int, int]] | None = None,
+        officer_slot_count: int | None = None,
         rng: random.Random | None = None,
+        stop_requested: Callable[[], bool] | None = None,
     ) -> None:
         self.endpoint = endpoint
         self.timeout = timeout
         self._owns_session = session is None
         self._session = session or GameSession(timeout=timeout)
         self._strategy_rarities = dict(
-            strategy_rarities or load_strategy_rarities()
+            strategy_rarities
+            if strategy_rarities is not None
+            else load_strategy_rarities()
         )
         self._troop_upgrade_costs = dict(
-            troop_upgrade_costs or load_troop_upgrade_costs()
+            troop_upgrade_costs
+            if troop_upgrade_costs is not None
+            else load_troop_upgrade_costs()
         )
+        self._officer_slot_count = (
+            load_legion_officer_slot_count()
+            if officer_slot_count is None
+            else officer_slot_count
+        )
+        if self._officer_slot_count <= 0:
+            raise LegionWarError(
+                f"军团军官槽位必须为正数：{self._officer_slot_count}"
+            )
         self._rng = rng or random.SystemRandom()
+        self._stop_requested = stop_requested or (lambda: False)
         self._item_totals: dict[int, int] = {}
         self._legion_info: LegionInfo | None = None
         self._deferred: Deque[MessageHeader] = deque()
         self._preserved: list[MessageHeader] = []
         self._closed = False
+
+    def _check_stop(self) -> None:
+        if self._stop_requested():
+            raise LegionWarCancelled("军团日常已停止")
 
     def close(self) -> None:
         if self._closed:
@@ -437,6 +529,7 @@ class LegionWarClient:
                 close()
 
     def _ensure_session(self) -> None:
+        self._check_stop()
         ensure_recovered = getattr(self._session, "ensure_recovered", None)
         ensure_ready = getattr(self._session, "ensure_ready", None)
         try:
@@ -481,12 +574,14 @@ class LegionWarClient:
         return None
 
     def _wait_for(self, expected: set[int], context: str) -> MessageHeader:
+        self._check_stop()
         header = self._take_deferred(expected)
         if header is not None:
             return header
 
         deadline = time.monotonic() + self.timeout
         while True:
+            self._check_stop()
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise LegionWarError(f"等待{context}超时")
@@ -504,6 +599,7 @@ class LegionWarClient:
                 self._preserved.append(header)
 
     def _send(self, message_id: int, data: bytes = b"") -> None:
+        self._check_stop()
         try:
             self._session.send_message(message_id, data)
         except Exception as exc:
@@ -515,32 +611,89 @@ class LegionWarClient:
         return decode_siege_state(response.data)
 
     def _rescue_and_fight(self, town: SiegeTown) -> bool:
-        self._send(
-            SIEGE_RESCUE_TOWN_MESSAGE_ID,
-            encode_siege_rescue_payload(town.town_id),
-        )
-        rescue = self._wait_for({SIEGE_RESCUE_TOWN_MESSAGE_ID}, "城堡出击响应")
-        response_town_id, result = _decode_rescue_response(rescue.data)
-        if result != 0:
-            raise LegionWarError(
-                f"城堡 {town.town_id} 出击被服务端拒绝（ret={result}）"
+        for attempt in range(2):
+            self._send(
+                SIEGE_RESCUE_TOWN_MESSAGE_ID,
+                encode_siege_rescue_payload(town.town_id),
             )
-        if response_town_id not in (0, town.town_id):
+            rescue = self._wait_for(
+                {SIEGE_RESCUE_TOWN_MESSAGE_ID}, "城堡出击响应"
+            )
+            response_town_id, result = _decode_rescue_response(rescue.data)
+            if result == 5:
+                resumed = self._resume_deferred_battle()
+                if resumed is not None:
+                    return resumed
+                if attempt == 1:
+                    detail = _decode_response_message(rescue.data)
+                    suffix = f"，{detail}" if detail else ""
+                    raise LegionWarError(
+                        f"城堡 {town.town_id} 出击被服务端拒绝（ret=5{suffix}）"
+                    )
+                self._retreat_stale_battle()
+                resumed = self._resume_deferred_battle()
+                if resumed is not None:
+                    return resumed
+                continue
+            if result != 0:
+                detail = _decode_response_message(rescue.data)
+                suffix = f"，{detail}" if detail else ""
+                raise LegionWarError(
+                    f"城堡 {town.town_id} 出击被服务端拒绝（ret={result}{suffix}）"
+                )
+            if response_town_id not in (0, town.town_id):
+                raise LegionWarError(
+                    "城堡出击响应 ID 不匹配："
+                    f"请求 {town.town_id}，响应 {response_town_id}"
+                )
+
+            battle_header = self._wait_for(
+                {LEGION_BATTLE_SYNC_MESSAGE_ID},
+                f"城堡 {town.town_id} 军团战状态",
+            )
+            return self._continue_battle(
+                decode_legion_battle_state(battle_header.data)
+            )
+        raise LegionWarError(f"城堡 {town.town_id} 出击恢复次数已用尽")
+
+    def _retreat_stale_battle(self) -> None:
+        self._send(LEGION_BATTLE_RETREAT_MESSAGE_ID)
+        response = self._wait_for(
+            {LEGION_BATTLE_RETREAT_MESSAGE_ID}, "遗留军团战撤退响应"
+        )
+        result = _decode_response_result(response.data, 1)
+        if result != 0:
+            detail = _decode_response_message(response.data, field_number=2)
+            suffix = f"，{detail}" if detail else ""
             raise LegionWarError(
-                f"城堡出击响应 ID 不匹配：请求 {town.town_id}，响应 {response_town_id}"
+                f"遗留军团战撤退被服务端拒绝（ret={result}{suffix}）"
             )
 
-        battle_header = self._wait_for(
-            {LEGION_BATTLE_SYNC_MESSAGE_ID}, f"城堡 {town.town_id} 军团战状态"
-        )
-        battle = decode_legion_battle_state(battle_header.data)
+    def _continue_battle(self, battle: LegionBattleState) -> bool:
+        if battle.battle_id <= 0:
+            raise LegionWarError("服务端下发了无效的军团战 battleId")
         if battle.turn <= 0:
             self._start_battle(battle)
         return self._fight_battle(battle)
 
+    def _resume_deferred_battle(self) -> bool | None:
+        """Resume a battle push received before the current siege response."""
+
+        header = self._take_deferred(
+            {LEGION_BATTLE_SYNC_MESSAGE_ID, LEGION_BATTLE_END_SUMMARY_MESSAGE_ID}
+        )
+        if header is None:
+            return None
+        if header.message_id == LEGION_BATTLE_END_SUMMARY_MESSAGE_ID:
+            return _decode_response_result(header.data, 1) == LEGION_BATTLE_RESULT_WIN
+        return self._continue_battle(decode_legion_battle_state(header.data))
+
     def _start_battle(self, battle: LegionBattleState) -> None:
         assert self._legion_info is not None
-        officer_ids = select_battle_officers(self._legion_info.officers)
+        officer_ids = select_battle_officers(
+            self._legion_info.officers,
+            max_officers=self._officer_slot_count,
+        )
         if not officer_ids:
             raise LegionWarError("没有可用于军团出击的军官")
         self._send(
@@ -552,21 +705,28 @@ class LegionWarClient:
         response = self._wait_for({LEGION_BATTLE_START_MESSAGE_ID}, "军团出击响应")
         result = _decode_response_result(response.data, 10)
         if result != 0:
-            raise LegionWarError(f"军团出击被服务端拒绝（ret={result}）")
+            detail = _decode_response_message(response.data)
+            suffix = f"，{detail}" if detail else ""
+            raise LegionWarError(
+                f"军团出击被服务端拒绝（ret={result}{suffix}）"
+            )
 
     def _fight_battle(self, initial: LegionBattleState) -> bool:
         battle = initial
         if battle.turn <= 0:
-            header = self._wait_for(
-                {LEGION_BATTLE_SYNC_MESSAGE_ID, LEGION_BATTLE_END_SUMMARY_MESSAGE_ID},
-                "军团战开始",
-            )
+            header = self._wait_for_battle_state("军团战开始")
             if header.message_id == LEGION_BATTLE_END_SUMMARY_MESSAGE_ID:
                 return _decode_response_result(header.data, 1) == LEGION_BATTLE_RESULT_WIN
             battle = decode_legion_battle_state(header.data)
 
         while True:
             if battle.turn > 0:
+                if not battle.strategy_ids:
+                    header = self._wait_for_battle_state("军团战术候选")
+                    if header.message_id == LEGION_BATTLE_END_SUMMARY_MESSAGE_ID:
+                        return _decode_response_result(header.data, 1) == LEGION_BATTLE_RESULT_WIN
+                    battle = decode_legion_battle_state(header.data)
+                    continue
                 strategy_id = choose_highest_rarity_strategy(
                     battle.strategy_ids, self._strategy_rarities, rng=self._rng
                 )
@@ -583,13 +743,28 @@ class LegionWarClient:
                         f"战术 {strategy_id} 被服务端拒绝（ret={result}）"
                     )
 
-            header = self._wait_for(
-                {LEGION_BATTLE_SYNC_MESSAGE_ID, LEGION_BATTLE_END_SUMMARY_MESSAGE_ID},
-                "军团战回合结算",
-            )
+            header = self._wait_for_battle_state("军团战回合结算")
             if header.message_id == LEGION_BATTLE_END_SUMMARY_MESSAGE_ID:
                 return _decode_response_result(header.data, 1) == LEGION_BATTLE_RESULT_WIN
             battle = decode_legion_battle_state(header.data)
+
+    def _wait_for_battle_state(self, context: str) -> MessageHeader:
+        expected = {
+            LEGION_BATTLE_SYNC_MESSAGE_ID,
+            LEGION_BATTLE_END_SUMMARY_MESSAGE_ID,
+            LEGION_BATTLE_STRATEGY_EFFECTS_MESSAGE_ID,
+            LEGION_BATTLE_PROFICIENCY_MESSAGE_ID,
+            LEGION_BATTLE_TURN_FIGHT_MESSAGE_ID,
+        }
+        while True:
+            header = self._wait_for(expected, context)
+            if header.message_id in {
+                LEGION_BATTLE_STRATEGY_EFFECTS_MESSAGE_ID,
+                LEGION_BATTLE_PROFICIENCY_MESSAGE_ID,
+                LEGION_BATTLE_TURN_FIGHT_MESSAGE_ID,
+            }:
+                continue
+            return header
 
     def _collect_tax(self, state: SiegeState) -> bool:
         if state.today_tax_collected:
@@ -646,7 +821,16 @@ class LegionWarClient:
             self._ensure_session()
             siege_wins = 0
             while True:
+                self._check_stop()
                 siege_state = self._sync_siege()
+                resumed = self._resume_deferred_battle()
+                if resumed is not None:
+                    if not resumed:
+                        raise LegionWarError(
+                            "待恢复的军团战未获胜，已停止后续税收与招募"
+                        )
+                    siege_wins += 1
+                    continue
                 trapped_town = next(
                     (town for town in siege_state.towns if town.trapped), None
                 )
@@ -658,8 +842,11 @@ class LegionWarClient:
                     )
                 siege_wins += 1
 
+            self._check_stop()
             tax_collected = self._collect_tax(siege_state)
+            self._check_stop()
             officer_pull_times = self._recruit_officers()
+            self._check_stop()
             troops_upgraded = self._upgrade_troops()
             return LegionWarRunResult(
                 siege_wins=siege_wins,

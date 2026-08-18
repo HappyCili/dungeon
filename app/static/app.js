@@ -5,6 +5,7 @@
   const state = {
     config: initialState.config,
     daily: initialState.daily,
+    autoTasks: null,
     arena: null,
     treasure: null,
     treasureFarm: null,
@@ -33,6 +34,17 @@
     loginButton: document.getElementById("login-button"),
     loginMessage: document.getElementById("login-message"),
     zoneSelect: document.getElementById("zone-select"),
+    autoTaskList: document.getElementById("auto-task-list"),
+    autoTasksScheduleStatus: document.getElementById("auto-tasks-schedule-status"),
+    refreshAutoTasks: document.getElementById("refresh-auto-tasks"),
+    runAutoTasks: document.getElementById("run-auto-tasks"),
+    stopAutoTasks: document.getElementById("stop-auto-tasks"),
+    autoTasksSchedulerEnabled: document.getElementById("auto-tasks-scheduler-enabled"),
+    autoTasksInterval: document.getElementById("auto-tasks-interval"),
+    autoTasksDragonTargetMode: document.getElementById("auto-tasks-dragon-target-mode"),
+    autoTasksDragonTarget: document.getElementById("auto-tasks-dragon-target"),
+    autoTasksLastCheck: document.getElementById("auto-tasks-last-check"),
+    autoTasksNextCheck: document.getElementById("auto-tasks-next-check"),
     taskTableBody: document.getElementById("task-table-body"),
     activityScore: document.getElementById("activity-score"),
     nextReward: document.getElementById("next-reward"),
@@ -127,8 +139,10 @@
     stopMonopoly: document.getElementById("stop-monopoly"),
     monopolyRolls: document.getElementById("monopoly-rolls"),
     monopolyInteractions: document.getElementById("monopoly-interactions"),
+    monopolyLayoutChoices: document.getElementById("monopoly-layout-choices"),
     monopolyConfirms: document.getElementById("monopoly-confirms"),
     monopolyDicePoint: document.getElementById("monopoly-dice-point"),
+    monopolyDiceRemaining: document.getElementById("monopoly-dice-remaining"),
     monopolyCell: document.getElementById("monopoly-cell"),
     monopolyTurn: document.getElementById("monopoly-turn"),
     monopolyStage: document.getElementById("monopoly-stage"),
@@ -213,6 +227,19 @@
       ? "已记住密码，可直接登录"
       : "";
     elements.rounds.value = String(config.arena.rounds);
+    if (config.auto_tasks) {
+      elements.autoTasksSchedulerEnabled.checked = Boolean(config.auto_tasks.scheduler_enabled);
+      elements.autoTasksInterval.value = String(config.auto_tasks.interval_minutes);
+      if (elements.autoTasksDragonTargetMode) {
+        elements.autoTasksDragonTargetMode.value = config.auto_tasks.dragon_target_mode;
+      }
+      if (elements.autoTasksDragonTarget) {
+        elements.autoTasksDragonTarget.value = String(config.auto_tasks.dragon_target_value);
+      }
+      if (elements.autoTasksFurnaceTarget) {
+        elements.autoTasksFurnaceTarget.value = String(config.auto_tasks.furnace_target_value ?? 0);
+      }
+    }
     elements.refreshOnExhaustion.checked = config.arena.refresh_on_exhaustion;
     if (elements.abyssMaxRounds && config.abyss) {
       elements.abyssMaxRounds.value = String(config.abyss.max_rounds ?? 0);
@@ -330,6 +357,109 @@
       fragment.append(row);
     });
     elements.taskTableBody.replaceChildren(fragment);
+  }
+
+  function renderAutoTasks(payload) {
+    state.autoTasks = payload;
+    if (!payload) {
+      elements.autoTaskList.replaceChildren();
+      const item = document.createElement("li");
+      item.className = "auto-task-list__empty";
+      item.textContent = "登录并选择区服后加载自动任务";
+      elements.autoTaskList.append(item);
+      elements.autoTasksScheduleStatus.textContent = "等待登录";
+      elements.autoTasksLastCheck.textContent = "--";
+      elements.autoTasksNextCheck.textContent = "--";
+      setJobControls();
+      return;
+    }
+    const fragment = document.createDocumentFragment();
+    payload.tasks.forEach((task) => {
+      const item = document.createElement("li");
+      item.className = "auto-task-row";
+      const checkbox = document.createElement("input");
+      checkbox.type = "checkbox";
+      checkbox.checked = task.enabled;
+      checkbox.dataset.autoTaskKey = task.key;
+      checkbox.setAttribute("aria-label", `启用${task.name}`);
+      checkbox.addEventListener("change", () => saveAutoTasksConfig().catch((error) => {
+        checkbox.checked = !checkbox.checked;
+        showToast(error.message, true);
+      }));
+      const name = document.createElement("span");
+      name.className = "auto-task-row__name";
+      const title = document.createElement("span");
+      title.textContent = task.name;
+      const description = document.createElement("small");
+      description.textContent = task.description;
+      name.append(title, description);
+      const result = document.createElement("span");
+      result.className = "auto-task-row__result";
+      result.textContent = task.result || "等待执行";
+      const target = document.createElement("div");
+      target.className = "auto-task-row__target";
+      const autoConfig = payload.config?.auto_tasks || state.config.auto_tasks || {};
+      if (task.key === "dragon_arena") {
+        const mode = document.createElement("select");
+        mode.id = "auto-tasks-dragon-target-mode";
+        mode.setAttribute("aria-label", "龙痕目标类型");
+        mode.innerHTML = "<option value=\"daily\">当日获得龙痕币</option><option value=\"inventory\">背包龙痕币总量</option>";
+        mode.value = autoConfig.dragon_target_mode || "daily";
+        mode.addEventListener("change", () => saveAutoTasksConfig().catch((error) => showToast(error.message, true)));
+        const value = document.createElement("input");
+        value.id = "auto-tasks-dragon-target";
+        value.type = "number";
+        value.min = "0";
+        value.max = "1000000000";
+        value.inputMode = "numeric";
+        value.value = String(autoConfig.dragon_target_value ?? 0);
+        value.setAttribute("aria-label", "龙痕目标数值");
+        value.addEventListener("change", () => {
+          value.value = String(normalizedAutoTaskTarget());
+          saveAutoTasksConfig().catch((error) => showToast(error.message, true));
+        });
+        target.append(mode, value);
+        elements.autoTasksDragonTargetMode = mode;
+        elements.autoTasksDragonTarget = value;
+      } else if (task.key === "treasure_sweep") {
+        const value = document.createElement("input");
+        value.id = "auto-tasks-furnace-target";
+        value.type = "number";
+        value.min = "0";
+        value.max = "1000000000";
+        value.inputMode = "numeric";
+        value.value = String(autoConfig.furnace_target_value ?? 4000);
+        value.setAttribute("aria-label", "聚宝之地炉火目标");
+        value.addEventListener("change", () => {
+          value.value = String(normalizedAutoTaskFurnaceTarget());
+          saveAutoTasksConfig().catch((error) => showToast(error.message, true));
+        });
+        target.append(value);
+        elements.autoTasksFurnaceTarget = value;
+      }
+      item.append(checkbox, name, target, result);
+      fragment.append(item);
+    });
+    elements.autoTaskList.replaceChildren(fragment);
+    const scheduler = payload.scheduler || {};
+    elements.autoTasksScheduleStatus.textContent = scheduler.last_status || "等待下一次检查";
+    elements.autoTasksLastCheck.textContent = formatScheduleTime(scheduler.last_checked_at);
+    elements.autoTasksNextCheck.textContent = formatScheduleTime(scheduler.next_check_at);
+    setJobControls();
+  }
+
+  function formatScheduleTime(value) {
+    if (!value) return "--";
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return value;
+    return date.toLocaleString("zh-CN", { hour12: false });
+  }
+
+  function applyAutoTaskResult(result) {
+    if (!state.autoTasks?.tasks || !result?.key) return;
+    const task = state.autoTasks.tasks.find((entry) => entry.key === result.key);
+    if (task) task.result = result.message;
+    renderAutoTasks(state.autoTasks);
   }
 
   function selectedTaskIds() {
@@ -651,8 +781,10 @@
     if (!stats) {
       elements.monopolyRolls.textContent = "0";
       elements.monopolyInteractions.textContent = "0";
+      elements.monopolyLayoutChoices.textContent = "0";
       elements.monopolyConfirms.textContent = "0";
       elements.monopolyDicePoint.textContent = "-- / --";
+      elements.monopolyDiceRemaining.textContent = "--";
       elements.monopolyCell.textContent = "--";
       elements.monopolyTurn.textContent = "-- / --";
       elements.monopolyStage.textContent = "空闲";
@@ -661,8 +793,12 @@
     }
     elements.monopolyRolls.textContent = String(stats.rolls || 0);
     elements.monopolyInteractions.textContent = String(stats.interactions || 0);
+    elements.monopolyLayoutChoices.textContent = String(stats.layout_choices || 0);
     elements.monopolyConfirms.textContent = String(stats.display_confirms || 0);
     elements.monopolyDicePoint.textContent = `${stats.last_dice_id || "--"} / ${stats.last_point ?? "--"}`;
+    elements.monopolyDiceRemaining.textContent = stats.dice_remaining == null
+      ? "--"
+      : `${stats.dice_label || "骰子"} ${stats.dice_remaining}`;
     elements.monopolyCell.textContent = String(stats.cell_no ?? "--");
     elements.monopolyTurn.textContent = `${stats.current_turn ?? "--"} / ${stats.total_turn ?? "--"}`;
     if (stats.stage) {
@@ -802,6 +938,7 @@
     const active = isActiveJobStatus(status);
     const sessionReady = gameSessionConfigured();
     const dailyLoaded = Boolean(state.daily);
+    const autoTasksLoaded = Boolean(state.autoTasks);
     const treasureLoaded = Boolean(state.treasure);
     const dungeonLoaded = Boolean(state.dungeon);
     const selectedTreasureArea = Number(elements.treasureArea.value);
@@ -820,6 +957,14 @@
       ? (state.daily.status_notice || "当前服务端状态暂不允许执行任务")
       : "";
     elements.runArena.disabled = active || !sessionReady;
+    elements.runAutoTasks.disabled = active || !sessionReady || !autoTasksLoaded;
+    elements.stopAutoTasks.disabled = !active;
+    elements.refreshAutoTasks.disabled = active || !sessionReady;
+    elements.autoTasksSchedulerEnabled.disabled = active;
+    elements.autoTasksInterval.disabled = active;
+    if (elements.autoTasksDragonTargetMode) elements.autoTasksDragonTargetMode.disabled = active;
+    if (elements.autoTasksDragonTarget) elements.autoTasksDragonTarget.disabled = active;
+    if (elements.autoTasksFurnaceTarget) elements.autoTasksFurnaceTarget.disabled = active;
     elements.runTreasure.disabled = active || !treasureReady;
     if (elements.runTreasureFarm) {
       elements.runTreasureFarm.disabled = active || !sessionReady || !farmReady;
@@ -913,6 +1058,9 @@
       if (event.data.daily) {
         renderDaily(event.data.daily);
       }
+      if (event.data.auto_task) {
+        applyAutoTaskResult(event.data.auto_task);
+      }
       if (event.data.arena) {
         renderArenaStats(event.data.arena);
       }
@@ -940,6 +1088,9 @@
     });
     if (job.result?.daily) {
       renderDaily(job.result.daily);
+    }
+    if (job.result?.auto_tasks) {
+      job.result.auto_tasks.forEach((result) => applyAutoTaskResult(result));
     }
     if (job.result?.arena) {
       renderArenaStats(job.result.arena);
@@ -976,6 +1127,8 @@
         || state.daily?.tasks.find((task) => task.id === progress.task_id)?.name
         || `未知日常任务（ID ${progress.task_id}）`;
       elements.jobProgress.textContent = `${taskName} · ${progress.completed_tasks || 0}/${progress.total_tasks || 0}`;
+    } else if (progress.auto_task) {
+      elements.jobProgress.textContent = `${progress.auto_task.key} · ${progress.auto_task.message || progress.auto_task.status}`;
     } else if (progress.arena) {
       elements.jobProgress.textContent = `竞技场 ${progress.arena.completed_rounds}/${progress.arena.requested_rounds} · ${progress.arena.stage}`;
     } else if (progress.treasure) {
@@ -1019,10 +1172,14 @@
       elements.jobProgress.textContent = (
         `宫廷棋 · 已掷骰 ${monopoly.rolls || 0} 次`
         + ` · 交互 ${monopoly.interactions || 0} 次`
+        + ` · 布局 ${monopoly.layout_choices || 0} 次`
         + ` · ${monopoly.stage || ""}`
       );
     } else if (progress.recovery) {
-      elements.jobProgress.textContent = `遗留状态 · ${progress.recovery.stage || "处理中"}`;
+      const contentArea = progress.recovery.content_area?.label;
+      elements.jobProgress.textContent = contentArea
+        ? `遗留状态 · ${contentArea} · ${progress.recovery.stage || "处理中"}`
+        : `遗留状态 · ${progress.recovery.stage || "处理中"}`;
     } else {
       elements.jobProgress.textContent = jobStatusLabels[status] || status;
     }
@@ -1250,13 +1407,64 @@
     }
   }
 
+  function autoTaskKeysFromPage() {
+    return Array.from(elements.autoTaskList.querySelectorAll("input[data-auto-task-key]:checked"))
+      .map((input) => input.dataset.autoTaskKey);
+  }
+
+  function normalizedAutoTaskInterval() {
+    const value = Number(elements.autoTasksInterval.value);
+    return Math.min(1440, Math.max(5, Number.isInteger(value) ? value : 60));
+  }
+
+  function normalizedAutoTaskTarget() {
+    const value = Number(elements.autoTasksDragonTarget?.value ?? 0);
+    return Math.min(1000000000, Math.max(0, Number.isInteger(value) ? value : 0));
+  }
+
+  function normalizedAutoTaskFurnaceTarget() {
+    const value = Number(elements.autoTasksFurnaceTarget?.value ?? 0);
+    return Math.min(1000000000, Math.max(0, Number.isInteger(value) ? value : 0));
+  }
+
+  async function saveAutoTasksConfig() {
+    const data = await api("/api/config/auto-tasks", {
+      method: "PUT",
+      body: JSON.stringify({
+        enabled_task_keys: autoTaskKeysFromPage(),
+        scheduler_enabled: elements.autoTasksSchedulerEnabled.checked,
+        interval_minutes: normalizedAutoTaskInterval(),
+        dragon_target_mode: elements.autoTasksDragonTargetMode?.value || "daily",
+        dragon_target_value: normalizedAutoTaskTarget(),
+        furnace_target_value: normalizedAutoTaskFurnaceTarget(),
+      }),
+    });
+    applyConfig(data.config);
+    elements.autoTasksInterval.value = String(normalizedAutoTaskInterval());
+    if (elements.autoTasksDragonTarget) elements.autoTasksDragonTarget.value = String(normalizedAutoTaskTarget());
+    if (elements.autoTasksFurnaceTarget) elements.autoTasksFurnaceTarget.value = String(normalizedAutoTaskFurnaceTarget());
+    return data;
+  }
+
+  async function refreshAutoTasks() {
+    const payload = await api("/api/auto-tasks", { method: "GET" });
+    applyConfig(payload.config);
+    renderAutoTasks(payload);
+    return payload;
+  }
+
   async function refreshTab(name, { notify = false } = {}) {
     if (!gameSessionConfigured() || state.activeJobId) {
       return;
     }
     const generation = ++state.tabRefreshGeneration;
     try {
-      if (name === "daily") {
+      if (name === "auto-tasks") {
+        await refreshAutoTasks();
+        if (notify && generation === state.tabRefreshGeneration) {
+          showToast("自动任务条件已刷新");
+        }
+      } else if (name === "daily") {
         const daily = await refreshDaily();
         if (notify && generation === state.tabRefreshGeneration) {
           showToast(daily?.status_notice || "日常状态已刷新");
@@ -1329,6 +1537,7 @@
     elements.loginButton.disabled = true;
     elements.loginMessage.textContent = "登录中";
     renderDaily(null);
+    renderAutoTasks(null);
     renderArenaStatus(null);
     renderArenaStats(null);
     renderTreasure(null);
@@ -1379,6 +1588,7 @@
       });
       applyConfig(data.config);
       renderDaily(null);
+      renderAutoTasks(null);
       renderArenaStatus(null);
       renderArenaStats(null);
       renderTreasure(null);
@@ -1389,8 +1599,9 @@
       renderTwinSpiralStatus(null);
       renderMonopolyStats(null);
       setJobControls();
-      const [daily, arena, treasure, dungeon, farm, abyss, twinSpiral] = await Promise.all([
+      const [daily, autoTasks, arena, treasure, dungeon, farm, abyss, twinSpiral] = await Promise.all([
         api("/api/daily-tasks", { method: "GET" }),
+        api("/api/auto-tasks", { method: "GET" }),
         api("/api/arena", { method: "GET" }),
         api("/api/treasure", { method: "GET" }),
         api("/api/dungeon", { method: "GET" }),
@@ -1399,6 +1610,7 @@
         api("/api/twin-spiral", { method: "GET" }),
       ]);
       renderDaily(daily);
+      renderAutoTasks(autoTasks);
       applyConfig(arena.config);
       renderArenaStatus(arena);
       applyConfig(treasure.config);
@@ -1426,6 +1638,40 @@
 
   elements.clearSelection.addEventListener("click", () => {
     persistSelection([]).catch((error) => showToast(error.message, true));
+  });
+
+  elements.refreshAutoTasks.addEventListener("click", () => {
+    refreshTab("auto-tasks", { notify: true }).catch(() => {});
+  });
+
+  elements.runAutoTasks.addEventListener("click", async () => {
+    let started = false;
+    elements.runAutoTasks.disabled = true;
+    elements.jobStatus.textContent = "连接游戏服";
+    elements.jobProgress.textContent = "正在检查自动任务条件";
+    try {
+      const data = await api("/api/jobs/auto-tasks", {
+        method: "POST",
+        body: JSON.stringify({}),
+      });
+      beginPolling(data.job);
+      started = true;
+    } catch (error) {
+      showToast(error.message, true);
+      elements.jobStatus.textContent = "空闲";
+      elements.jobProgress.textContent = "等待操作";
+    } finally {
+      if (!started) setJobControls();
+    }
+  });
+
+  elements.stopAutoTasks.addEventListener("click", cancelActiveJob);
+  elements.autoTasksSchedulerEnabled.addEventListener("change", () => {
+    saveAutoTasksConfig().catch((error) => showToast(error.message, true));
+  });
+  elements.autoTasksInterval.addEventListener("change", () => {
+    elements.autoTasksInterval.value = String(normalizedAutoTaskInterval());
+    saveAutoTasksConfig().catch((error) => showToast(error.message, true));
   });
 
   elements.refreshDaily.addEventListener("click", () => {
@@ -1611,7 +1857,9 @@
         body: JSON.stringify({ area_id: areaId, times }),
       });
       applyConfig(data.config);
-      renderTreasure(data.treasure);
+      if (data.treasure) {
+        renderTreasure(data.treasure);
+      }
       beginPolling(data.job);
     } catch (error) {
       showToast(error.message, true);
@@ -1703,8 +1951,10 @@
         body: JSON.stringify({ dungeon_id: dungeonId }),
       });
       applyConfig(data.config);
-      renderDungeon(data.dungeon);
-      renderDungeonRewards();
+      if (data.dungeon) {
+        renderDungeon(data.dungeon);
+        renderDungeonRewards();
+      }
       beginPolling(data.job);
     } catch (error) {
       showToast(error.message, true);
@@ -1841,7 +2091,9 @@
         renderMonopolyStats({
           rolls: 0,
           interactions: 0,
+          layout_choices: 0,
           display_confirms: 0,
+          dice_remaining: null,
           stage: "连接中",
           last_result: "正在连接宫廷棋",
         });
@@ -1865,6 +2117,7 @@
 
   applyConfig(state.config);
   renderDaily(state.daily);
+  renderAutoTasks(null);
   renderArenaStatus(null);
   renderArenaStats(null);
   renderTreasure(null);

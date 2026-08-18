@@ -8,10 +8,13 @@ from typing import Any, Callable, Mapping
 from dungeon_sweep import (
     DungeonDrawRejected,
     DungeonDrawResponse,
+    DungeonLampClaimRejected,
+    DungeonLampClaimResponse,
     DungeonStatus,
     DungeonSweepClient,
     DungeonSweepError,
     DungeonSweepRejected,
+    DUNGEON_LAMP_ITEM_ID,
 )
 from game_session import GameSessionManager
 from harvest_fief import GameEndpoint, HarvestError
@@ -39,6 +42,18 @@ PROP_KIND_ITEM = 1
 PROP_KIND_REWARD_BOX = 2
 
 LiveClientBuilder = Callable[[GameEndpoint], DungeonSweepClient]
+
+
+class DungeonSweepUnavailable(JobExecutionError):
+    """A known server-side sweep condition that an automatic run may skip."""
+
+    def __init__(self, dungeon_name: str, ret: int, reason: str) -> None:
+        self.dungeon_name = dungeon_name
+        self.ret = ret
+        self.reason = reason
+        super().__init__(
+            f"{dungeon_name} 扫荡被服务端拒绝：{reason}（ret={ret}）"
+        )
 
 
 def _load_dungeon_names(path: Path) -> dict[int, str]:
@@ -197,6 +212,15 @@ class DungeonService:
             client.close()
         return self.payload(status, selected_dungeon_id)
 
+    def claim_daily_lamp(self, endpoint: GameEndpoint) -> dict[str, Any]:
+        """Claim the direct-shop dungeon lamp without starting a sweep."""
+
+        client = self._live_client_builder(endpoint)
+        try:
+            return self._claim_daily_lamp(client)
+        finally:
+            client.close()
+
     def run(
         self,
         endpoint: GameEndpoint,
@@ -226,6 +250,10 @@ class DungeonService:
             try:
                 client.sweep(dungeon_id)
             except DungeonSweepRejected as exc:
+                if exc.reason is not None:
+                    raise DungeonSweepUnavailable(
+                        self.dungeon_name(dungeon_id), exc.ret, exc.reason
+                    ) from exc
                 raise JobExecutionError(
                     f"{self.dungeon_name(dungeon_id)} 扫荡被服务端拒绝（ret={exc.ret}）"
                 ) from exc
@@ -307,6 +335,234 @@ class DungeonService:
             }
         finally:
             client.close()
+
+    def run_daily(
+        self,
+        endpoint: GameEndpoint,
+        dungeon_id: int,
+        emit: Callable[[str, str, dict[str, Any]], None],
+        stop_requested: Callable[[], bool],
+    ) -> dict[str, Any]:
+        """Claim the daily lamp, sweep every remaining attempt, then draw once."""
+
+        client = self._live_client_builder(endpoint)
+        try:
+            if stop_requested():
+                return {
+                    "cancelled": True,
+                    "dungeon": {"id": dungeon_id, "name": self.dungeon_name(dungeon_id)},
+                    "rewards": [],
+                    "lamp_claim": self._lamp_payload(None),
+                    "sweeps_completed": 0,
+                    "sweeps_requested": 0,
+                    "sweep_limit": self._dungeon_limits.get(dungeon_id, 3),
+                }
+
+            lamp_claim = self._claim_daily_lamp(client)
+            try:
+                before = client.get_status()
+            except (DungeonSweepError, HarvestError, OSError) as exc:
+                raise JobExecutionError("读取地下城状态失败，请刷新后重试") from exc
+            try:
+                self._validate_sweep(before, dungeon_id)
+            except DungeonSweepError as exc:
+                # A daily lamp can still be claimed when all sweep attempts are used.
+                if not before.can_sweep(dungeon_id) or self._has_sweep_attempt_remaining(
+                    before, dungeon_id
+                ):
+                    raise JobExecutionError(str(exc)) from exc
+                return {
+                    "cancelled": False,
+                    "dungeon": self.payload(before, dungeon_id),
+                    "rewards": [],
+                    "lamp_claim": lamp_claim,
+                    "sweeps_completed": 0,
+                    "sweeps_requested": 0,
+                    "sweep_limit": self._dungeon_limits.get(dungeon_id, 3),
+                    "sweep_completed": False,
+                }
+
+            dungeon = self.payload(before, dungeon_id)
+            sweep_limit = self._dungeon_limits.get(dungeon_id, 3)
+            used_before = before.challenge_times_for(dungeon_id)
+            requested = max(sweep_limit - used_before, 0)
+            emit(
+                "info",
+                f"已读取 {self.dungeon_name(dungeon_id)}，今日已扫荡 {used_before}/{sweep_limit} 次",
+                {"dungeon": dungeon, "lamp_claim": lamp_claim},
+            )
+            if requested <= 0:
+                return {
+                    "cancelled": False,
+                    "dungeon": dungeon,
+                    "rewards": [],
+                    "lamp_claim": lamp_claim,
+                    "sweeps_completed": 0,
+                    "sweeps_requested": 0,
+                    "sweep_limit": sweep_limit,
+                    "sweep_completed": False,
+                }
+
+            sweeps_completed = 0
+            for _ in range(requested):
+                if stop_requested():
+                    break
+                try:
+                    client.sweep(dungeon_id)
+                except DungeonSweepRejected as exc:
+                    if sweeps_completed > 0 and exc.ret in {3, 5}:
+                        emit(
+                            "warning",
+                            f"服务端已将 {self.dungeon_name(dungeon_id)} 次数判定为已用尽",
+                            {"dungeon": dungeon, "ret": exc.ret},
+                        )
+                        break
+                    if exc.reason is not None:
+                        raise DungeonSweepUnavailable(
+                            self.dungeon_name(dungeon_id), exc.ret, exc.reason
+                        ) from exc
+                    raise JobExecutionError(
+                        f"{self.dungeon_name(dungeon_id)} 扫荡被服务端拒绝（ret={exc.ret}）"
+                    ) from exc
+                except (DungeonSweepError, HarvestError, OSError) as exc:
+                    raise JobExecutionError(
+                        f"{self.dungeon_name(dungeon_id)} 扫荡未完成，请检查游戏服连接后重试"
+                    ) from exc
+                sweeps_completed += 1
+                emit(
+                    "info",
+                    f"{self.dungeon_name(dungeon_id)} 扫荡完成 {sweeps_completed}/{requested}",
+                    {
+                        "dungeon": dungeon,
+                        "phase": "sweeping",
+                        "sweeps_completed": sweeps_completed,
+                        "sweeps_requested": requested,
+                    },
+                )
+
+            if stop_requested() or sweeps_completed == 0:
+                return {
+                    "cancelled": stop_requested(),
+                    "dungeon": dungeon,
+                    "rewards": [],
+                    "lamp_claim": lamp_claim,
+                    "sweeps_completed": sweeps_completed,
+                    "sweeps_requested": requested,
+                    "sweep_limit": sweep_limit,
+                    "sweep_completed": sweeps_completed > 0,
+                }
+
+            emit(
+                "info",
+                f"{self.dungeon_name(dungeon_id)} 已完成 {sweeps_completed} 次扫荡，开始全部抽取",
+                {
+                    "dungeon": dungeon,
+                    "phase": "drawing",
+                    "sweeps_completed": sweeps_completed,
+                },
+            )
+            try:
+                draw = client.draw_all(dungeon_id)
+            except DungeonDrawRejected as exc:
+                raise JobExecutionError(
+                    f"{self.dungeon_name(dungeon_id)} 全部抽取被服务端拒绝（ret={exc.ret}）"
+                ) from exc
+            except (DungeonSweepError, HarvestError, OSError) as exc:
+                raise JobExecutionError(
+                    f"{self.dungeon_name(dungeon_id)} 全部抽取未完成，请检查游戏服连接后重试"
+                ) from exc
+
+            rewards = self.reward_payload(draw)
+            challenge_times = dict(before.challenge_times)
+            challenge_times[dungeon_id] = used_before + sweeps_completed
+            dungeon = self.payload(
+                replace(
+                    before,
+                    challenge_times=challenge_times,
+                    draw_times=draw.draw_times,
+                    total_draw_times=draw.total_draw_times,
+                ),
+                dungeon_id,
+            )
+            draw_payload = {
+                "all_drawn": draw.all_drawn,
+                "draw_times": draw.draw_times,
+                "total_draw_times": draw.total_draw_times,
+                "count": len(rewards),
+                "reward_notice_received": draw.reward_notice_received,
+            }
+            if rewards:
+                reward_label = (
+                    "服务端结算奖励"
+                    if rewards[0]["source"] == "item_change"
+                    else "服务端抽取结果"
+                )
+                completion_message = (
+                    f"{self.dungeon_name(dungeon_id)} 全部抽取完成，"
+                    f"获得 {len(rewards)} 项{reward_label}："
+                    f"{self.reward_summary(rewards)}"
+                )
+            else:
+                completion_message = (
+                    f"{self.dungeon_name(dungeon_id)} 全部抽取完成，"
+                    "服务端未返回可展示的奖励明细"
+                )
+            emit(
+                "success",
+                completion_message,
+                {
+                    "dungeon": dungeon,
+                    "rewards": rewards,
+                    "draw": draw_payload,
+                    "phase": "completed",
+                    "lamp_claim": lamp_claim,
+                    "sweeps_completed": sweeps_completed,
+                },
+            )
+            return {
+                "cancelled": False,
+                "dungeon": dungeon,
+                "rewards": rewards,
+                "draw": draw_payload,
+                "sweep_completed": True,
+                "lamp_claim": lamp_claim,
+                "sweeps_completed": sweeps_completed,
+                "sweeps_requested": requested,
+                "sweep_limit": sweep_limit,
+            }
+        finally:
+            client.close()
+
+    def _claim_daily_lamp(self, client: DungeonSweepClient) -> dict[str, Any]:
+        claim = getattr(client, "claim_daily_lamp", None)
+        if not callable(claim):
+            return self._lamp_payload(None)
+        try:
+            response = claim()
+        except DungeonLampClaimRejected as exc:
+            raise JobExecutionError(str(exc)) from exc
+        except (DungeonSweepError, HarvestError, OSError) as exc:
+            raise JobExecutionError("领取地下城每日永焰之灯失败，请检查游戏服连接后重试") from exc
+        return self._lamp_payload(response)
+
+    @staticmethod
+    def _lamp_payload(response: Any) -> dict[str, Any]:
+        if response is None:
+            quantity = 0
+            ret = 0
+        elif isinstance(response, Mapping):
+            quantity = int(response.get("claimed_qty", response.get("quantity", 0)) or 0)
+            ret = int(response.get("ret", 0) or 0)
+        else:
+            quantity = int(getattr(response, "claimed_qty", 0) or 0)
+            ret = int(getattr(response, "ret", 0) or 0)
+        return {
+            "item_id": DUNGEON_LAMP_ITEM_ID,
+            "item_name": "永焰之灯",
+            "claimed": quantity > 0,
+            "quantity": quantity,
+            "ret": ret,
+        }
 
     def payload(
         self, status: DungeonStatus, selected_dungeon_id: int

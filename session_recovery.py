@@ -13,12 +13,60 @@ import time
 from typing import Protocol, Sequence
 
 from game_session import (
+    BATTLE_INFO_MESSAGE_ID,
+    BATTLE_OFFLINE_MESSAGE_ID,
+    BATTLE_S2C_FRAME_BROADCAST_MESSAGE_ID,
+    BATTLE_S2C_FRAME_HASH_VERIFY_MESSAGE_ID,
+    BATTLE_S2C_START_MESSAGE_ID,
+    BATTLE_UNIT_INFO_MESSAGE_ID,
     GameSession,
     GameSessionError,
     GameSessionKickout,
     SessionRecoverySnapshot,
 )
 from harvest_fief import GameEndpoint
+
+
+MAP_BATTLE_TYPES = frozenset({2, 7, 8})
+DRAGON_ARENA_MESSAGE_IDS = frozenset({21104, 21106, 21108})
+GRAVE_ABYSS_MESSAGE_IDS = frozenset({19400, 19402, 19410, 19414})
+KNIGHT_ARENA_BATTLE_TYPE = 5
+# ``Battle_info`` opens both the native BattlePrepare screen and an actual
+# battle handshake.  These packets are emitted only after the player has
+# started the battle (or while reconnecting to one), so they are the reliable
+# signal for a running Knight Arena battle.
+KNIGHT_ARENA_RUNNING_MESSAGE_IDS = frozenset(
+    {
+        BATTLE_UNIT_INFO_MESSAGE_ID,
+        BATTLE_OFFLINE_MESSAGE_ID,
+        BATTLE_S2C_START_MESSAGE_ID,
+        BATTLE_S2C_FRAME_BROADCAST_MESSAGE_ID,
+        BATTLE_S2C_FRAME_HASH_VERIFY_MESSAGE_ID,
+    }
+)
+
+
+def _battle_issue(snapshot: SessionRecoverySnapshot):
+    return next((issue for issue in snapshot.issues if issue.kind == "battle"), None)
+
+
+def knight_arena_battle_is_running(snapshot: SessionRecoverySnapshot) -> bool:
+    """Return whether the Knight Arena residue has crossed BattlePrepare.
+
+    The native client receives ``Battle_info`` before displaying the team
+    preparation screen.  Treating that packet as proof of a running battle
+    sends an unsolicited ``Battle_C2S_start`` during recovery, which the
+    server rejects for a preparation-only state.
+    """
+
+    battle_issue = _battle_issue(snapshot)
+    return bool(
+        battle_issue
+        and battle_issue.battle_type == KNIGHT_ARENA_BATTLE_TYPE
+        and KNIGHT_ARENA_RUNNING_MESSAGE_IDS.intersection(
+            battle_issue.message_ids
+        )
+    )
 
 
 @dataclass(frozen=True)
@@ -28,6 +76,55 @@ class RecoveryResult:
     handler: str
     message: str
     handled: bool = True
+
+
+@dataclass(frozen=True)
+class RecoveryContentArea:
+    """UI-facing owner for a login-time residual state.
+
+    The coordinator still owns the actual dispatch.  This compact projection is
+    used before recovery starts so every task can tell the UI which feature area
+    is about to consume the server-side residue.
+    """
+
+    id: str
+    label: str
+
+    def to_payload(self) -> dict[str, str]:
+        return {"id": self.id, "label": self.label}
+
+
+def recovery_content_area(snapshot: SessionRecoverySnapshot) -> RecoveryContentArea:
+    """Classify a residual snapshot using the default coordinator's routing order."""
+
+    if not snapshot.pending:
+        return RecoveryContentArea("none", "无遗留状态")
+
+    battle_issue = _battle_issue(snapshot)
+    if any(issue.kind == "event" for issue in snapshot.issues) or (
+        battle_issue is not None and battle_issue.battle_type in MAP_BATTLE_TYPES
+    ):
+        return RecoveryContentArea("map_activity", "地图探索")
+    if battle_issue is not None and (
+        battle_issue.battle_type == 10
+        or bool(DRAGON_ARENA_MESSAGE_IDS.intersection(snapshot.observed_message_ids))
+    ):
+        return RecoveryContentArea("dragon_arena", "龙痕竞技场")
+    if battle_issue is not None and (
+        battle_issue.battle_type == 3
+        or bool(GRAVE_ABYSS_MESSAGE_IDS.intersection(snapshot.observed_message_ids))
+    ):
+        return RecoveryContentArea("grave_abyss", "罪者深渊")
+    if knight_arena_battle_is_running(snapshot):
+        return RecoveryContentArea("knight_arena", "普通竞技场")
+    if (
+        battle_issue is not None
+        and battle_issue.battle_type == KNIGHT_ARENA_BATTLE_TYPE
+    ):
+        return RecoveryContentArea("knight_arena_preparation", "骑士比武")
+    if battle_issue is not None:
+        return RecoveryContentArea("generic_battle", "通用战斗")
+    return RecoveryContentArea("unknown", "未分类服务状态")
 
 
 @dataclass(frozen=True)
@@ -162,7 +259,7 @@ class MapActivityRecoveryHandler:
     """Resume map battle/event residues through the existing map state machine."""
 
     name = "map_activity"
-    _MAP_BATTLE_TYPES = frozenset({2, 7, 8})
+    _MAP_BATTLE_TYPES = MAP_BATTLE_TYPES
 
     @staticmethod
     def _map_area_id(snapshot: SessionRecoverySnapshot, session: GameSession) -> int:
@@ -254,7 +351,7 @@ class DragonArenaRecoveryHandler:
     """Resume a leftover Scararena battle using the saved default outcome."""
 
     name = "dragon_arena"
-    _SCARARENA_MESSAGE_IDS = frozenset({21104, 21106, 21108})
+    _SCARARENA_MESSAGE_IDS = DRAGON_ARENA_MESSAGE_IDS
 
     def __init__(self, *, outcome: str = "mercy") -> None:
         self._outcome = outcome
@@ -313,7 +410,7 @@ class GraveAbyssRecoveryHandler:
     """Resume a leftover Grave/abyss battle before another task starts."""
 
     name = "grave_abyss"
-    _GRAVE_MESSAGE_IDS = frozenset({19400, 19402, 19410, 19414})
+    _GRAVE_MESSAGE_IDS = GRAVE_ABYSS_MESSAGE_IDS
 
     def can_handle(self, snapshot: SessionRecoverySnapshot) -> bool:
         battle_issue = next(
@@ -366,27 +463,24 @@ class GraveAbyssRecoveryHandler:
 
 
 class KnightArenaPreparationRecoveryHandler:
-    """Release a Knight Arena screen restored before an actual battle starts.
+    """Release a Knight Arena BattlePrepare screen without starting a battle.
 
     ``battleType=5`` is the ordinary Arena PVP flow.  The native client keeps
-    ``battleState=1`` while its team preparation screen is open, even before
-    the server has emitted ``Battle_info``.  There is no battle handshake to
-    continue in that case, so routing it to the generic handler only leaves a
-    shared session waiting for packets that will never arrive.
+    ``battleState=1`` while its team preparation screen is open and replays
+    ``Battle_info`` when reconnecting.  That packet carries the prospective
+    teams, not evidence that ``Battle_C2S_start`` was sent.  Recovery releases
+    the local barrier and lets the following task issue its own Arena action.
     """
 
     name = "knight_arena_preparation"
-    _KNIGHT_ARENA_BATTLE_TYPE = 5
+    _KNIGHT_ARENA_BATTLE_TYPE = KNIGHT_ARENA_BATTLE_TYPE
 
     def can_handle(self, snapshot: SessionRecoverySnapshot) -> bool:
-        battle_issue = next(
-            (issue for issue in snapshot.issues if issue.kind == "battle"), None
-        )
+        battle_issue = _battle_issue(snapshot)
         return bool(
             battle_issue
             and battle_issue.battle_type == self._KNIGHT_ARENA_BATTLE_TYPE
-            and battle_issue.battle_state == 1
-            and not battle_issue.message_ids
+            and not knight_arena_battle_is_running(snapshot)
         )
 
     def recover(
@@ -395,14 +489,75 @@ class KnightArenaPreparationRecoveryHandler:
         _endpoint: GameEndpoint,
         _snapshot: SessionRecoverySnapshot,
     ) -> RecoveryResult:
-        # A marker-only preparation screen has no server-side result to settle.
-        # Clear the local login barrier so a subsequent explicit Arena action
-        # can issue its own challenge request.
+        deferred = []
+        while True:
+            try:
+                header = session.receive_header(0)
+            except GameSessionError as exc:
+                if "超时" not in str(exc):
+                    raise
+                break
+            if header.message_id != BATTLE_INFO_MESSAGE_ID:
+                deferred.append(header)
+        if deferred:
+            session.push_headers(deferred)
+
+        # The server has only restored BattlePrepare.  Drop its prospective
+        # Battle_info and clear the local login barrier; a later explicit Arena
+        # action owns the decision to send Battle_C2S_start.
         session.resolve_recovery_issue("battle")
         return RecoveryResult(
             self.name,
-            "骑士比武停在备战界面，未收到 Battle_info，已解除本地等待",
+            "骑士比武停在备战界面，未自动开始战斗，已解除本地等待",
         )
+
+
+class KnightArenaRecoveryHandler:
+    """Finish an ordinary Arena battle with runtime continuation packets."""
+
+    name = "knight_arena"
+    _KNIGHT_ARENA_BATTLE_TYPE = KNIGHT_ARENA_BATTLE_TYPE
+
+    def can_handle(self, snapshot: SessionRecoverySnapshot) -> bool:
+        return knight_arena_battle_is_running(snapshot)
+
+    def recover(
+        self,
+        session: GameSession,
+        endpoint: GameEndpoint,
+        _snapshot: SessionRecoverySnapshot,
+    ) -> RecoveryResult:
+        from knight_arena import KnightArenaClient
+
+        client = KnightArenaClient(
+            endpoint,
+            session.timeout,
+            session=session,
+            log=lambda _message: None,
+            log_server_messages=False,
+            business_log=None,
+            task="session_recovery",
+        )
+        try:
+            try:
+                client.login()
+                result = client.await_challenge_result()
+                session.resolve_recovery_issue("battle")
+            except GameSessionKickout:
+                raise
+            except Exception as exc:
+                return RecoveryResult(
+                    self.name,
+                    f"普通竞技场恢复失败：{type(exc).__name__}",
+                    handled=False,
+                )
+            return RecoveryResult(
+                self.name,
+                "已完成普通竞技场遗留战斗"
+                + ("（胜利）" if result.win else "（失败）"),
+            )
+        finally:
+            client.close()
 
 
 class GenericBattleRecoveryHandler:
@@ -569,6 +724,7 @@ def build_default_recovery_coordinator() -> SessionRecoveryCoordinator:
             MapActivityRecoveryHandler(),
             DragonArenaRecoveryHandler(),
             GraveAbyssRecoveryHandler(),
+            KnightArenaRecoveryHandler(),
             KnightArenaPreparationRecoveryHandler(),
             GenericBattleRecoveryHandler(),
         )

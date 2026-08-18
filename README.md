@@ -34,6 +34,14 @@ cd ui_app
 
 打开 `http://127.0.0.1:8765`。首次运行后，非敏感设置保存在 `config/ui-settings.json`。
 
+开发时使用 `--reload` 监视源码并自动重启：
+
+```bash
+../.venv/bin/python ui_app.py --host 127.0.0.1 --port 8765 --reload
+```
+
+自动重启会中断正在执行的任务。
+
 ## 验证
 
 ```bash

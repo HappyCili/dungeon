@@ -34,6 +34,7 @@ DAILY_ACTION_SPECS: tuple[DailyActionSpec, ...] = (
     DailyActionSpec(104, 1, "秘法塔探索"),
     DailyActionSpec(105, 2, "庄园普通收取"),
     DailyActionSpec(106, 1, "庄园快速收取"),
+    DailyActionSpec(107, 1, "地下城挑战"),
     DailyActionSpec(109, 3, "骑士比武挑战"),
     DailyActionSpec(112, 1, "龙痕竞技场胜利"),
     DailyActionSpec(116, 1, "军团税收领取"),
@@ -46,6 +47,7 @@ FIXTURE_DAILY_REMAINING_SECONDS = 5 * 3600 + 42 * 60 + 18
 # 独立刷 SS 脚本默认仅在金币单价 < 200 时刷新；日常任务需补足 5 次，
 # 允许配置表最高 200 金币单价（比较为 cost >= limit 时停止，故取 201）。
 DAILY_GUILD_GOLD_COST_LIMIT = 201
+DUNGEON_DAILY_SWEEP_COUNT = 3
 
 
 @dataclass(frozen=True)
@@ -554,6 +556,61 @@ def run_fief_quick_harvest_action(
     )
 
 
+def run_dungeon_sweep_action(
+    endpoint: GameEndpoint,
+    timeout: float,
+    remaining: int,
+    *,
+    client_factory: Callable[..., object] | None = None,
+    session: GameSession | None = None,
+) -> ActionExecution:
+    """日常 107：选择历史最高评分地下城并扫荡三次。
+
+    日常配置的服务端目标是完成一次地下城挑战，但该动作按操作台需求固定
+    发起三次扫荡请求。候选地下城只取服务端当前已解锁且可展示的列表，评分
+    相同时按地下城 ID 升序，保证自动选择结果稳定。
+    """
+
+    if remaining <= 0:
+        return ActionExecution(0, 0, "无需执行地下城扫荡")
+
+    from dungeon_sweep import DungeonSweepClient
+
+    factory = client_factory or DungeonSweepClient
+    client = _make_feature_client(factory, endpoint, timeout, session=session)
+    try:
+        status = client.get_status()
+        candidates = tuple(status.sweepable_ids)
+        if not candidates:
+            return ActionExecution(
+                DUNGEON_DAILY_SWEEP_COUNT,
+                0,
+                "当前没有可扫荡的地下城",
+            )
+        dungeon_id = min(
+            candidates,
+            key=lambda candidate: (
+                -status.best_score_for(candidate),
+                candidate,
+            ),
+        )
+        best_score = status.best_score_for(dungeon_id)
+        attempted = 0
+        for _ in range(DUNGEON_DAILY_SWEEP_COUNT):
+            client.sweep(dungeon_id)
+            attempted += 1
+        return ActionExecution(
+            DUNGEON_DAILY_SWEEP_COUNT,
+            attempted,
+            f"已选择最高评分地下城（ID {dungeon_id}，评分 {best_score}）扫荡 "
+            f"{attempted}/{DUNGEON_DAILY_SWEEP_COUNT} 次，等待服务端状态确认",
+        )
+    finally:
+        close = getattr(client, "close", None)
+        if callable(close):
+            close()
+
+
 def run_knight_arena_action(
     endpoint: GameEndpoint,
     timeout: float,
@@ -801,6 +858,11 @@ def build_live_daily_action_runner(
         ),
         106: CallableDailyAction(
             lambda remaining: run_fief_quick_harvest_action(
+                endpoint, timeout, remaining, session=shared
+            )
+        ),
+        107: CallableDailyAction(
+            lambda remaining: run_dungeon_sweep_action(
                 endpoint, timeout, remaining, session=shared
             )
         ),

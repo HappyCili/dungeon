@@ -64,6 +64,7 @@
       </section>
 
       <nav class="tabs" role="tablist" aria-label="功能页">
+        <button id="auto-tasks-tab" class="tab-button" type="button" role="tab" aria-selected="false" aria-controls="auto-tasks-panel" data-tab="auto-tasks">自动任务</button>
         <button id="daily-tab" class="tab-button is-active" type="button" role="tab" aria-selected="true" aria-controls="daily-panel" data-tab="daily">日常任务</button>
         <button id="arena-tab" class="tab-button" type="button" role="tab" aria-selected="false" aria-controls="arena-panel" data-tab="arena">龙痕竞技场</button>
         <button id="treasure-tab" class="tab-button" type="button" role="tab" aria-selected="false" aria-controls="treasure-panel" data-tab="treasure">聚宝之地</button>
@@ -72,6 +73,55 @@
         <button id="twin-spiral-tab" class="tab-button" type="button" role="tab" aria-selected="false" aria-controls="twin-spiral-panel" data-tab="twin-spiral">双生螺旋</button>
         <button id="monopoly-tab" class="tab-button" type="button" role="tab" aria-selected="false" aria-controls="monopoly-panel" data-tab="monopoly">宫廷棋</button>
       </nav>
+
+      <section id="auto-tasks-panel" class="feature-panel" role="tabpanel" aria-labelledby="auto-tasks-tab" hidden>
+        <div class="section-heading section-heading--compact">
+          <div>
+            <p class="eyebrow">批量领取与挑战</p>
+            <h2>自动任务</h2>
+          </div>
+          <output id="auto-tasks-schedule-status" class="inline-message" aria-live="polite">等待加载</output>
+        </div>
+        <div class="auto-task-layout">
+          <section class="auto-task-section" aria-labelledby="auto-tasks-daily-heading">
+            <div class="section-heading section-heading--compact">
+              <div>
+                <p class="eyebrow">按当前条件执行</p>
+                <h3 id="auto-tasks-daily-heading">每日执行</h3>
+              </div>
+            </div>
+            <ul id="auto-task-list" class="auto-task-list" aria-live="polite">
+              <li class="auto-task-list__empty">登录并选择区服后加载自动任务</li>
+            </ul>
+            <div class="command-bar">
+              <button id="refresh-auto-tasks" class="button button--secondary" type="button">刷新条件</button>
+              <button id="run-auto-tasks" class="button button--primary" type="button">立即执行</button>
+              <button id="stop-auto-tasks" class="button button--danger" type="button" disabled>停止</button>
+            </div>
+          </section>
+          <section class="auto-task-section" aria-labelledby="auto-tasks-scheduler-heading">
+            <div class="section-heading section-heading--compact">
+              <div>
+                <p class="eyebrow">应用运行期间生效</p>
+                <h3 id="auto-tasks-scheduler-heading">定时执行</h3>
+              </div>
+            </div>
+            <label class="switch-control">
+              <input id="auto-tasks-scheduler-enabled" type="checkbox">
+              <span class="switch-control__track" aria-hidden="true"></span>
+              <span>按固定间隔检查</span>
+            </label>
+            <label class="field-control">
+              <span>检查间隔（分钟）</span>
+              <input id="auto-tasks-interval" type="number" inputmode="numeric" min="5" max="1440" value="60">
+            </label>
+            <dl class="auto-task-schedule-stats" aria-live="polite">
+              <div><dt>上次检查</dt><dd id="auto-tasks-last-check">--</dd></div>
+              <div><dt>下次检查</dt><dd id="auto-tasks-next-check">--</dd></div>
+            </dl>
+          </section>
+        </div>
+      </section>
 
       <section id="daily-panel" class="feature-panel" role="tabpanel" aria-labelledby="daily-tab">
         <div class="section-heading section-heading--compact">
@@ -366,7 +416,7 @@
         </div>
         <div class="arena-layout">
           <div class="arena-controls">
-            <p class="field-hint">持续自动掷骰；出现交互选项时按界面顺序选择第二个按钮。</p>
+            <p class="field-hint">持续自动掷骰；事件默认选择最后一个选项，拜访与布局默认选择第二项。</p>
             <div class="command-bar command-bar--arena">
               <button id="run-monopoly" class="button button--primary" type="button">开始自动掷骰</button>
               <button id="stop-monopoly" class="button button--danger" type="button" disabled>停止</button>
@@ -375,8 +425,10 @@
           <dl class="arena-stats" aria-live="polite">
             <div><dt>已掷骰</dt><dd id="monopoly-rolls">0</dd></div>
             <div><dt>交互选择</dt><dd id="monopoly-interactions">0</dd></div>
+            <div><dt>布局选择</dt><dd id="monopoly-layout-choices">0</dd></div>
             <div><dt>展示确认</dt><dd id="monopoly-confirms">0</dd></div>
             <div><dt>最后骰子 / 点数</dt><dd id="monopoly-dice-point">-- / --</dd></div>
+            <div><dt>当前骰子剩余</dt><dd id="monopoly-dice-remaining">--</dd></div>
             <div><dt>当前格位</dt><dd id="monopoly-cell">--</dd></div>
             <div><dt>回合</dt><dd id="monopoly-turn">-- / --</dd></div>
             <div><dt>当前阶段</dt><dd id="monopoly-stage">空闲</dd></div>

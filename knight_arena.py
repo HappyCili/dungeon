@@ -2,7 +2,8 @@
 """骑士比武（普通竞技场 Arena_*）WebSocket 客户端。
 
 日常任务 109：在骑士比武中完成 3 次挑战。只计挑战次数，不要求胜利。
-对手与角色均可任意选取；默认随机挑未战胜的候选，用当前编队开战。
+普通竞技场每日免费挑战上限由自动任务策略管理，当前为 5；不等于刷新次数。
+对手与角色均可任意选取；默认随机挑未战胜的候选，用竞技场攻击编队开战。
 
 协议来源：``decrypted-js/main.js`` 中 ``Arena_info`` / ``Arena_challenge`` /
 ``Arena_challenge_result`` 与战斗握手（与龙痕竞技场共用 Battle_*）。
@@ -31,7 +32,10 @@ from dragon_arena import (
     BATTLE_S2C_FRAME_HASH_VERIFY_MESSAGE_ID,
     BATTLE_S2C_START_MESSAGE_ID,
     GAME_DATA_MESSAGE_ID,
+    BattleInfo,
+    BattleTeamUnit,
     DragonArenaClient,
+    GameDataBattleContext,
     GameLoginKickout,
     GameMessageTimeout,
     GameSessionClosed,
@@ -44,6 +48,8 @@ from dragon_arena_business_map import (
     ARENA_CHALLENGE_RESULT_MESSAGE_ID,
     ARENA_INFO_MESSAGE_ID,
     ARENA_REFRESH_OPPONENTS_MESSAGE_ID,
+    HERO_SET_TEAM_MESSAGE_ID,
+    HERO_TEAM_SYNC_MESSAGE_ID,
     LOGIN_OK_MESSAGE_ID,
     LOGIN_REUNIQUE_MESSAGE_ID,
 )
@@ -67,6 +73,8 @@ from harvest_fief import build_parser as build_base_parser
 # 匹配列表下标（Arena_challenge.opponenttype=0）；1 为历史复仇。
 OPPONENT_TYPE_MATCH = 0
 OPPONENT_TYPE_REVENGE = 1
+# Native ``TeamModule.battleTypeToTeamType`` maps PVP to ``IDX_ARENA``.
+PVP_ARENA_TEAM_ID = 4
 
 
 @dataclass(frozen=True)
@@ -119,6 +127,22 @@ class ArenaRoundResult:
     opponent_index: int
     challenge: ArenaChallengeResponse
     battle: ArenaChallengeResult | None
+
+
+@dataclass(frozen=True)
+class ArenaDailyRunResult:
+    """Result of one bounded ordinary-Arena free-challenge run."""
+
+    season_open: bool
+    initial_challenge_num: int
+    daily_free_limit: int
+    requested_challenges: int
+    accepted_challenges: int
+    results: tuple[ArenaRoundResult, ...]
+    rejected_challenges: int
+    cancelled: bool
+    stop_reason: str | None
+    failure: str | None
 
 
 def _decode_string_field(data: bytes) -> str:
@@ -220,6 +244,44 @@ def encode_arena_challenge(
     return b"".join(parts)
 
 
+def encode_hero_set_team(team_id: int, team_payload: bytes) -> bytes:
+    """Encode native ``Hero_setteam`` for one normal team slot.
+
+    The Arena team editor always resaves ``IDX_ARENA`` before it dispatches
+    ``Arena_challenge``.  ``team_payload`` is the server-provided ``HeroTeam``
+    message from ``Game_data.hero.teams`` and therefore preserves artifacts and
+    all fields the current client does not otherwise need to decode.
+    """
+
+    if team_id < 0:
+        raise HarvestError("Hero_setteam 编队 ID 不能为负数")
+    if not team_payload:
+        raise HarvestError("Hero_setteam 缺少编队数据")
+    return encode_int_field(1, team_id) + encode_bytes_field(2, team_payload)
+
+
+def _decode_hero_set_team_response(data: bytes) -> tuple[int, int]:
+    """Return ``(team_id, ret)`` from native ``Hero_setteam`` response."""
+
+    team_id = 0
+    ret = 0
+    for field_number, wire_type, value in ProtoReader(data).fields():
+        if field_number == 1 and wire_type == 0:
+            team_id = decode_int32(int(value))
+        elif field_number == 2 and wire_type == 0:
+            ret = decode_int32(int(value))
+    return team_id, ret
+
+
+def _decode_hero_team_sync_id(data: bytes) -> int:
+    """Read ``Hero_teamsync.id`` (field 4 in native codec ``ws``)."""
+
+    for field_number, wire_type, value in ProtoReader(data).fields():
+        if field_number == 4 and wire_type == 0:
+            return decode_int32(int(value))
+    return 0
+
+
 def decode_arena_challenge_response(data: bytes) -> ArenaChallengeResponse:
     values = {
         "ret": 0,
@@ -308,6 +370,79 @@ def pick_challenge_candidate(
 
 class KnightArenaClient(DragonArenaClient):
     """骑士比武客户端：复用龙痕竞技场的登录与战斗握手，走 Arena_* 协议。"""
+
+    @property
+    def last_round_failure(self) -> str | None:
+        """最近一轮未结算的服务端或战斗协议原因。"""
+
+        return getattr(self, "_last_round_failure", None)
+
+    def _select_battle_team(
+        self,
+        context: GameDataBattleContext,
+        _battle: BattleInfo,
+    ) -> tuple[BattleTeamUnit, ...]:
+        """Use native PVP's dedicated ``hero.teams[IDX_ARENA]`` lineup."""
+
+        team = context.teams.get(PVP_ARENA_TEAM_ID, ())
+        if not team:
+            raise HarvestError(
+                "Game_data 中竞技场攻击编队 4 为空，无法构造 Battle_C2S_start"
+            )
+        self.log(
+            f"[战斗] 普通竞技场使用攻击编队={PVP_ARENA_TEAM_ID}，"
+            f"角色={len(team)}。"
+        )
+        return team
+
+    def _sync_attack_team(self) -> None:
+        """Replay the native Arena team-editor save before a challenge."""
+
+        context = self._game_data_context
+        if context is None:
+            raise HarvestError("本会话没有可用的 Game_data 编队，无法同步竞技场攻击编队")
+        team_payload = context.team_payloads.get(PVP_ARENA_TEAM_ID)
+        if not team_payload:
+            raise HarvestError("Game_data 中缺少竞技场攻击编队 4 的完整数据")
+
+        self._send_message(
+            HERO_SET_TEAM_MESSAGE_ID,
+            encode_hero_set_team(PVP_ARENA_TEAM_ID, team_payload),
+            encrypted=True,
+        )
+        response_seen = False
+        team_sync_seen = False
+        deferred = []
+        deadline = time.monotonic() + self.timeout
+        try:
+            while not (response_seen and team_sync_seen):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise HarvestError("等待竞技场攻击编队同步确认超时")
+                header = self._next_header(remaining)
+                if header.message_id == HERO_SET_TEAM_MESSAGE_ID:
+                    team_id, ret = _decode_hero_set_team_response(header.data)
+                    if team_id == PVP_ARENA_TEAM_ID:
+                        if ret != 0:
+                            raise HarvestError(
+                                f"竞技场攻击编队同步返回 ret={ret}"
+                            )
+                        response_seen = True
+                    else:
+                        deferred.append(header)
+                    continue
+                if header.message_id == HERO_TEAM_SYNC_MESSAGE_ID:
+                    if _decode_hero_team_sync_id(header.data) == PVP_ARENA_TEAM_ID:
+                        team_sync_seen = True
+                    else:
+                        deferred.append(header)
+                    continue
+                deferred.append(header)
+        finally:
+            for header in reversed(deferred):
+                self._queued_headers.appendleft(header)
+
+        self.log(f"[挑战] 竞技场攻击编队={PVP_ARENA_TEAM_ID} 已同步。")
 
     def get_info(self) -> ArenaInfo:
         self._ensure_arena_idle()
@@ -454,10 +589,13 @@ class KnightArenaClient(DragonArenaClient):
     def run_round(self, opponent_index: int) -> ArenaRoundResult:
         """挑战指定 mdatas 下标；不论输赢都算完成一次挑战。"""
 
+        self._last_round_failure = None
         self._begin_arena_settlement()
+        self._sync_attack_team()
         challenge = self.challenge(opponent_index)
         if challenge.ret != 0:
             self._arena_settlement_changes.clear()
+            self._last_round_failure = f"Arena_challenge 返回 ret={challenge.ret}"
             self.log(
                 f"[挑战] 下标={opponent_index}，服务端 ret={challenge.ret}，跳过本轮。"
             )
@@ -475,6 +613,7 @@ class KnightArenaClient(DragonArenaClient):
             self.log(f"[战斗] 下标={opponent_index}，游戏服连接已关闭。")
             raise
         except HarvestError as exc:
+            self._last_round_failure = str(exc)
             self.log(f"[战斗] 下标={opponent_index}，本轮未完成：{exc}。")
             return ArenaRoundResult(opponent_index, challenge, None)
 
@@ -483,6 +622,119 @@ class KnightArenaClient(DragonArenaClient):
         )
         self._collect_post_settlement_item_changes()
         return ArenaRoundResult(opponent_index, challenge, battle)
+
+    @staticmethod
+    def _mark_opponent_won(
+        opponents: Sequence[ArenaOpponent], opponent_index: int
+    ) -> list[ArenaOpponent]:
+        """Keep the current candidate list consistent with a settled win."""
+
+        return [
+            (
+                ArenaOpponent(
+                    index=opponent.index,
+                    opponent_id=opponent.opponent_id,
+                    opponent_type=opponent.opponent_type,
+                    win=1,
+                    score=opponent.score,
+                    nick=opponent.nick,
+                )
+                if opponent.index == opponent_index
+                else opponent
+            )
+            for opponent in opponents
+        ]
+
+    def run_daily_free_challenges(
+        self,
+        *,
+        daily_free_limit: int,
+        stop_requested: Callable[[], bool] | None = None,
+    ) -> ArenaDailyRunResult:
+        """Spend at most the free budget reported at the beginning of a run.
+
+        A successful ``Arena_challenge`` can consume a daily attempt before the
+        battle handshake finishes.  Once that accepted challenge fails to settle,
+        stop instead of selecting another opponent and risking an extra spend.
+        """
+
+        if daily_free_limit < 0:
+            raise HarvestError("普通竞技场每日免费次数不能为负数")
+
+        info = self.get_info()
+        requested = max(daily_free_limit - info.challenge_num, 0)
+        if not info.season_open or requested == 0:
+            return ArenaDailyRunResult(
+                season_open=info.season_open,
+                initial_challenge_num=info.challenge_num,
+                daily_free_limit=daily_free_limit,
+                requested_challenges=requested,
+                accepted_challenges=0,
+                results=(),
+                rejected_challenges=0,
+                cancelled=False,
+                stop_reason=None,
+                failure=None,
+            )
+
+        results: list[ArenaRoundResult] = []
+        opponents = list(info.opponents)
+        attempted: set[int] = set()
+        accepted = 0
+        rejected = 0
+        cancelled = False
+        stop_reason: str | None = None
+        failure: str | None = None
+
+        while accepted < requested:
+            if stop_requested is not None and stop_requested():
+                cancelled = True
+                break
+
+            opponent_index = pick_challenge_candidate(opponents, attempted=attempted)
+            if opponent_index is None:
+                stop_reason = "候选已耗尽" if attempted else "没有可用对手"
+                break
+
+            attempted.add(opponent_index)
+            result = self.run_round(opponent_index)
+            if result.challenge.ret != 0:
+                rejected += 1
+                continue
+
+            accepted += 1
+            if result.battle is None:
+                failure = (
+                    self.last_round_failure
+                    or "挑战已被服务端接受，但未收到战斗结算"
+                )
+                break
+
+            results.append(result)
+            if result.battle.win:
+                opponents = self._mark_opponent_won(opponents, opponent_index)
+
+            # Never increase the initial budget. A newer server counter may only
+            # reduce the number of remaining local attempts.
+            server_remaining = max(
+                daily_free_limit - result.challenge.challenge_num, 0
+            )
+            if server_remaining < requested - accepted:
+                stop_reason = "服务端已报告免费次数用完"
+                break
+
+        return ArenaDailyRunResult(
+            season_open=info.season_open,
+            initial_challenge_num=info.challenge_num,
+            daily_free_limit=daily_free_limit,
+            requested_challenges=requested,
+            accepted_challenges=accepted,
+            results=tuple(results),
+            rejected_challenges=rejected,
+            cancelled=cancelled,
+            stop_reason=stop_reason,
+            failure=failure,
+        )
 
     def run_loop(
         self,
@@ -536,21 +788,7 @@ class KnightArenaClient(DragonArenaClient):
                 results.append(result)
                 # 本地标记已战胜，避免重复优先选同一人。
                 if result.battle.win:
-                    opponents = [
-                        (
-                            ArenaOpponent(
-                                index=opp.index,
-                                opponent_id=opp.opponent_id,
-                                opponent_type=opp.opponent_type,
-                                win=1,
-                                score=opp.score,
-                                nick=opp.nick,
-                            )
-                            if opp.index == index
-                            else opp
-                        )
-                        for opp in opponents
-                    ]
+                    opponents = self._mark_opponent_won(opponents, index)
             elif result.challenge.ret != 0:
                 # 明确失败的序号不再重试；其它错误保留序号以便换人。
                 continue
@@ -685,7 +923,10 @@ def _self_test() -> None:
     slot_entry = encode_int_field(1, 0) + encode_bytes_field(2, slot)
     team = encode_bytes_field(1, slot_entry)
     team_entry = encode_int_field(1, 0) + encode_bytes_field(2, team)
-    teams = encode_bytes_field(1, team_entry)
+    arena_team_entry = encode_int_field(1, PVP_ARENA_TEAM_ID) + encode_bytes_field(
+        2, team
+    )
+    teams = encode_bytes_field(1, team_entry) + encode_bytes_field(1, arena_team_entry)
     hero = (
         encode_bytes_field(1, encode_int_field(1, 10101))
         + encode_bytes_field(4, teams)
@@ -729,6 +970,20 @@ def _self_test() -> None:
         (0x2, encode_message_header(PACK_PASSWORD_MESSAGE_ID, password_payload)),
         (0x2, encrypted(GAME_DATA_MESSAGE_ID, game_data)),
         (0x2, encrypted(LOGIN_REUNIQUE_MESSAGE_ID)),
+        (
+            0x2,
+            encrypted(
+                HERO_SET_TEAM_MESSAGE_ID,
+                encode_int_field(1, PVP_ARENA_TEAM_ID),
+            ),
+        ),
+        (
+            0x2,
+            encrypted(
+                HERO_TEAM_SYNC_MESSAGE_ID,
+                encode_int_field(4, PVP_ARENA_TEAM_ID),
+            ),
+        ),
         (0x2, encrypted(ARENA_CHALLENGE_MESSAGE_ID, challenge_ok)),
         (0x2, encrypted(ARENA_CHALLENGE_RESULT_MESSAGE_ID, result_ok)),
     ]

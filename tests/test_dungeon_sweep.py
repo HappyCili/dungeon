@@ -7,12 +7,18 @@ from dungeon_sweep import (
     DUN_START_DRAW_MESSAGE_ID,
     DUN_DRAW_ITEM_CHANGE_SOURCE,
     DUN_SWEEP_MESSAGE_ID,
+    DUNGEON_LAMP_ITEM_ID,
+    DIRECT_SHOP_ID,
     GAME_DATA_MESSAGE_ID,
+    SHOP_BUY_MESSAGE_ID,
     DungeonSweepClient,
     DungeonSweepRejected,
     decode_dungeon_status,
+    encode_dungeon_lamp_claim_request,
     encode_dungeon_draw_all_request,
     encode_dungeon_sweep_request,
+    find_dungeon_lamp_offer,
+    sweep_rejection_reason,
 )
 from harvest_fief import (
     HarvestError,
@@ -130,6 +136,42 @@ class DungeonSweepProtocolTestCase(unittest.TestCase):
         self.assertEqual(
             encode_dungeon_draw_all_request(2302), b"\x08\xfe\x11\x10\x01"
         )
+
+    def test_direct_shop_lamp_offer_is_found_and_encoded(self) -> None:
+        goods = (
+            encode_int_field(1, 7001)
+            + encode_int_field(2, 3)
+            + encode_bytes_field(
+                7,
+                encode_int_field(1, 1)
+                + encode_int_field(2, DUNGEON_LAMP_ITEM_ID)
+                + encode_int_field(3, 1),
+            )
+        )
+        game_data = encode_bytes_field(
+            17,
+            encode_int_field(1, DIRECT_SHOP_ID) + encode_bytes_field(9, goods),
+        )
+
+        offer = find_dungeon_lamp_offer(game_data)
+
+        self.assertIsNotNone(offer)
+        assert offer is not None
+        self.assertEqual(offer.stock_qty, 3)
+        self.assertEqual(
+            encode_dungeon_lamp_claim_request(offer.stock_qty, offer.goods_data),
+            encode_int_field(1, DIRECT_SHOP_ID)
+            + encode_int_field(2, 3)
+            + encode_bytes_field(3, goods),
+        )
+
+    def test_sweep_rejection_uses_native_reason_when_defined(self) -> None:
+        rejection = DungeonSweepRejected(3)
+
+        self.assertEqual(rejection.ret, 3)
+        self.assertEqual(rejection.reason, "无扫荡次数")
+        self.assertEqual(str(rejection), "地下城扫荡失败：无扫荡次数（ret=3）")
+        self.assertIsNone(sweep_rejection_reason(4))
 
     def test_client_sweeps_then_draws_all_and_decodes_rewards(self) -> None:
         session_password = "87654321"
@@ -286,6 +328,76 @@ class DungeonSweepProtocolTestCase(unittest.TestCase):
             client.sweep(2301)
 
         self.assertEqual(context.exception.ret, 4)
+        self.assertIsNone(context.exception.reason)
+
+    def test_client_claims_available_daily_lamp_from_direct_shop(self) -> None:
+        session_password = "87654321"
+        password_payload = encode_bytes_field(
+            1,
+            pack1_encode(session_password.encode("utf-8"), SOCKET_PACK_KEY).encode(
+                "utf-8"
+            ),
+        )
+
+        def encrypted(message_id: int, data: bytes = b"") -> tuple[int, bytes]:
+            return (
+                0x2,
+                pack1_encode(
+                    encode_message_header(message_id, data), session_password
+                ).encode("utf-8"),
+            )
+
+        status_payload = _dungeon_status_payload(
+            unlocked_ids=(2301,),
+            visible_ids=(2301,),
+            best_scores={2301: 88},
+            current_dungeon_id=2301,
+            draw_times=0,
+            total_draw_times=0,
+        )
+        goods = (
+            encode_int_field(1, 7001)
+            + encode_int_field(2, 3)
+            + encode_bytes_field(
+                7,
+                encode_int_field(1, 1)
+                + encode_int_field(2, DUNGEON_LAMP_ITEM_ID)
+                + encode_int_field(3, 1),
+            )
+        )
+        game_data = (
+            encode_bytes_field(17, encode_int_field(1, DIRECT_SHOP_ID) + encode_bytes_field(9, goods))
+            + encode_bytes_field(18, status_payload)
+        )
+        fake_socket = FakeSocket(
+            [
+                (0x2, encode_message_header(PACK_PASSWORD_MESSAGE_ID, password_payload)),
+                encrypted(LOGIN_REUNIQUE_MESSAGE_ID),
+                encrypted(GAME_DATA_MESSAGE_ID, game_data),
+                encrypted(SHOP_BUY_MESSAGE_ID, encode_int_field(1, DIRECT_SHOP_ID)),
+            ]
+        )
+        client = DungeonSweepClient(
+            self.endpoint,
+            1.0,
+            socket_factory=lambda _url, _timeout: fake_socket,
+        )
+
+        result = client.claim_daily_lamp()
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.claimed_qty, 3)
+        request = decode_message_header(
+            pack1_decode(fake_socket.text_frames[0], session_password)
+        )
+        self.assertEqual(request.message_id, SHOP_BUY_MESSAGE_ID)
+        self.assertEqual(
+            request.data,
+            encode_int_field(1, DIRECT_SHOP_ID)
+            + encode_int_field(2, 3)
+            + encode_bytes_field(3, goods),
+        )
 
 
 if __name__ == "__main__":

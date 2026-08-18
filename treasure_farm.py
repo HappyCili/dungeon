@@ -133,12 +133,14 @@ BATTLE_ACTIVE_MESSAGE_IDS = frozenset(
 # 事件状态机并释放地图地标。
 EVENT_WAIT_SHOW_GET_ITEM = 1
 EVENT_WAIT_SHOW_DIALOG = 2
+EVENT_WAIT_ACTION_LINE_TEXT = 16
 EVENT_WAIT_ACTION_ITEM_INTERACTION = 53
 EVENT_WAIT_LABELS = {
     EVENT_WAIT_SHOW_GET_ITEM: "获得物品提示",
     EVENT_WAIT_SHOW_DIALOG: "对话提示",
 }
 EVENT_WAIT_ACTION_LABELS = {
+    EVENT_WAIT_ACTION_LINE_TEXT: "单行提示",
     EVENT_WAIT_ACTION_ITEM_INTERACTION: "物品交互提示",
 }
 
@@ -626,6 +628,7 @@ class EventFuncAction:
 
     wait: int = 0
     wait_action_id: int = 0
+    wait_action_p1: int | None = None
     event_id: int = 0
     dialog_id: int = 0
     location_id: int = 0
@@ -642,8 +645,16 @@ class EventFuncAction:
 
     @property
     def auto_confirmable(self) -> bool:
-        return self.wait in EVENT_WAIT_LABELS or (
-            self.wait_action_id == EVENT_WAIT_ACTION_ITEM_INTERACTION
+        if self.wait in EVENT_WAIT_LABELS:
+            return True
+        if self.wait_action_id == EVENT_WAIT_ACTION_ITEM_INTERACTION:
+            return True
+        # EventModule.OnLineTextsShow sends Event_func_next immediately for a
+        # single-line toast (pint.p1 == 0). A non-zero p1 opens a panel and
+        # remains a visible, user-dismissed interaction.
+        return (
+            self.wait_action_id == EVENT_WAIT_ACTION_LINE_TEXT
+            and self.wait_action_p1 == 0
         )
 
 
@@ -1414,6 +1425,7 @@ def decode_event_func_action(data: bytes) -> EventFuncAction:
 
     wait = 0
     wait_action_id = 0
+    wait_action_p1: int | None = None
     event_id = 0
     dialog_id = 0
     location_id = 0
@@ -1428,10 +1440,25 @@ def decode_event_func_action(data: bytes) -> EventFuncAction:
             ).fields():
                 if nested_field == 1 and nested_wire == 0:
                     wait_action_id = decode_int32(int(nested_value))
-                    break
+                elif nested_field == 2 and nested_wire == 2:
+                    # waitAction.param.pint.p1. The generated client only
+                    # auto-closes LineText when this value is zero.
+                    for param_field, param_wire, param_value in ProtoReader(
+                        bytes(nested_value)
+                    ).fields():
+                        if param_field != 1 or param_wire != 2:
+                            continue
+                        wait_action_p1 = 0
+                        for pint_field, pint_wire, pint_value in ProtoReader(
+                            bytes(param_value)
+                        ).fields():
+                            if pint_field == 2 and pint_wire == 0:
+                                wait_action_p1 = decode_int32(int(pint_value))
+                        break
     return EventFuncAction(
         wait=wait,
         wait_action_id=wait_action_id,
+        wait_action_p1=wait_action_p1,
         event_id=event_id,
         dialog_id=dialog_id,
         location_id=location_id,

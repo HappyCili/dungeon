@@ -1,0 +1,84 @@
+{
+  "source_bundle": "/Users/max/Downloads/dungeon4_M521957/ui_app/.monopoly-ui.unityfs",
+  "project_root": "/Users/max/Downloads/dungeon4_M521957/ui_app",
+  "assets": [
+    {
+      "name": "monopolyBuffEffectsPanel",
+      "path": "monopolyBuffEffectsPanel.js",
+      "bytes": 2180,
+      "sha256": "2f5137ebb865314f9f9839a5ee12d395db0323810209e7d8134e715233091b85"
+    },
+    {
+      "name": "battleRewardMonopoly",
+      "path": "battleRewardMonopoly.js",
+      "bytes": 3788,
+      "sha256": "93970e206bfb0bbb6d5227c5339d092c61661f681f67bce9ea80a5359d55759b"
+    },
+    {
+      "name": "monopolyEventPanel",
+      "path": "monopolyEventPanel.js",
+      "bytes": 5022,
+      "sha256": "9e3df900d4aa09c3b5a61af9fa91344d44a36121d35494b86df1636b7a3adfaf"
+    },
+    {
+      "name": "monopolyConfiscateRewardPanel",
+      "path": "monopolyConfiscateRewardPanel.js",
+      "bytes": 3433,
+      "sha256": "f4738adbbe79717e9870247e01f76150a0cf9c8c5246243873dc45adb2a7938d"
+    },
+    {
+      "name": "monopolyBossInfoPanel",
+      "path": "monopolyBossInfoPanel.js",
+      "bytes": 4886,
+      "sha256": "d358a75a22f167c45c259b88b950d6e3e3053a59240deab663b5f87ed975d5ce"
+    },
+    {
+      "name": "monopolyDiceSelPoint",
+      "path": "monopolyDiceSelPoint.js",
+      "bytes": 3321,
+      "sha256": "e211100c3314d24d1fc5bf9efe3e596917396cd021422e64254239dc9005a93d"
+    },
+    {
+      "name": "monopolyRewardPanel",
+      "path": "monopolyRewardPanel.js",
+      "bytes": 2754,
+      "sha256": "17784a12762e55650f736d0c9248b0fe90ebef3fb5da48c6817888e42d9cddc5"
+    },
+    {
+      "name": "monopolyPayVisitPanel",
+      "path": "monopolyPayVisitPanel.js",
+      "bytes": 5718,
+      "sha256": "83eeb54977921bbe2c08de0de927ec005ed50fd1c8ab85d795ce9738a0a47868"
+    },
+    {
+      "name": "monopolyBuyDicePanel",
+      "path": "monopolyBuyDicePanel.js",
+      "bytes": 3508,
+      "sha256": "7450c9fc2a44e20cf02fe03a293bffab00d25847ff15c43a2854241883b5c664"
+    },
+    {
+      "name": "monopolyTileInfoPanel",
+      "path": "monopolyTileInfoPanel.js",
+      "bytes": 3129,
+      "sha256": "4237d952a71bcb25e8af536782fb4947b8184fbc43a83c69fe774254bee84a4c"
+    },
+    {
+      "name": "monopolyMainPanel",
+      "path": "monopolyMainPanel.js",
+      "bytes": 20969,
+      "sha256": "0761ecb33d5a22e0b06e4fc65e5af6594bbbae642a22a6b61d69dbdf17673657"
+    },
+    {
+      "name": "monopolyBuffPanel",
+      "path": "monopolyBuffPanel.js",
+      "bytes": 9013,
+      "sha256": "d62a164ddb1decb7425d05fc6d733e1387dd660747154f1b2a0037398e417438"
+    },
+    {
+      "name": "monopolySelectLayout",
+      "path": "monopolySelectLayout.js",
+      "bytes": 3304,
+      "sha256": "c30841ce640ae662e5df4b372c8a65da4b7518b24c44b9cccfbbc0c8391494df"
+    }
+  ]
+}

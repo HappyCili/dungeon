@@ -9,12 +9,29 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 
-CONFIG_VERSION = 7
+CONFIG_VERSION = 9
 DEFAULT_ENABLED_TASK_IDS = [104, 112, 119]
 VALID_OUTCOMES = frozenset({"mercy", "execute"})
 MAX_TREASURE_SWEEP_TIMES = 30
 MAX_TREASURE_FARM_HEARTH = 10000
 MAX_ABYSS_ROUNDS = 900
+MIN_AUTO_TASK_INTERVAL_MINUTES = 5
+MAX_AUTO_TASK_INTERVAL_MINUTES = 1440
+VALID_DRAGON_TARGET_MODES = frozenset({"daily", "inventory"})
+AUTO_TASK_KEYS = (
+    "signin",
+    "fief",
+    "monthly_vip",
+    "furnace",
+    "dragon_reward_like",
+    "treasure_sweep",
+    "knight_arena",
+    "legion_war",
+    "dragon_arena",
+    "dungeon_sweep",
+    "monopoly",
+    "daily_rewards",
+)
 
 
 @dataclass
@@ -73,6 +90,16 @@ class TwinSpiralSettings:
 
 
 @dataclass
+class AutoTaskSettings:
+    enabled_task_keys: list[str] = field(default_factory=lambda: list(AUTO_TASK_KEYS))
+    scheduler_enabled: bool = False
+    interval_minutes: int = 60
+    dragon_target_mode: str = "daily"
+    dragon_target_value: int = 0
+    furnace_target_value: int = 4000
+
+
+@dataclass
 class UiSettings:
     version: int = CONFIG_VERSION
     account: AccountSettings = field(default_factory=AccountSettings)
@@ -83,6 +110,7 @@ class UiSettings:
     dungeon: DungeonSettings = field(default_factory=DungeonSettings)
     abyss: AbyssSettings = field(default_factory=AbyssSettings)
     twin_spiral: TwinSpiralSettings = field(default_factory=TwinSpiralSettings)
+    auto_tasks: AutoTaskSettings = field(default_factory=AutoTaskSettings)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -107,6 +135,7 @@ def settings_from_mapping(value: Mapping[str, object]) -> UiSettings:
     dungeon = _mapping(value.get("dungeon"))
     abyss = _mapping(value.get("abyss"))
     twin_spiral = _mapping(value.get("twin_spiral"))
+    auto_tasks = _mapping(value.get("auto_tasks"))
 
     selected = daily.get("enabled_task_ids")
     enabled_task_ids = (
@@ -180,6 +209,40 @@ def settings_from_mapping(value: Mapping[str, object]) -> UiSettings:
     ):
         twin_spiral_node_id = 0
 
+    auto_task_keys = auto_tasks.get("enabled_task_keys")
+    enabled_auto_task_keys = (
+        [key for key in auto_task_keys if key in AUTO_TASK_KEYS]
+        if isinstance(auto_task_keys, list)
+        else list(AUTO_TASK_KEYS)
+    )
+    scheduler_enabled = auto_tasks.get("scheduler_enabled") is True
+    interval_minutes = auto_tasks.get("interval_minutes")
+    if (
+        not isinstance(interval_minutes, int)
+        or isinstance(interval_minutes, bool)
+        or not MIN_AUTO_TASK_INTERVAL_MINUTES
+        <= interval_minutes
+        <= MAX_AUTO_TASK_INTERVAL_MINUTES
+    ):
+        interval_minutes = 60
+    dragon_target_mode = auto_tasks.get("dragon_target_mode")
+    if dragon_target_mode not in VALID_DRAGON_TARGET_MODES:
+        dragon_target_mode = "daily"
+    dragon_target_value = auto_tasks.get("dragon_target_value")
+    if (
+        not isinstance(dragon_target_value, int)
+        or isinstance(dragon_target_value, bool)
+        or not 0 <= dragon_target_value <= 1_000_000_000
+    ):
+        dragon_target_value = 0
+    furnace_target_value = auto_tasks.get("furnace_target_value")
+    if (
+        not isinstance(furnace_target_value, int)
+        or isinstance(furnace_target_value, bool)
+        or not 0 <= furnace_target_value <= 1_000_000_000
+    ):
+        furnace_target_value = 4000
+
     zone_id = _bounded_string(zone.get("id"), 64)
     zone_name = _bounded_string(zone.get("name"), 128)
     if zone_name.startswith("演示"):
@@ -213,6 +276,14 @@ def settings_from_mapping(value: Mapping[str, object]) -> UiSettings:
             auto_buff=abyss_auto_buff,
         ),
         twin_spiral=TwinSpiralSettings(node_id=twin_spiral_node_id),
+        auto_tasks=AutoTaskSettings(
+            enabled_task_keys=enabled_auto_task_keys,
+            scheduler_enabled=scheduler_enabled,
+            interval_minutes=interval_minutes,
+            dragon_target_mode=dragon_target_mode,
+            dragon_target_value=dragon_target_value,
+            furnace_target_value=furnace_target_value,
+        ),
     )
 
 
@@ -334,4 +405,28 @@ class ConfigStore:
     def set_twin_spiral(self, node_id: int) -> UiSettings:
         return self.update(
             lambda settings: setattr(settings.twin_spiral, "node_id", node_id)
+        )
+
+    def set_auto_tasks(
+        self,
+        enabled_task_keys: list[str],
+        scheduler_enabled: bool,
+        interval_minutes: int,
+        dragon_target_mode: str,
+        dragon_target_value: int,
+        furnace_target_value: int,
+    ) -> UiSettings:
+        return self.update(
+            lambda settings: (
+                setattr(
+                    settings.auto_tasks,
+                    "enabled_task_keys",
+                    list(enabled_task_keys),
+                ),
+                setattr(settings.auto_tasks, "scheduler_enabled", scheduler_enabled),
+                setattr(settings.auto_tasks, "interval_minutes", interval_minutes),
+                setattr(settings.auto_tasks, "dragon_target_mode", dragon_target_mode),
+                setattr(settings.auto_tasks, "dragon_target_value", dragon_target_value),
+                setattr(settings.auto_tasks, "furnace_target_value", furnace_target_value),
+            )
         )

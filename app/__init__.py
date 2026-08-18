@@ -8,12 +8,17 @@ from flask import Flask
 from game_session import GameSessionManager
 
 from .config_store import ConfigStore
+from .auto_task_scheduler import AutoTaskScheduler
 from .credentials import CredentialStore, KeyringCredentialStore
 from .job_manager import JobManager
 from .routes import register_routes
 from .services.account_service import AccountService
 from .services.abyss_service import AbyssService
 from .services.arena_service import ArenaService
+from .services.auto_task_service import (
+    AutoTaskService,
+    build_live_auto_task_handlers,
+)
 from .services.daily_service import DailyService
 from .services.dungeon_service import DungeonService
 from .services.monopoly_service import MonopolyService
@@ -63,25 +68,66 @@ def create_app(
             session_manager=session_manager,
         )
     )
+    jobs = job_manager or JobManager()
+    arena = arena_service or ArenaService(session_manager=session_manager)
+    treasure = treasure_service or TreasureService(session_manager=session_manager)
+    dungeon = dungeon_service or DungeonService(session_manager=session_manager)
+    monopoly = monopoly_service or MonopolyService(session_manager=session_manager)
+    auto_tasks = AutoTaskService(
+        handlers=build_live_auto_task_handlers(
+            treasure_service=treasure,
+            arena_service=arena,
+            dungeon_service=dungeon,
+            monopoly_service=monopoly,
+            session_manager=session_manager,
+            config_store=config_store,
+        )
+    )
     services = {
         "config_store": config_store,
         "account": account,
         "game_session": session_manager,
         "daily": daily_service
         or DailyService(session_manager=session_manager),
-        "arena": arena_service
-        or ArenaService(session_manager=session_manager),
-        "treasure": treasure_service
-        or TreasureService(session_manager=session_manager),
-        "dungeon": dungeon_service
-        or DungeonService(session_manager=session_manager),
+        "arena": arena,
+        "treasure": treasure,
+        "dungeon": dungeon,
         "abyss": abyss_service or AbyssService(session_manager=session_manager),
         "twin_spiral": twin_spiral_service
         or TwinSpiralService(session_manager=session_manager),
-        "monopoly": monopoly_service or MonopolyService(session_manager=session_manager),
-        "jobs": job_manager or JobManager(),
+        "monopoly": monopoly,
+        "auto_tasks": auto_tasks,
+        "jobs": jobs,
     }
+
+    def launch_scheduled_auto_tasks() -> str | None:
+        settings = config_store.snapshot().auto_tasks
+        if not settings.enabled_task_keys or jobs.active_job_id() is not None:
+            return None
+        try:
+            endpoint = account.resolve_selected_game_endpoint()
+        except AccountLoginError:
+            return None
+        job = jobs.start(
+            "auto_tasks",
+            lambda emit, stop_requested: auto_tasks.run(
+                endpoint,
+                settings,
+                emit,
+                stop_requested,
+            ),
+        )
+        return str(job["id"])
+
+    scheduler = AutoTaskScheduler(
+        config_store,
+        jobs,
+        launch_scheduled_auto_tasks,
+    )
+    services["auto_task_scheduler"] = scheduler
     app.extensions["daily_console"] = services
-    app.jinja_env.globals["asset_version"] = "daily-recovery-monopoly-twin-spiral-v1"
+    app.jinja_env.globals["asset_version"] = "auto-tasks-v5"
     register_routes(app)
+    if not app.config["TESTING"]:
+        scheduler.start()
     return app

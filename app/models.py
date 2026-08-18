@@ -23,7 +23,7 @@ DAILY_TASKS: tuple[DailyTaskDefinition, ...] = (
     DailyTaskDefinition(104, "秘法塔探索", 1, 10, True, "可执行", "登录并选择区服后通过游戏服会话执行"),
     DailyTaskDefinition(105, "庄园普通收取", 2, 10, True, "可执行", "每次作业至多收取 1 次；资源产出后可再次执行"),
     DailyTaskDefinition(106, "庄园快速收取", 1, 10, True, "可执行", "默认仅免费快速收取，不消耗宝石"),
-    DailyTaskDefinition(107, "地下城挑战", 1, 15, False, "尚未接入", "缺少进入、战斗和结算适配器"),
+    DailyTaskDefinition(107, "地下城挑战", 1, 15, True, "可执行", "自动选择历史最高评分的地下城并扫荡 3 次"),
     DailyTaskDefinition(108, "公会委托派遣", 3, 15, False, "尚未接入", "缺少委托选择与派遣适配器"),
     DailyTaskDefinition(109, "骑士比武挑战", 3, 15, True, "可执行", "登录并选择区服后通过游戏服会话执行；只计挑战次数，不要求胜利"),
     DailyTaskDefinition(110, "聚宝之地大宝箱", 1, 15, False, "尚未接入", "缺少进入、开箱和资源检查适配器"),

@@ -10,6 +10,7 @@ from harvest_fief import GameEndpoint, HarvestError
 from logging_store import MANAGED_DESTINATION, LogPersistenceError, write_standard_log
 from monopoly import (
     MonopolyClient,
+    MonopolyDiceSelection,
     MonopolyError,
     MonopolyTurnResult,
     describe_roll_rejection,
@@ -25,6 +26,8 @@ class MonopolySession(Protocol):
     def __enter__(self) -> "MonopolySession": ...
 
     def close(self) -> None: ...
+
+    def dice_status(self) -> MonopolyDiceSelection: ...
 
     def roll_once(
         self, *, stop_requested: Callable[[], bool] | None = None
@@ -45,18 +48,29 @@ def _zone_from_endpoint(endpoint: GameEndpoint) -> dict[str, str]:
 def format_run_summary(stats: dict[str, Any], *, cancelled: bool = False) -> str:
     rolls = int(stats.get("rolls") or 0)
     interactions = int(stats.get("interactions") or 0)
+    visit_choices = int(stats.get("visit_choices") or 0)
+    layout_choices = int(stats.get("layout_choices") or 0)
     confirms = int(stats.get("display_confirms") or 0)
     heading = "已停止" if cancelled else "已结束" if stats.get("stop_reason") else "已完成"
     reason = str(stats.get("stop_reason") or "")
     suffix = f" · {reason}" if reason else ""
+    dice_id = stats.get("dice_id")
+    dice_label = str(stats.get("dice_label") or "骰子")
+    dice_remaining = stats.get("dice_remaining")
+    remaining = (
+        f" · {dice_label}剩余 {dice_remaining}"
+        if dice_id and dice_remaining is not None
+        else ""
+    )
     return (
         f"{heading} · 掷骰 {rolls} 次 · 交互选择 {interactions} 次"
-        f" · 展示确认 {confirms} 次{suffix}"
+        f" · 拜访选择 {visit_choices} 次"
+        f" · 布局选择 {layout_choices} 次 · 展示确认 {confirms} 次{remaining}{suffix}"
     )
 
 
 class MonopolyService:
-    """持续掷骰，直到服务器拒绝下一次掷骰或任务被停止。"""
+    """持续掷骰，直到所选骰子耗尽、服务器拒绝或任务被停止。"""
 
     def __init__(
         self,
@@ -100,9 +114,17 @@ class MonopolyService:
             stats["last_result"] = "正在连接宫廷棋"
             progress("info", "连接宫廷棋…")
             client = self._live_client_builder(endpoint, lambda _message: None).__enter__()
+            self._sync_dice_status(stats, client)
             stats["stage"] = "自动掷骰"
-            stats["last_result"] = "交互默认选择第二个按钮"
-            progress("info", "已连接 · 交互默认选择第二个按钮")
+            dice_text = self._dice_text(stats)
+            selection_policy = "事件默认选最后一项 · 拜访/布局默认选第二项"
+            stats["last_result"] = f"{selection_policy} · {dice_text}"
+            progress("info", f"已连接 · {selection_policy} · {dice_text}")
+            if stats["dice_remaining"] == 0:
+                stats["stop_reason"] = f"{stats['dice_label']}已耗尽"
+                stats["stage"] = "骰子耗尽"
+                result_payload = self._finish(stats, cancelled=False, progress=progress)
+                return result_payload
 
             while True:
                 if stop_requested():
@@ -115,16 +137,46 @@ class MonopolyService:
                 if turn.cancelled or stop_requested():
                     result_payload = self._finish(stats, cancelled=True, progress=progress)
                     return result_payload
-                if turn.blocked_reason:
-                    stats["stop_reason"] = turn.blocked_reason
-                    stats["stage"] = "等待骰子"
-                    result_payload = self._finish(stats, cancelled=False, progress=progress)
-                    return result_payload
                 if turn.roll is None:
+                    if turn.visit_choices:
+                        count = len(turn.visit_choices)
+                        stats["interactions"] = int(stats["interactions"]) + count
+                        stats["visit_choices"] = int(stats["visit_choices"]) + count
+                    if turn.interaction_error:
+                        stats["stop_reason"] = turn.interaction_error
+                        stats["stage"] = "交互失败"
+                        result_payload = self._finish(stats, cancelled=False, progress=progress)
+                        return result_payload
+                    if turn.pending_interaction:
+                        stats["stop_reason"] = "宫廷棋事件未完成，已停止后续掷骰"
+                        stats["stage"] = "等待事件"
+                        result_payload = self._finish(stats, cancelled=False, progress=progress)
+                        return result_payload
+                    if turn.layout_choice is not None:
+                        self._apply_layout_choice(stats, turn)
+                        self._sync_dice_status(
+                            stats,
+                            client,
+                            include_remaining=turn.dice_remaining is None,
+                        )
+                    if turn.dice_depleted:
+                        if turn.dice_remaining is not None:
+                            stats["dice_remaining"] = turn.dice_remaining
+                        stats["stop_reason"] = f"{stats['dice_label']}已耗尽"
+                        stats["stage"] = "骰子耗尽"
+                        result_payload = self._finish(stats, cancelled=False, progress=progress)
+                        return result_payload
+                    if turn.layout_choice is not None:
+                        continue
                     raise MonopolyServiceError("服务端未返回宫廷棋掷骰结果")
 
                 roll = turn.roll
                 self._apply_turn(stats, turn)
+                self._sync_dice_status(
+                    stats,
+                    client,
+                    include_remaining=turn.dice_remaining is None,
+                )
                 if roll.ret != 0:
                     stats["stop_reason"] = describe_roll_rejection(roll.ret)
                     stats["stage"] = "掷骰结束"
@@ -144,15 +196,30 @@ class MonopolyService:
                 details = (
                     f"第 {stats['rolls']} 次 · 骰子 {roll.dice_id or '--'}"
                     f" · 点数 {roll.point} · 格位 {roll.cell_no}"
+                    f" · {self._dice_text(stats)}"
                 )
                 if turn.choice is not None:
                     details += (
                         f" · 已选第 {turn.choice.button_number} 个按钮"
                         f"（{turn.choice.title or '未命名选项'}）"
                     )
+                if turn.visit_choices:
+                    details += " · 拜访默认选" + "、".join(
+                        f"第 {item.button_number} 项" for item in turn.visit_choices
+                    )
+                if turn.layout_choice is not None:
+                    details += (
+                        f" · 棋盘布局已选第 {turn.layout_choice.button_number} 项"
+                        f"（{turn.layout_choice.layout_id}）"
+                    )
                 stats["stage"] = "自动掷骰"
                 stats["last_result"] = details
                 progress("success", details)
+                if turn.dice_depleted:
+                    stats["stop_reason"] = f"{stats['dice_label']}已耗尽"
+                    stats["stage"] = "骰子耗尽"
+                    result_payload = self._finish(stats, cancelled=False, progress=progress)
+                    return result_payload
         except JobExecutionError:
             raise
         except MonopolyServiceError as exc:
@@ -177,7 +244,12 @@ class MonopolyService:
         return {
             "rolls": 0,
             "interactions": 0,
+            "visit_choices": 0,
+            "layout_choices": 0,
             "display_confirms": 0,
+            "dice_id": None,
+            "dice_label": "骰子",
+            "dice_remaining": None,
             "last_dice_id": None,
             "last_point": None,
             "cell_no": None,
@@ -196,12 +268,54 @@ class MonopolyService:
             stats["rolls"] = int(stats["rolls"]) + 1
         if turn.choice is not None:
             stats["interactions"] = int(stats["interactions"]) + 1
+        if turn.visit_choices:
+            count = len(turn.visit_choices)
+            stats["interactions"] = int(stats["interactions"]) + count
+            stats["visit_choices"] = int(stats["visit_choices"]) + count
+        if turn.layout_choice is not None:
+            stats["interactions"] = int(stats["interactions"]) + 1
+            stats["layout_choices"] = int(stats["layout_choices"]) + 1
         stats["display_confirms"] = int(stats["display_confirms"]) + turn.display_confirms
         stats["last_dice_id"] = roll.dice_id or None
+        if roll.dice_id:
+            stats["dice_id"] = roll.dice_id
+        if turn.dice_remaining is not None:
+            stats["dice_remaining"] = turn.dice_remaining
         stats["last_point"] = roll.point
         stats["cell_no"] = roll.cell_no
         stats["current_turn"] = roll.current_turn
         stats["total_turn"] = roll.total_turn
+
+    @staticmethod
+    def _apply_layout_choice(stats: dict[str, Any], turn: MonopolyTurnResult) -> None:
+        if turn.layout_choice is None:
+            return
+        stats["interactions"] = int(stats["interactions"]) + 1
+        stats["layout_choices"] = int(stats["layout_choices"]) + 1
+
+    @staticmethod
+    def _sync_dice_status(
+        stats: dict[str, Any], client: MonopolySession, *, include_remaining: bool = True
+    ) -> None:
+        get_status = getattr(client, "dice_status", None)
+        if not callable(get_status):
+            return
+        status = get_status()
+        dice_id = int(getattr(status, "dice_id", 0) or 0)
+        if dice_id:
+            stats["dice_id"] = dice_id
+        label = str(getattr(status, "label", "") or "")
+        if label:
+            stats["dice_label"] = label
+        available = getattr(status, "available", None)
+        if include_remaining and available is not None:
+            stats["dice_remaining"] = max(0, int(available))
+
+    @staticmethod
+    def _dice_text(stats: dict[str, Any]) -> str:
+        label = str(stats.get("dice_label") or "骰子")
+        remaining = stats.get("dice_remaining")
+        return f"{label}剩余 {remaining}" if remaining is not None else f"{label}余量待同步"
 
     @staticmethod
     def _finish(
@@ -234,7 +348,12 @@ class MonopolyService:
         details = {
             "rolls": monopoly.get("rolls"),
             "interactions": monopoly.get("interactions"),
+            "visit_choices": monopoly.get("visit_choices"),
+            "layout_choices": monopoly.get("layout_choices"),
             "display_confirms": monopoly.get("display_confirms"),
+            "dice_id": monopoly.get("dice_id"),
+            "dice_label": monopoly.get("dice_label"),
+            "dice_remaining": monopoly.get("dice_remaining"),
             "last_dice_id": monopoly.get("last_dice_id"),
             "last_point": monopoly.get("last_point"),
             "cell_no": monopoly.get("cell_no"),

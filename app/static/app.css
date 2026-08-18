@@ -172,6 +172,112 @@ h2 {
   border-bottom: 1px solid var(--line);
 }
 
+.auto-task-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1.4fr) minmax(260px, 0.8fr);
+  gap: 24px;
+}
+
+.auto-task-section {
+  min-width: 0;
+}
+
+.auto-task-section + .auto-task-section {
+  padding-left: 24px;
+  border-left: 1px solid var(--line);
+}
+
+.auto-task-list {
+  display: grid;
+  min-height: 180px;
+  margin: 0 0 16px;
+  padding: 0;
+  list-style: none;
+  border-top: 1px solid var(--line);
+}
+
+.auto-task-list__empty,
+.auto-task-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) minmax(150px, max-content) max-content;
+  align-items: center;
+  gap: 10px;
+  min-height: 48px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.auto-task-list__empty {
+  grid-template-columns: 1fr;
+  color: var(--muted);
+}
+
+.auto-task-row__name {
+  display: grid;
+  gap: 1px;
+  min-width: 0;
+  font-weight: 700;
+}
+
+.auto-task-row__name small,
+.auto-task-row__result {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 400;
+}
+
+.auto-task-row__result {
+  max-width: 180px;
+  overflow-wrap: anywhere;
+  text-align: right;
+}
+
+.auto-task-row__target {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  min-width: 0;
+}
+
+.auto-task-row__target select,
+.auto-task-row__target input {
+  min-width: 0;
+  max-width: 170px;
+  padding: 6px 8px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--surface);
+  color: var(--ink);
+  font: inherit;
+}
+
+.auto-task-schedule-stats {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin: 16px 0 0;
+}
+
+.auto-task-schedule-stats div {
+  min-width: 0;
+  padding: 9px 10px;
+  background: var(--teal-soft);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+}
+
+.auto-task-schedule-stats dt {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.auto-task-schedule-stats dd {
+  margin: 2px 0 0;
+  overflow-wrap: anywhere;
+  font-weight: 700;
+}
+
 .configuration-band {
   background: #fbfdfc;
 }
@@ -1033,9 +1139,35 @@ select:hover {
   }
 
   .arena-layout,
+  .auto-task-layout,
   .treasure-layout,
   .dungeon-layout {
     grid-template-columns: 1fr;
+  }
+
+  .auto-task-section + .auto-task-section {
+    padding-top: 18px;
+    padding-left: 0;
+    border-top: 1px solid var(--line);
+    border-left: 0;
+  }
+
+  .auto-task-row {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  .auto-task-row__target,
+  .auto-task-row__result {
+    grid-column: 2;
+  }
+
+  .auto-task-row__target {
+    justify-content: flex-start;
+  }
+
+  .auto-task-row__result {
+    max-width: none;
+    text-align: left;
   }
 
   .arena-controls,

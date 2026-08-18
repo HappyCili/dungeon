@@ -68,7 +68,7 @@ class InMemoryArenaClient:
             buff_choice_index=0,
             stage_id=33,
             daily_reward_num=4,
-            daily_reward_received=True,
+            daily_reward_available=True,
         )
 
     def match(self) -> DragonArenaMatchResponse:
@@ -139,6 +139,136 @@ class UnsettledArenaClient(InMemoryArenaClient):
         )
 
 
+class RetryingArenaClient(InMemoryArenaClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.info_calls = 0
+        self.challenge_indexes: list[int] = []
+
+    def match(self) -> DragonArenaMatchResponse:
+        self.match_calls += 1
+        self.matched = True
+        self.challenged = [False, False, False]
+        return DragonArenaMatchResponse(
+            ret=0,
+            opponents=tuple(
+                DragonArenaOpponent(1000 + index, False) for index in range(1, 4)
+            ),
+        )
+
+    def get_info(self) -> DragonArenaInfo:
+        self.info_calls += 1
+        return super().get_info()
+
+    def run_round(
+        self,
+        index: int,
+        *,
+        win_choice_id: int | None = None,
+        mercy_choice_id: int | None = None,
+    ) -> DragonArenaRoundResult:
+        self.challenge_indexes.append(index)
+        if len(self.challenge_indexes) <= 2:
+            return DragonArenaRoundResult(
+                index=index,
+                challenge=DragonArenaChallengeResponse(2, index, 1, False, 0),
+                battle=None,
+                mercy=None,
+            )
+        self.challenged[index - 1] = True
+        return DragonArenaRoundResult(
+            index=index,
+            challenge=DragonArenaChallengeResponse(0, index, 2, False, 0),
+            battle=DragonArenaChallengeResult(True, index, False, 100, 10, 1, 0, 3),
+            mercy=None,
+        )
+
+
+class ReorderedArenaClient(InMemoryArenaClient):
+    """Refreshes 21100 with the rejected robot moved to a new list position."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.challenge_indexes: list[int] = []
+
+    def get_info(self) -> DragonArenaInfo:
+        if not self.matched:
+            return super().get_info()
+        robot_ids = (1001, 1002) if not self.challenge_indexes else (1002, 1001)
+        return DragonArenaInfo(
+            level=32,
+            clearance_time=0,
+            opponents=tuple(DragonArenaOpponent(robot_id, False) for robot_id in robot_ids),
+            rewards=(),
+            score=90,
+            choice_pending=0,
+            choice_id=0,
+            buff_choice_id=0,
+            buff_choice_index=0,
+            stage_id=33,
+            daily_reward_num=4,
+            daily_reward_available=True,
+        )
+
+    def run_round(
+        self,
+        index: int,
+        *,
+        win_choice_id: int | None = None,
+        mercy_choice_id: int | None = None,
+    ) -> DragonArenaRoundResult:
+        self.challenge_indexes.append(index)
+        if len(self.challenge_indexes) == 1:
+            return DragonArenaRoundResult(
+                index=index,
+                challenge=DragonArenaChallengeResponse(2, index, 1, False, 0),
+                battle=None,
+                mercy=None,
+            )
+        return DragonArenaRoundResult(
+            index=index,
+            challenge=DragonArenaChallengeResponse(0, index, 2, False, 0),
+            battle=DragonArenaChallengeResult(True, index, False, 100, 10, 1, 0, 3),
+            mercy=None,
+        )
+
+
+class AlwaysRejectedArenaClient(InMemoryArenaClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.challenge_indexes: list[int] = []
+
+    def run_round(
+        self,
+        index: int,
+        *,
+        win_choice_id: int | None = None,
+        mercy_choice_id: int | None = None,
+    ) -> DragonArenaRoundResult:
+        self.challenge_indexes.append(index)
+        return DragonArenaRoundResult(
+            index=index,
+            challenge=DragonArenaChallengeResponse(2, index, 1, False, 0),
+            battle=None,
+            mercy=None,
+        )
+
+
+class MatchRetryArenaClient(InMemoryArenaClient):
+    def match(self) -> DragonArenaMatchResponse:
+        self.match_calls += 1
+        if self.match_calls == 1:
+            return DragonArenaMatchResponse(ret=2, opponents=())
+        self.matched = True
+        self.challenged = [False, False]
+        return DragonArenaMatchResponse(
+            ret=0,
+            opponents=tuple(
+                DragonArenaOpponent(1000 + index, False) for index in range(1, 3)
+            ),
+        )
+
+
 class ArenaServiceTestCase(unittest.TestCase):
     def setUp(self) -> None:
         self.clients: list[InMemoryArenaClient] = []
@@ -167,7 +297,7 @@ class ArenaServiceTestCase(unittest.TestCase):
         self.assertEqual(
             snapshot["opponents"], {"total": 0, "available": 0, "challenged": 0}
         )
-        self.assertEqual(snapshot["daily_reward"], {"received": True, "count": 4})
+        self.assertEqual(snapshot["daily_reward"], {"available": True, "count": 4})
         self.assertTrue(self.clients[0].entered)
         self.assertTrue(self.clients[0].closed)
 
@@ -199,8 +329,8 @@ class ArenaServiceTestCase(unittest.TestCase):
         )
         self.assertEqual(stats["dragon_coin_total"], 8848)
         messages = [message for _, message, _ in events]
-        self.assertTrue(any("开始战斗" in message for message in messages))
-        self.assertTrue(any("战斗进行中" in message for message in messages))
+        self.assertTrue(any("发送挑战请求" in message for message in messages))
+        self.assertTrue(any("等待服务端挑战响应" in message for message in messages))
         self.assertTrue(any("战斗完成：胜利" in message for message in messages))
         self.assertTrue(any(message == "胜利抉择：仁慈" for message in messages))
         self.assertTrue(any("剩余对手" in message and "进度" in message for message in messages))
@@ -253,6 +383,142 @@ class ArenaServiceTestCase(unittest.TestCase):
         self.assertTrue(any("进度 0/2" in message for message in messages))
         self.assertFalse(any("第 1 轮已完成" in message for message in messages))
         self.assertTrue(any(message.startswith("未完成") for message in messages))
+
+    def test_rejected_challenge_retries_next_candidate_before_counting_round(self) -> None:
+        client = RetryingArenaClient()
+        service = ArenaService(
+            live_client_builder=lambda _endpoint, _log: client,
+            kickout_retry_delay=0,
+            result_log_destination=None,
+            opponent_picker=lambda candidates: candidates[0],
+        )
+        events: list[tuple[str, str, dict[str, object]]] = []
+
+        result = service.run(
+            self.endpoint,
+            1,
+            "mercy",
+            True,
+            lambda level, message, data: events.append((level, message, data)),
+            lambda: False,
+        )
+
+        stats = result["arena"]
+        # The refreshed state is reused by the next candidate selection, so a
+        # successful match and each rejected candidate produce only one 21100.
+        self.assertEqual(client.info_calls, 4)
+        self.assertEqual(client.challenge_indexes, [1, 2, 3])
+        self.assertEqual(stats["completed_rounds"], 1)
+        self.assertEqual(stats["wins"], 1)
+        self.assertEqual(stats["stop_reason"], "")
+        self.assertEqual(stats["stage"], "已完成")
+        messages = [message for _, message, _ in events]
+        self.assertTrue(any("挑战请求被服务端拒绝（ret=2" in message for message in messages))
+        self.assertTrue(any("已按原生客户端行为刷新竞技场状态" in message for message in messages))
+        self.assertTrue(any("继续尝试其他候选" in message for message in messages))
+        self.assertFalse(any("未收到战斗结算" in message for message in messages))
+        self.assertFalse(any("战斗进行中" in message for message in messages))
+
+    def test_reordered_info_retries_new_robot_at_its_new_index(self) -> None:
+        client = ReorderedArenaClient()
+        service = ArenaService(
+            live_client_builder=lambda _endpoint, _log: client,
+            kickout_retry_delay=0,
+            result_log_destination=None,
+            opponent_picker=lambda candidates: candidates[0],
+        )
+
+        result = service.run(
+            self.endpoint,
+            1,
+            "mercy",
+            True,
+            lambda _level, _message, _data: None,
+            lambda: False,
+        )
+
+        # After the first candidate is rejected, its robot moves from index 1
+        # to index 2. The refreshed index 1 is a new candidate and must run.
+        self.assertEqual(client.challenge_indexes, [1, 1])
+        self.assertEqual(result["arena"]["completed_rounds"], 1)
+
+    def test_all_rejected_candidates_wait_before_restarting_the_same_set(self) -> None:
+        client = AlwaysRejectedArenaClient()
+        service = ArenaService(
+            live_client_builder=lambda _endpoint, _log: client,
+            kickout_retry_delay=0,
+            challenge_retry_delay=0,
+            result_log_destination=None,
+            opponent_picker=lambda candidates: candidates[0],
+        )
+        events: list[str] = []
+        stop_calls = 0
+
+        def stop_requested() -> bool:
+            nonlocal stop_calls
+            stop_calls += 1
+            return stop_calls >= 6
+
+        result = service.run(
+            self.endpoint,
+            1,
+            "mercy",
+            True,
+            lambda _level, message, _data: events.append(message),
+            stop_requested,
+        )
+
+        self.assertTrue(result["cancelled"])
+        self.assertEqual(client.challenge_indexes, [1, 2])
+        self.assertTrue(any("当前候选均被服务端暂拒" in message for message in events))
+
+    def test_server_unfinished_candidates_are_retried_before_match(self) -> None:
+        client = RetryingArenaClient()
+        service = ArenaService(
+            live_client_builder=lambda _endpoint, _log: client,
+            kickout_retry_delay=0,
+            result_log_destination=None,
+            opponent_picker=lambda candidates: candidates[0],
+        )
+
+        result = service.run(
+            self.endpoint,
+            2,
+            "mercy",
+            True,
+            lambda _level, _message, _data: None,
+            lambda: False,
+        )
+
+        self.assertEqual(result["arena"]["completed_rounds"], 2)
+        self.assertEqual(client.match_calls, 1)
+        self.assertEqual(client.challenge_indexes, [1, 2, 3, 1])
+
+    def test_match_rejection_retries_instead_of_stopping(self) -> None:
+        client = MatchRetryArenaClient()
+        service = ArenaService(
+            live_client_builder=lambda _endpoint, _log: client,
+            kickout_retry_delay=0,
+            match_retry_delay=0,
+            result_log_destination=None,
+            opponent_picker=lambda candidates: candidates[0],
+        )
+        events: list[str] = []
+
+        result = service.run(
+            self.endpoint,
+            1,
+            "mercy",
+            True,
+            lambda _level, message, _data: events.append(message),
+            lambda: False,
+        )
+
+        self.assertEqual(client.match_calls, 2)
+        self.assertEqual(result["arena"]["completed_rounds"], 1)
+        self.assertEqual(result["arena"]["stop_reason"], "")
+        self.assertTrue(any("寻找新对手被服务端拒绝（ret=2）" in message for message in events))
+        self.assertFalse(any("服务端未返回可挑战对手" in message for message in events))
 
     def test_kickout_ret2_refreshes_endpoint_and_retries_login(self) -> None:
         refreshed = GameEndpoint("ws://retry.invalid", "token-2", "4101", "真实一区")

@@ -19,8 +19,34 @@ from harvest_fief import (
     pack1_encode,
 )
 from harvest_fief import ItemChange
-from game_session import BATTLE_INFO_MESSAGE_ID, GameSession, GameSessionManager
-from session_recovery import RecoveryResult, SessionRecoveryCoordinator
+from dragon_arena import (
+    BattleInfo,
+    BattleTeamUnit,
+    ProtoReader,
+    decode_game_data_battle_context,
+)
+from game_session import (
+    BATTLE_INFO_MESSAGE_ID,
+    BATTLE_S2C_START_MESSAGE_ID,
+    GAME_DATA_MESSAGE_ID,
+    GameSession,
+    GameSessionManager,
+    SessionRecoveryIssue,
+    SessionRecoverySnapshot,
+)
+from session_recovery import (
+    RecoveryResult,
+    SessionRecoveryCoordinator,
+    recovery_content_area,
+)
+from knight_arena import (
+    ArenaChallengeResponse,
+    ArenaChallengeResult,
+    ArenaInfo,
+    ArenaOpponent,
+    ArenaRoundResult,
+    KnightArenaClient,
+)
 from treasure_area import (
     MAP_TREASURE_CLEAR_RESULT_MESSAGE_ID,
     MAP_TREASURE_INFO_MESSAGE_ID,
@@ -306,6 +332,260 @@ class TreasureAreaProtocolTestCase(unittest.TestCase):
         self.assertEqual(handler.seen_message_id, BATTLE_INFO_MESSAGE_ID)
         self.assertFalse(session.recovery_pending)
         self.assertTrue(session.recovery_checked)
+
+    def test_knight_arena_preparation_battle_info_does_not_start_battle(self) -> None:
+        session_password = "87654321"
+        password_payload = encode_bytes_field(
+            1,
+            pack1_encode(session_password.encode("utf-8"), SOCKET_PACK_KEY).encode(
+                "utf-8"
+            ),
+        )
+
+        def encrypted(message_id: int, data: bytes = b"") -> tuple[int, bytes]:
+            return (
+                0x2,
+                pack1_encode(
+                    encode_message_header(message_id, data), session_password
+                ).encode("utf-8"),
+            )
+
+        marker = encode_int_field(3, 1) + encode_int_field(4, 5)
+        fake_socket = FakeSocket(
+            [
+                (0x2, encode_message_header(PACK_PASSWORD_MESSAGE_ID, password_payload)),
+                encrypted(GAME_DATA_MESSAGE_ID, encode_bytes_field(35, marker)),
+                encrypted(BATTLE_INFO_MESSAGE_ID, b"battle-prepare"),
+                encrypted(19800, b"arena-info"),
+                encrypted(LOGIN_REUNIQUE_MESSAGE_ID),
+            ]
+        )
+        import game_session as gs
+
+        original_delay = gs.POST_LOGIN_BUSINESS_DELAY_SECONDS
+        original_drain = gs.POST_LOGIN_RECOVERY_DRAIN_SECONDS
+        gs.POST_LOGIN_BUSINESS_DELAY_SECONDS = 0
+        gs.POST_LOGIN_RECOVERY_DRAIN_SECONDS = 0
+        try:
+            manager = GameSessionManager(
+                timeout=1.0,
+                socket_factory=lambda _url, _timeout: fake_socket,
+                websocket_log=False,
+            )
+            session = manager.session_for(self.endpoint)
+        finally:
+            gs.POST_LOGIN_BUSINESS_DELAY_SECONDS = original_delay
+            gs.POST_LOGIN_RECOVERY_DRAIN_SECONDS = original_drain
+
+        self.assertFalse(session.recovery_pending)
+        self.assertTrue(session.recovery_checked)
+        self.assertEqual(fake_socket.text_frames, [])
+        self.assertEqual(session.receive_header(0).message_id, 19800)
+
+    def test_knight_arena_running_packets_route_to_battle_recovery(self) -> None:
+        snapshot = SessionRecoverySnapshot(
+            generation=1,
+            game_data_present=True,
+            issues=(
+                SessionRecoveryIssue(
+                    kind="battle",
+                    battle_state=1,
+                    battle_type=5,
+                    message_ids=(
+                        BATTLE_INFO_MESSAGE_ID,
+                        BATTLE_S2C_START_MESSAGE_ID,
+                    ),
+                ),
+            ),
+        )
+
+        self.assertEqual(recovery_content_area(snapshot).id, "knight_arena")
+
+    def test_knight_arena_start_uses_native_pvp_team_slot(self) -> None:
+        def team_entry(team_id: int, hero_id: int, x: int, y: int) -> bytes:
+            position = encode_int_field(1, x) + encode_int_field(2, y)
+            slot = encode_int_field(1, hero_id) + encode_bytes_field(2, position)
+            slot_entry = encode_int_field(1, 0) + encode_bytes_field(2, slot)
+            team = encode_bytes_field(1, slot_entry)
+            return encode_int_field(1, team_id) + encode_bytes_field(2, team)
+
+        teams = b"".join(
+            (
+                encode_bytes_field(1, team_entry(0, 101, 1, 1)),
+                encode_bytes_field(1, team_entry(4, 202, 3, 2)),
+            )
+        )
+        hero = b"".join(
+            (
+                encode_bytes_field(1, encode_int_field(1, 101)),
+                encode_bytes_field(1, encode_int_field(1, 202)),
+                encode_bytes_field(4, teams),
+                encode_int_field(10, 0),
+            )
+        )
+        context = decode_game_data_battle_context(encode_bytes_field(9, hero))
+        self.assertEqual(context.team, (BattleTeamUnit(101, 1, 1),))
+        self.assertEqual(context.teams[4], (BattleTeamUnit(202, 3, 2),))
+        self.assertTrue(context.team_payloads[4])
+
+        client = KnightArenaClient(
+            self.endpoint,
+            1.0,
+            battle_start_codec="python",
+            websocket_log=False,
+            business_log=None,
+            log=lambda _message: None,
+        )
+        client._game_data_context = context
+        sent: list[tuple[int, bytes]] = []
+
+        def capture(message_id: int, data: bytes = b"", *, encrypted: bool) -> None:
+            self.assertTrue(encrypted)
+            sent.append((message_id, data))
+
+        client._send_message = capture  # type: ignore[method-assign]
+        client.start_battle(
+            BattleInfo(
+                battle_id=91,
+                ret=0,
+                battle_type=5,
+                location_id=0,
+                player_units=1,
+                enemy_units=1,
+                enemy_team=(BattleTeamUnit(9001, 1, 6),),
+                skip_team=False,
+                skip_mode=0,
+                battle_data=b"",
+            )
+        )
+        client.close()
+
+        self.assertEqual(sent[0][0], 18010)
+        player_ids = [
+            next(
+                int(value)
+                for field_number, wire_type, value in ProtoReader(bytes(entry)).fields()
+                if field_number == 1 and wire_type == 0
+            )
+            for field_number, wire_type, entry in ProtoReader(sent[0][1]).fields()
+            if field_number == 2 and wire_type == 2
+        ]
+        self.assertEqual(player_ids, [202])
+
+    def test_knight_arena_syncs_attack_team_before_challenge(self) -> None:
+        team = encode_bytes_field(
+            1,
+            encode_int_field(1, 0)
+            + encode_bytes_field(
+                2,
+                encode_int_field(1, 202)
+                + encode_bytes_field(2, encode_int_field(1, 3) + encode_int_field(2, 2)),
+            ),
+        )
+        teams = encode_bytes_field(
+            1,
+            encode_int_field(1, 4) + encode_bytes_field(2, team),
+        )
+        hero = (
+            encode_bytes_field(1, encode_int_field(1, 202))
+            + encode_bytes_field(4, teams)
+            + encode_int_field(10, 4)
+        )
+        context = decode_game_data_battle_context(encode_bytes_field(9, hero))
+        client = KnightArenaClient(
+            self.endpoint,
+            1.0,
+            websocket_log=False,
+            business_log=None,
+            log=lambda _message: None,
+        )
+        client._game_data_context = context
+        sent: list[tuple[int, bytes]] = []
+        client._send_message = (
+            lambda message_id, data=b"", *, encrypted: sent.append((message_id, data))
+        )
+        client._queued_headers.extend(
+            (
+                MessageHeader(15016, 0, encode_int_field(1, 4)),
+                MessageHeader(15014, 0, encode_int_field(4, 4)),
+            )
+        )
+
+        client._sync_attack_team()
+        client.close()
+
+        self.assertEqual(sent[0][0], 15016)
+        self.assertEqual(
+            sent[0][1],
+            encode_int_field(1, 4) + encode_bytes_field(2, context.team_payloads[4]),
+        )
+
+    def test_knight_arena_daily_runner_stops_after_unsettled_accepted_challenge(
+        self,
+    ) -> None:
+        client = object.__new__(KnightArenaClient)
+        client.log = lambda _message: None
+        client._last_round_failure = None
+        client.get_info = lambda: ArenaInfo(
+            challenge_num=3,
+            refresh_num=0,
+            season_id=1255,
+            season_score=223,
+            season_open=True,
+            season_challenge_num=5,
+            opponents=(
+                ArenaOpponent(0, 1001, 0, 0, 200, "甲"),
+                ArenaOpponent(1, 1002, 0, 0, 180, "乙"),
+                ArenaOpponent(2, 1003, 0, 0, 160, "丙"),
+            ),
+        )
+        calls: list[int] = []
+
+        def run_round(index: int) -> ArenaRoundResult:
+            calls.append(index)
+            if len(calls) == 1:
+                return ArenaRoundResult(
+                    index,
+                    ArenaChallengeResponse(0, 0, 0, index, 4, 6),
+                    ArenaChallengeResult(True, 0, index, 230, 7, 230),
+                )
+            client._last_round_failure = "Battle_S2C_start 返回 ret=7"
+            return ArenaRoundResult(
+                index,
+                ArenaChallengeResponse(0, 0, 0, index, 5, 7),
+                None,
+            )
+
+        client.run_round = run_round
+        result = client.run_daily_free_challenges(daily_free_limit=5)
+
+        self.assertEqual(result.requested_challenges, 2)
+        self.assertEqual(result.accepted_challenges, 2)
+        self.assertEqual(len(result.results), 1)
+        self.assertEqual(result.rejected_challenges, 0)
+        self.assertEqual(result.failure, "Battle_S2C_start 返回 ret=7")
+        self.assertEqual(len(calls), 2)
+
+    def test_knight_arena_daily_runner_skips_closed_season(self) -> None:
+        client = object.__new__(KnightArenaClient)
+        client.log = lambda _message: None
+        client.get_info = lambda: ArenaInfo(
+            challenge_num=0,
+            refresh_num=0,
+            season_id=1255,
+            season_score=223,
+            season_open=False,
+            season_challenge_num=0,
+            opponents=(),
+        )
+        client.run_round = lambda _index: self.fail("赛季关闭时不得挑战")
+
+        result = client.run_daily_free_challenges(daily_free_limit=5)
+
+        self.assertFalse(result.season_open)
+        self.assertEqual(result.requested_challenges, 5)
+        self.assertEqual(result.accepted_challenges, 0)
+        self.assertEqual(result.results, ())
 
     def test_sweep_request_uses_native_area_useitem_and_times_fields(self) -> None:
         request = encode_treasure_sweep_request(1001, MAX_SWEEP_TIMES_PER_REQUEST)

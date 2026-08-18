@@ -529,6 +529,63 @@ class ProtocolCodecTestCase(unittest.TestCase):
         self.assertIsNone(client._pending_event_action)
         self.assertIn("地图事件获得物品提示已确认", client.drain_event_progress_notes())
 
+    def test_event_func_action_confirms_native_single_line_text(self) -> None:
+        from dragon_arena_business_map import (
+            EVENT_FUNC_ACTION_MESSAGE_ID,
+            EVENT_FUNC_NEXT_MESSAGE_ID,
+        )
+        from treasure_farm import TreasureFarmClient, encode_event_func_next
+
+        client = object.__new__(TreasureFarmClient)
+        client._auto_event_progress = True
+        client._pending_event_action = None
+        client._pending_event_start = None
+        client._event_progress_notes = []
+        sent: list[tuple[int, bytes, bool]] = []
+        client._send_message = lambda mid, data=b"", *, encrypted: sent.append(
+            (mid, data, encrypted)
+        )
+        action_param = (
+            encode_bytes_field(1, b"")
+            + encode_bytes_field(2, encode_bytes_field(1, "什么也没发生".encode()))
+        )
+        wait_action = encode_int_field(1, 16) + encode_bytes_field(2, action_param)
+        payload = encode_bytes_field(3, wait_action)
+
+        self.assertTrue(
+            client._handle_common_message(
+                SimpleNamespace(message_id=EVENT_FUNC_ACTION_MESSAGE_ID, data=payload)
+            )
+        )
+        self.assertEqual(
+            sent,
+            [(EVENT_FUNC_NEXT_MESSAGE_ID, encode_event_func_next(), True)],
+        )
+        self.assertIn("地图事件单行提示已确认", client.drain_event_progress_notes())
+
+    def test_event_func_action_keeps_multiline_text_pending(self) -> None:
+        from dragon_arena_business_map import EVENT_FUNC_ACTION_MESSAGE_ID
+        from treasure_farm import TreasureFarmClient
+
+        client = object.__new__(TreasureFarmClient)
+        client._auto_event_progress = True
+        client._pending_event_action = None
+        client._pending_event_start = None
+        client._event_progress_notes = []
+        sent: list[int] = []
+        client._send_message = lambda mid, _data=b"", *, encrypted: sent.append(mid)
+        action_param = encode_bytes_field(1, encode_int_field(2, 1))
+        wait_action = encode_int_field(1, 16) + encode_bytes_field(2, action_param)
+        payload = encode_bytes_field(3, wait_action)
+
+        self.assertTrue(
+            client._handle_common_message(
+                SimpleNamespace(message_id=EVENT_FUNC_ACTION_MESSAGE_ID, data=payload)
+            )
+        )
+        self.assertEqual(sent, [])
+        self.assertIsNotNone(client._pending_event_action)
+
     def test_process_node_waits_for_reward_event_completion(self) -> None:
         from dragon_arena_business_map import (
             EVENT_END_MESSAGE_ID,

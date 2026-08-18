@@ -1,0 +1,9 @@
+{"source":"logs/websocket_raw/knight_arena/2026-07-24.jsonl","frame":14,"direction":"S->C","message_id":19800,"name":"Arena_info","summary":{"challenge_num":0,"refresh_num":0,"season_id":1255,"season_score":223,"season_open":true,"get_daily_reward":false,"season_challenge_num":5,"candidate_count":3,"unwon_count":3}}
+{"source":"logs/websocket_raw/knight_arena/2026-07-24.jsonl","frame":22,"direction":"C->S","message_id":19810,"name":"Arena_challenge","summary":{"request_fields":{"opponentid":2}}}
+{"source":"logs/websocket_raw/knight_arena/2026-07-24.jsonl","frame":27,"direction":"S->C","message_id":19800,"name":"Arena_info","summary":{"challenge_num":0,"refresh_num":0,"season_id":1255,"season_score":223,"season_open":true,"get_daily_reward":false,"season_challenge_num":5,"candidate_count":3,"unwon_count":3}}
+{"source":"logs/websocket_raw/knight_arena/2026-07-24.jsonl","frame":28,"direction":"S->C","message_id":18002,"name":"Battle_info","summary":{"battle_id":101002,"ret":0,"battle_type":5,"enemy_units":6}}
+{"source":"logs/websocket_raw/knight_arena/2026-07-24.jsonl","frame":29,"direction":"C->S","message_id":18010,"name":"Battle_C2S_start","summary":{"payload_bytes":130}}
+{"source":"logs/websocket_raw/knight_arena/2026-07-24.jsonl","frame":30,"direction":"S->C","message_id":18012,"name":"Battle_S2C_start","summary":{"battle_id":101002,"ret":7}}
+{"source":"logs/websocket_raw/knight_arena/2026-07-24.jsonl","frame":32,"direction":"S->C","message_id":19810,"name":"Arena_challenge","summary":{"ret":9,"opponentid":0}}
+{"source":"logs/websocket_raw/knight_arena/2026-07-24.jsonl","frame":36,"direction":"S->C","message_id":19808,"name":"Arena_refresh_opponents","summary":{"ret":0,"candidate_count":3,"unwon_count":3}}
+{"source":"logs/websocket_raw/knight_arena/2026-07-24.jsonl","frame":60,"direction":"S->C","message_id":19808,"name":"Arena_refresh_opponents","summary":{"ret":1,"candidate_count":0,"unwon_count":0}}

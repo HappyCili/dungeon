@@ -36,7 +36,7 @@ import sys
 import tempfile
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 from typing import Callable, Deque, Iterable, Iterator, Mapping, Sequence
@@ -209,7 +209,7 @@ class DragonArenaInfo:
     buff_choice_index: int
     stage_id: int
     daily_reward_num: int
-    daily_reward_received: bool
+    daily_reward_available: bool
 
 
 @dataclass(frozen=True)
@@ -343,6 +343,8 @@ class GameDataBattleContext:
     received_monotonic: float
     current_team_id: int
     team: tuple[BattleTeamUnit, ...]
+    teams: Mapping[int, tuple[BattleTeamUnit, ...]] = field(default_factory=dict)
+    team_payloads: Mapping[int, bytes] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -489,12 +491,49 @@ def _decode_battle_unit_position(data: bytes) -> BattleTeamUnit | None:
     return BattleTeamUnit(hero_id=unit_id, x=x, y=y)
 
 
+def _decode_game_data_team(
+    data: bytes,
+    *,
+    owned_hero_ids: set[int],
+) -> tuple[BattleTeamUnit, ...]:
+    """Decode one normal ``hero.teams`` entry into usable battle units."""
+
+    slots: dict[int, bytes] = {}
+    for field_number, wire_type, value in ProtoReader(data).fields():
+        if field_number != 1 or wire_type != 2:
+            continue
+        entry = bytes(value)
+        slot_index = _first_int_field(entry, 1)
+        slot = _first_bytes_field(entry, 2)
+        if slot is not None:
+            slots[decode_int32(slot_index or 0)] = slot
+
+    team: list[BattleTeamUnit] = []
+    seen_heroes: set[int] = set()
+    for slot_index in range(6):
+        slot = slots.get(slot_index)
+        if slot is None:
+            continue
+        hero_id = _first_int_field(slot, 1)
+        position = _first_bytes_field(slot, 2)
+        if hero_id is None or hero_id <= 0 or position is None:
+            continue
+        if owned_hero_ids and hero_id not in owned_hero_ids:
+            continue
+        if hero_id in seen_heroes:
+            continue
+        x, y = _decode_battle_position(position)
+        team.append(BattleTeamUnit(hero_id=hero_id, x=x, y=y))
+        seen_heroes.add(hero_id)
+    return tuple(team)
+
+
 def decode_game_data_battle_context(
     data: bytes,
     *,
     received_monotonic: float | None = None,
 ) -> GameDataBattleContext:
-    """Extract the current normal team from ``Game_data``.
+    """Extract normal teams from ``Game_data`` and select the current one.
 
     The layout follows ``St.hero`` -> ``Xo.teams`` -> ``vs.teams`` in the
     generated protocol code.  Dragon Arena is not assigned a dedicated team
@@ -539,37 +578,14 @@ def decode_game_data_battle_context(
         if team is not None:
             hero_teams[decode_int32(team_id or 0)] = team
 
-    selected_team = hero_teams.get(current_team_id)
-    if selected_team is None:
+    if current_team_id not in hero_teams:
         raise HarvestError(f"Game_data 中不存在当前编队 {current_team_id}")
 
-    slots: dict[int, bytes] = {}
-    for field_number, wire_type, value in ProtoReader(selected_team).fields():
-        if field_number != 1 or wire_type != 2:
-            continue
-        entry = bytes(value)
-        slot_index = _first_int_field(entry, 1)
-        slot = _first_bytes_field(entry, 2)
-        if slot is not None:
-            slots[decode_int32(slot_index or 0)] = slot
-
-    team: list[BattleTeamUnit] = []
-    seen_heroes: set[int] = set()
-    for slot_index in range(6):
-        slot = slots.get(slot_index)
-        if slot is None:
-            continue
-        hero_id = _first_int_field(slot, 1)
-        position = _first_bytes_field(slot, 2)
-        if hero_id is None or hero_id <= 0 or position is None:
-            continue
-        if owned_hero_ids and hero_id not in owned_hero_ids:
-            continue
-        if hero_id in seen_heroes:
-            continue
-        x, y = _decode_battle_position(position)
-        team.append(BattleTeamUnit(hero_id=hero_id, x=x, y=y))
-        seen_heroes.add(hero_id)
+    teams = {
+        team_id: _decode_game_data_team(team_data, owned_hero_ids=owned_hero_ids)
+        for team_id, team_data in hero_teams.items()
+    }
+    team = teams[current_team_id]
 
     if not team:
         raise HarvestError(f"当前编队 {current_team_id} 没有可用于战斗的角色")
@@ -580,7 +596,9 @@ def decode_game_data_battle_context(
             time.monotonic() if received_monotonic is None else received_monotonic
         ),
         current_team_id=current_team_id,
-        team=tuple(team),
+        team=team,
+        teams=teams,
+        team_payloads=hero_teams,
     )
 
 
@@ -622,7 +640,7 @@ def decode_scararena_info(data: bytes) -> DragonArenaInfo:
         "buff_choice_index": 0,
         "stage_id": 0,
         "daily_reward_num": 0,
-        "daily_reward_received": False,
+        "daily_reward_available": False,
     }
     for field_number, wire_type, value in ProtoReader(data).fields():
         if field_number == 1 and wire_type == 0:
@@ -650,7 +668,7 @@ def decode_scararena_info(data: bytes) -> DragonArenaInfo:
         elif field_number == 16 and wire_type == 0:
             values["daily_reward_num"] = decode_int32(int(value))
         elif field_number == 17 and wire_type == 0:
-            values["daily_reward_received"] = bool(value)
+            values["daily_reward_available"] = bool(value)
     return DragonArenaInfo(
         level=values["level"],
         clearance_time=values["clearance_time"],
@@ -663,7 +681,7 @@ def decode_scararena_info(data: bytes) -> DragonArenaInfo:
         buff_choice_index=values["buff_choice_index"],
         stage_id=values["stage_id"],
         daily_reward_num=values["daily_reward_num"],
-        daily_reward_received=values["daily_reward_received"],
+        daily_reward_available=values["daily_reward_available"],
     )
 
 
@@ -1227,6 +1245,11 @@ class DragonArenaClient:
             return
         self.websocket.close()
 
+    def item_total(self, item_id: int) -> int | None:
+        """Return the latest Game_data / settlement total for an item."""
+
+        return self._item_totals.get(item_id)
+
     def _send_message(self, message_id: int, data: bytes = b"", *, encrypted: bool) -> None:
         if self._session is not None:
             self._session.send_message(message_id, data, encrypted=encrypted)
@@ -1760,12 +1783,22 @@ class DragonArenaClient:
         )
         self.log("[战斗] 已发送 x3、自动角色技能和自动圣物技能。")
 
+    def _select_battle_team(
+        self,
+        context: GameDataBattleContext,
+        _battle: BattleInfo,
+    ) -> tuple[BattleTeamUnit, ...]:
+        """Return the native team selected for this battle client."""
+
+        return context.team
+
     def start_battle(self, battle: BattleInfo) -> None:
         """Send the required 18010 handshake after a successful Battle_info."""
 
         context = self._game_data_context
         if context is None:
             raise HarvestError("本会话没有可用的 Game_data 编队，无法构造 Battle_C2S_start")
+        team = self._select_battle_team(context, battle)
         # Map LOCEVT (and similar) often deliver enemy x=y=-1 before seat
         # expansion. Official JS protobuf rejects uint32 4294967295 for those
         # coords; Python encode_battle_c2s_start expands seats first.
@@ -1775,13 +1808,13 @@ class DragonArenaClient:
         if self._js_codec_bridge is not None and not needs_seat_expand:
             payload = self._js_codec_bridge.encode_battle_start(
                 battle,
-                context.team,
+                team,
             )
             codec_name = "JS codec"
         else:
             payload = encode_battle_c2s_start(
                 battle,
-                context.team,
+                team,
             )
             codec_name = (
                 "Python codec (seat expand)"
@@ -1790,11 +1823,11 @@ class DragonArenaClient:
             )
         self._send_message(BATTLE_C2S_START_MESSAGE_ID, payload, encrypted=True)
         positions = ", ".join(
-            f"{hero_name(unit.hero_id)}@({unit.x},{unit.y})" for unit in context.team
+            f"{hero_name(unit.hero_id)}@({unit.x},{unit.y})" for unit in team
         )
         self.log(
             "[战斗] 已发送 Battle_C2S_start："
-            f"角色={len(context.team)} [{positions}]，敌方站位={len(battle.enemy_team)}，"
+            f"角色={len(team)} [{positions}]，敌方站位={len(battle.enemy_team)}，"
             f"编码={codec_name}，"
             f"载荷={len(payload)} 字节，字段={summarize_protobuf_fields(payload)}。"
         )
@@ -2011,7 +2044,11 @@ class DragonArenaClient:
         challenge = self.challenge(index)
         if challenge.ret != 0:
             self._arena_settlement_changes.clear()
-            self.log(f"[挑战] 序号={index}，服务端 ret={challenge.ret}，继续下一轮。")
+            self.log(
+                "[挑战] "
+                f"序号={challenge.index or index}，服务端拒绝（ret={challenge.ret}）；"
+                "未进入战斗，等待调用方刷新竞技场状态。"
+            )
             return DragonArenaRoundResult(index, challenge, None, None)
 
         opponent_data = (
@@ -2100,6 +2137,19 @@ class DragonArenaClient:
                 if not opponent.challenged and index not in attempted
             ]
             if not candidates:
+                server_candidates = [
+                    index
+                    for index, opponent in enumerate(info.opponents, start=1)
+                    if not opponent.challenged
+                ]
+                if server_candidates:
+                    attempted.clear()
+                    self.log(
+                        "[挑战] "
+                        f"服务端仍有 {len(server_candidates)} 名未挑战对手，"
+                        "重新尝试当前候选集。"
+                    )
+                    continue
                 if refresh_on_exhaustion and not refreshed_without_progress:
                     matched = self.match()
                     self.log(
@@ -2120,14 +2170,23 @@ class DragonArenaClient:
             results.append(result)
             attempted.add(index)
             if result.battle is None:
-                # 未收到结算时保留已完成结果，但停止发送后续请求，避免把
-                # 未完成战斗误算为挑战次数并让会话进入不一致状态。
-                self.log("[龙痕竞技场] 本轮无结算，停止循环以等待状态恢复。")
+                if result.challenge.ret != 0:
+                    # Native DragonArenaModule refreshes 21100 after a rejected
+                    # 21104 response, then tries another unattempted candidate.
+                    self.log(
+                        "[龙痕竞技场] "
+                        f"挑战被服务端拒绝（ret={result.challenge.ret}，"
+                        f"序号={result.challenge.index or result.index}），"
+                        "刷新竞技场状态后继续尝试其他候选。"
+                    )
+                    continue
+                else:
+                    # 未收到结算时保留已完成结果，但停止发送后续请求，避免把
+                    # 未完成战斗误算为挑战次数并让会话进入不一致状态。
+                    self.log("[龙痕竞技场] 本轮无结算，停止循环以等待状态恢复。")
                 break
             if result.battle is not None and result.battle.win:
                 wins += 1
-                # 服务端可能在匹配/获胜后替换候选列表；下一轮会以最新 info 决定序号。
-                attempted.clear()
                 refreshed_without_progress = False
         return tuple(results)
 
